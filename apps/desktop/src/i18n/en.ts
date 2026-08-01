@@ -2315,6 +2315,7 @@ export const en: Translations = {
       thinking: 'Thinking',
       fast: 'Fast',
       effort: 'Effort',
+      auto: 'Auto',
       minimal: 'Minimal',
       low: 'Low',
       medium: 'Medium',

@@ -10,6 +10,7 @@ import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
 export type ComposerModelSource = '' | 'default' | 'manual'
+export type ReasoningMode = 'auto' | 'inherit' | 'manual'
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 
@@ -347,6 +348,12 @@ export const $resumeExhaustedSessionId = atom<string | null>(null)
 export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
 export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
+// Backend-authoritative source for the visible effort. Unlike the sticky
+// effort value, this is intentionally runtime-only: profile/connection refresh
+// seeds `inherit`, and session.info restores a live session's exact mode.
+export const $currentReasoningMode = atom<ReasoningMode>('inherit')
+export const $currentReasoningReason = atom('')
+export const $currentAdaptivePolicyVersion = atom('')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
 // Effective approval-bypass state mirrored from the gateway (session.info).
@@ -453,6 +460,13 @@ export const setCurrentReasoningEffort = (next: Updater<string>) => {
   updateAtom($currentReasoningEffort, next)
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
 }
+
+export const setCurrentReasoningMode = (next: Updater<ReasoningMode>) =>
+  updateAtom($currentReasoningMode, next)
+export const setCurrentReasoningReason = (next: Updater<string>) =>
+  updateAtom($currentReasoningReason, next)
+export const setCurrentAdaptivePolicyVersion = (next: Updater<string>) =>
+  updateAtom($currentAdaptivePolicyVersion, next)
 
 export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($currentServiceTier, next)
 

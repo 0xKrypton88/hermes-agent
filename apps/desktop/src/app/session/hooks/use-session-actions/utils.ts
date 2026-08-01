@@ -9,6 +9,7 @@ import {
   $currentCwd,
   $sessions,
   sessionMatchesStoredId,
+  setCurrentAdaptivePolicyVersion,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -16,6 +17,8 @@ import {
   setCurrentPersonality,
   setCurrentProvider,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  setCurrentReasoningReason,
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
@@ -551,7 +554,18 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'adaptivePolicyVersion'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'reasoningMode'
+    | 'reasoningReason'
+    | 'serviceTier'
+    | 'yolo'
   >
 >
 
@@ -601,6 +615,21 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   if (typeof info.reasoning_effort === 'string') {
     setCurrentReasoningEffort(info.reasoning_effort)
     sessionState.reasoningEffort = info.reasoning_effort
+  }
+
+  if (info.reasoning_mode === 'auto' || info.reasoning_mode === 'inherit' || info.reasoning_mode === 'manual') {
+    setCurrentReasoningMode(info.reasoning_mode)
+    sessionState.reasoningMode = info.reasoning_mode
+  }
+
+  if (typeof info.reasoning_reason === 'string') {
+    setCurrentReasoningReason(info.reasoning_reason)
+    sessionState.reasoningReason = info.reasoning_reason
+  }
+
+  if (typeof info.adaptive_policy_version === 'string') {
+    setCurrentAdaptivePolicyVersion(info.adaptive_policy_version)
+    sessionState.adaptivePolicyVersion = info.adaptive_policy_version
   }
 
   if (typeof info.service_tier === 'string') {

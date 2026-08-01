@@ -28,6 +28,7 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $currentReasoningMode,
   $messages,
   $newChatWorkspaceTarget,
   $sessions,
@@ -157,7 +158,10 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
-async function desktopSessionCreateParams(cwd: string): Promise<Record<string, unknown>> {
+async function desktopSessionCreateParams(
+  cwd: string,
+  profileOverride: { profile: null | string } | null = null
+): Promise<Record<string, unknown>> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
@@ -165,22 +169,29 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   const selection = {
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
+    mode: $currentReasoningMode.get(),
     model: $currentModel.get().trim(),
     provider: $currentProvider.get().trim()
   }
 
-  const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
+  const profile = profileOverride
+    ? profileOverride.profile?.trim() || null
+    : ($newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get()))
+
   await ensureGatewayProfile(profile)
+
+  const auto = selection.mode === 'auto'
+  const model = auto ? 'gpt-5.6-sol' : selection.model
+  const provider = auto ? 'openai-codex' : selection.provider
 
   return {
     cols: 96,
     source: 'desktop',
     ...(cwd && { cwd }),
     ...(profile ? { profile } : {}),
-    ...(selection.model
-      ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
-      : {}),
-    ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
+    ...(model ? { model, ...(provider ? { provider } : {}) } : {}),
+    ...(selection.mode === 'auto' || selection.mode === 'manual' ? { reasoning_mode: selection.mode } : {}),
+    ...(!auto && selection.effort ? { reasoning_effort: selection.effort } : {}),
     fast: selection.fast
   }
 }
@@ -1115,14 +1126,11 @@ export function useSessionActions({
         // lands the branch on the launch (default) profile — the "session
         // jumps between profiles after branching" bug. The swap also makes
         // upsertOptimisticSession's $activeGatewayProfile stamp correct.
-        await ensureGatewayProfile(profile)
-
         // No title: the backend auto-names the branch from its parent's lineage.
+        const params = await desktopSessionCreateParams(cwd?.trim() ?? '', { profile: profile ?? null })
+
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
-          cols: 96,
-          source: 'desktop',
-          ...(cwd && { cwd }),
-          ...(profile ? { profile } : {}),
+          ...params,
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           ...(parentStoredId && { parent_session_id: parentStoredId })
         })

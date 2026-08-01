@@ -16,6 +16,7 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $currentReasoningMode,
   $messages,
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
@@ -27,6 +28,7 @@ import {
   setCurrentModel,
   setCurrentProvider,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
   setMessages,
   setNewChatWorkspaceTarget,
   setResumeFailedSessionId,
@@ -69,7 +71,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'startFreshSessionDraft'
+  'createBackendSessionForSend' | 'openNewSessionTile' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -439,6 +441,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentModel.set('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
+    $currentReasoningMode.set('inherit')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
   })
@@ -537,6 +540,82 @@ describe('createBackendSessionForSend profile routing', () => {
       provider: 'anthropic',
       reasoning_effort: 'high'
     })
+  })
+
+  it('creates Auto sessions on the exact Sol route without a stale explicit effort', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('anthropic/claude-sonnet-4.6')
+      setCurrentProvider('anthropic')
+      setCurrentReasoningEffort('high')
+      setCurrentReasoningMode('auto')
+    })
+
+    expect(params).toMatchObject({
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      reasoning_mode: 'auto'
+    })
+    expect(params).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('creates Manual sessions with the targeted effort and selected route', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('anthropic/claude-sonnet-4.6')
+      setCurrentProvider('anthropic')
+      setCurrentReasoningEffort('high')
+      setCurrentReasoningMode('manual')
+    })
+
+    expect(params).toMatchObject({
+      model: 'anthropic/claude-sonnet-4.6',
+      provider: 'anthropic',
+      reasoning_effort: 'high',
+      reasoning_mode: 'manual'
+    })
+  })
+
+  it('keeps the legacy create shape while reasoning mode is inherited', async () => {
+    const params = await createWith(() => {
+      setCurrentReasoningEffort('medium')
+      setCurrentReasoningMode('inherit')
+    })
+
+    expect(params).toMatchObject({ reasoning_effort: 'medium' })
+    expect(params).not.toHaveProperty('reasoning_mode')
+  })
+
+  it('uses the same Auto create contract for a fresh split tile', async () => {
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+    setCurrentReasoningEffort('low')
+    setCurrentReasoningMode('auto')
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'tile-runtime', stored_session_id: 'tile-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('right')
+    })
+
+    expect(createParams).toMatchObject({
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      reasoning_mode: 'auto'
+    })
+    expect(createParams).not.toHaveProperty('reasoning_effort')
   })
 
   it('falls back to the entered project cwd when the current cwd is blank', async () => {
@@ -1019,6 +1098,8 @@ describe('branchStoredSession desktop source tagging', () => {
     setSessions([])
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
+    setCurrentReasoningMode('inherit')
+    setCurrentReasoningEffort('')
     vi.restoreAllMocks()
   })
 
@@ -1088,6 +1169,44 @@ describe('branchStoredSession desktop source tagging', () => {
       parent_session_id: 'stored-parent',
       source: 'desktop'
     })
+  })
+
+  it('uses the shared Auto create contract for branch sessions', async () => {
+    setCurrentReasoningMode('auto')
+    setCurrentReasoningEffort('high')
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    expect(createParams).toMatchObject({
+      model: 'gpt-5.6-sol',
+      parent_session_id: 'stored-parent',
+      provider: 'openai-codex',
+      reasoning_mode: 'auto'
+    })
+    expect(createParams).not.toHaveProperty('reasoning_effort')
   })
 
   // #67603: right-clicking a session outside the paginated sidebar window is a

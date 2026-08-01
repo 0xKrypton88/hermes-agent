@@ -1,18 +1,24 @@
 import { QueryClient } from '@tanstack/react-query'
 import { cleanup, render, renderHook } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
+import type { ClientSessionState } from '@/app/types'
 import { getGlobalModelInfo } from '@/hermes'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningMode,
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningMode
 } from '@/store/session'
 import type * as SessionStates from '@/store/session-states'
 
@@ -20,6 +26,7 @@ import { useModelControls } from './use-model-controls'
 
 const setGlobalModel = vi.fn()
 const notifyError = vi.fn()
+const updateTileSession = vi.hoisted(() => vi.fn())
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -42,7 +49,7 @@ vi.mock('@/store/session-states', async importOriginal => {
 
   return {
     ...actual,
-    sessionTileDelegate: () => null
+    sessionTileDelegate: () => ({ updateSession: updateTileSession })
   }
 })
 
@@ -86,6 +93,8 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setCurrentReasoningMode('inherit')
+    updateTileSession.mockReset()
   })
 
   afterEach(() => {
@@ -96,6 +105,8 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setCurrentReasoningMode('inherit')
+    updateTileSession.mockReset()
   })
 
   it('applies the global model when there is no active runtime session', async () => {
@@ -203,6 +214,72 @@ describe('useModelControls', () => {
     expect(getCurrentModelSource()).toBe('manual')
     expect(requestGateway).not.toHaveBeenCalled()
     expect(setGlobalModel).not.toHaveBeenCalled()
+  })
+
+  it('disables Auto on the draft when another model is selected', async () => {
+    setCurrentReasoningMode('auto')
+    const requestGateway = vi.fn()
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(controls.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic' })).resolves.toBe(true)
+
+    expect($currentReasoningMode.get()).toBe('manual')
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('disables Auto only on the targeted tile when that tile selects another model', async () => {
+    setCurrentReasoningMode('auto')
+
+    let tileState: ClientSessionState = {
+      ...createClientSessionState('stored-tile'),
+      fast: false,
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      reasoningEffort: '',
+      reasoningMode: 'auto'
+    }
+
+    updateTileSession.mockImplementation((runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState) => {
+      expect(runtimeId).toBe('tile-runtime')
+      tileState = updater(tileState)
+
+      return tileState
+    })
+
+    const tileView: SessionView = {
+      kind: 'tile',
+      $awaitingResponse: atom(false),
+      $busy: atom(false),
+      $cwd: atom(''),
+      $fast: atom(tileState.fast),
+      $lastVisibleIsUser: atom(false),
+      $messages: atom([]),
+      $messagesEmpty: atom(true),
+      $model: atom(tileState.model),
+      $provider: atom(tileState.provider),
+      $reasoningEffort: atom(tileState.reasoningEffort),
+      $reasoningMode: atom(tileState.reasoningMode),
+      $runtimeId: atom<string | null>('tile-runtime'),
+      $storedId: atom<string | null>('stored-tile')
+    }
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let controls!: Controls
+
+    render(
+      <SessionViewProvider value={tileView}>
+        <Harness onReady={value => (controls = value)} requestGateway={requestGateway} />
+      </SessionViewProvider>
+    )
+
+    await expect(
+      controls.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic', sessionId: 'tile-runtime' })
+    ).resolves.toBe(true)
+
+    expect(tileState.reasoningMode).toBe('manual')
+    expect($currentReasoningMode.get()).toBe('auto')
   })
 
   it('updates only the active profile new-chat cache', async () => {

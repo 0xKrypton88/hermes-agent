@@ -1,10 +1,17 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode
+} from '@/store/session'
 
 import { ModelPill } from './model-pill'
 
@@ -20,6 +27,8 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentReasoningEffort('')
+  setCurrentReasoningMode('inherit')
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
@@ -81,6 +90,22 @@ describe('ModelPill pinned-override badge', () => {
 })
 
 describe('ModelPill per-surface model label', () => {
+  it('shows the Auto route before a decision and the effective effort afterwards', () => {
+    setCurrentModel('gpt-5.6-sol')
+    setCurrentReasoningMode('auto')
+
+    const { rerender } = render(
+      <ModelPill disabled={false} model={modelState({ model: 'gpt-5.6-sol', provider: 'openai-codex' })} />
+    )
+
+    expect(screen.getByText('GPT-5.6 Sol · Auto')).toBeTruthy()
+
+    act(() => setCurrentReasoningEffort('high'))
+    rerender(<ModelPill disabled={false} model={modelState({ model: 'gpt-5.6-sol', provider: 'openai-codex' })} />)
+
+    expect(screen.getByText('High · Auto')).toBeTruthy()
+  })
+
   it('shows the chat-bar model even when the primary global differs', () => {
     setCurrentModel('primary/model')
     $activeSessionId.set('primary-runtime')
@@ -97,6 +122,7 @@ describe('ModelPill per-surface model label', () => {
       $model: atom('tile/claude-sonnet'),
       $provider: atom('anthropic'),
       $reasoningEffort: atom('high'),
+      $reasoningMode: atom('manual'),
       $runtimeId: atom('tile-runtime'),
       $storedId: atom('stored-tile')
     }

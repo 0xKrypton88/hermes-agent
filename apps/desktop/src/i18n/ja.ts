@@ -2187,6 +2187,7 @@ export const ja = defineLocale({
       thinking: '思考',
       fast: '高速',
       effort: '努力度',
+      auto: '自動',
       minimal: '最小',
       low: '低',
       medium: '中',

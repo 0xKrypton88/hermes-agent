@@ -16,7 +16,13 @@ import { useI18n } from '@/i18n'
 import { normalize } from '@/lib/text'
 import { setModelPreset } from '@/store/model-presets'
 import { notifyError } from '@/store/notifications'
-import { markComposerSelectionManual, setCurrentFastMode, setCurrentReasoningEffort } from '@/store/session'
+import {
+  $currentReasoningMode,
+  markComposerSelectionManual,
+  setCurrentFastMode,
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode
+} from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 
 // Hermes' real reasoning levels (see VALID_REASONING_EFFORTS); `none` is owned
@@ -109,10 +115,45 @@ export function ModelEditSubmenu({
   const copy = t.shell.modelOptions
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
+  const reasoningMode = useStore(view.$reasoningMode ?? $currentReasoningMode)
   const touchesPrimary = view.kind === 'primary'
+  const autoRoute = provider === 'openai-codex' && model === 'gpt-5.6-sol'
 
   const effortValue = normalizeEffort(effort)
   const thinkingOn = isThinkingEnabled(effort)
+
+  // Auto is a session/draft mode rather than a model preset. The backend is
+  // authoritative for live sessions (session.info can subsequently refine or
+  // replace this optimistic value), while a draft carries it into
+  // session.create.
+  const patchAuto = async () => {
+    if (!isActive || !autoRoute) {
+      return
+    }
+
+    if (touchesPrimary) {
+      markComposerSelectionManual()
+      setCurrentReasoningMode('auto')
+    } else if (activeSessionId) {
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningMode: 'auto' }))
+    }
+
+    if (!activeSessionId) {
+      return
+    }
+
+    try {
+      await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: 'auto' })
+    } catch (err) {
+      if (touchesPrimary) {
+        setCurrentReasoningMode(reasoningMode)
+      } else {
+        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningMode }))
+      }
+
+      notifyError(err, copy.updateFailed)
+    }
+  }
 
   // Editing always records the model's global preset (keyed by provider::model,
   // not per-surface — a tile edit re-applies to that model everywhere); the
@@ -127,9 +168,14 @@ export function ModelEditSubmenu({
 
     if (touchesPrimary) {
       markComposerSelectionManual()
+      setCurrentReasoningMode('manual')
       setCurrentReasoningEffort(next)
     } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+        ...state,
+        reasoningEffort: next,
+        reasoningMode: 'manual'
+      }))
     }
 
     // Preset-only without a session: `isActive` holds for the global/default
@@ -144,9 +190,14 @@ export function ModelEditSubmenu({
       await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
     } catch (err) {
       if (touchesPrimary) {
+        setCurrentReasoningMode(reasoningMode)
         setCurrentReasoningEffort(effort)
       } else if (activeSessionId) {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: effort }))
+        sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+          ...state,
+          reasoningEffort: effort,
+          reasoningMode
+        }))
       }
 
       setModelPreset(provider, model, { effort })
@@ -239,7 +290,19 @@ export function ModelEditSubmenu({
             <>
               <DropdownMenuSeparator className="mx-0" />
               <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
-              <DropdownMenuRadioGroup onValueChange={value => void patchReasoning(value)} value={effortValue}>
+              <DropdownMenuRadioGroup
+                onValueChange={value => (value === 'auto' ? void patchAuto() : void patchReasoning(value))}
+                value={autoRoute && reasoningMode === 'auto' ? 'auto' : effortValue}
+              >
+                {autoRoute ? (
+                  <DropdownMenuRadioItem
+                    className={dropdownMenuRow}
+                    onSelect={event => event.preventDefault()}
+                    value="auto"
+                  >
+                    {copy.auto}
+                  </DropdownMenuRadioItem>
+                ) : null}
                 {EFFORT_OPTIONS.map(option => (
                   <DropdownMenuRadioItem
                     className={dropdownMenuRow}

@@ -11,12 +11,14 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningMode,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningMode
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -152,19 +154,25 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         ? $currentProvider.get()
         : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
 
+      const prevReasoningMode = touchesPrimary
+        ? $currentReasoningMode.get()
+        : ($sessionStates.get()[liveSessionId!]?.reasoningMode ?? 'inherit')
+
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
 
       if (touchesPrimary) {
         setCurrentModel(selection.model)
         setCurrentProvider(selection.provider)
+        setCurrentReasoningMode('manual')
         markComposerSelectionManual()
       } else if (liveSessionId) {
         // Optimistic tile paint — session.info will confirm; rollback on error.
         sessionTileDelegate()?.updateSession(liveSessionId, state => ({
           ...state,
           model: selection.model,
-          provider: selection.provider
+          provider: selection.provider,
+          reasoningMode: 'manual'
         }))
       }
 
@@ -196,12 +204,14 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         if (touchesPrimary) {
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
+          setCurrentReasoningMode(prevReasoningMode)
           setCurrentModelSource(prevSource)
         } else if (liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
             model: prevModel,
-            provider: prevProvider
+            provider: prevProvider,
+            reasoningMode: prevReasoningMode
           }))
         }
 

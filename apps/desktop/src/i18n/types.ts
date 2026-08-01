@@ -1923,6 +1923,7 @@ export interface Translations {
       thinking: string
       fast: string
       effort: string
+      auto: string
       minimal: string
       low: string
       medium: string

@@ -11,6 +11,12 @@ const REASONING_LABELS: Record<string, string> = {
   ultra: 'Ultra'
 }
 
+const ADAPTIVE_REASONING_LABELS: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High'
+}
+
 export function reasoningEffortLabel(effort: string): string {
   const key = normalize(effort)
 
@@ -97,6 +103,15 @@ export function modelDisplayParts(model: string): { name: string; tag: string } 
 /** Friendly one-line model name for menus and the status bar. */
 export function displayModelName(model: string): string {
   return modelDisplayParts(model).name
+}
+
+/** Adaptive-routing status: route name until the gateway decides, then the
+ * authoritative low/medium/high effort. Auto never exposes unsupported levels. */
+export function formatAdaptiveReasoningStatusLabel(model: string, reasoningEffort: string): string {
+  const effort = ADAPTIVE_REASONING_LABELS[normalize(reasoningEffort)]
+  const route = displayModelName(model).replace(/^GPT-5\.6-sol$/i, 'GPT-5.6 Sol')
+
+  return `${effort || route} · Auto`
 }
 
 /** Status bar trigger label — model name plus the live session state (effort/fast). */

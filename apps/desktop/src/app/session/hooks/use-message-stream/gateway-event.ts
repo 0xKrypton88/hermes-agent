@@ -35,11 +35,14 @@ import {
   $currentModel,
   $currentProvider,
   sessionMatchesStoredId,
+  setCurrentAdaptivePolicyVersion,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  setCurrentReasoningReason,
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
@@ -331,6 +334,22 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (typeof payload?.reasoning_effort === 'string') {
             setCurrentReasoningEffort(payload.reasoning_effort)
+          }
+
+          if (
+            payload?.reasoning_mode === 'auto' ||
+            payload?.reasoning_mode === 'inherit' ||
+            payload?.reasoning_mode === 'manual'
+          ) {
+            setCurrentReasoningMode(payload.reasoning_mode)
+          }
+
+          if (typeof payload?.reasoning_reason === 'string') {
+            setCurrentReasoningReason(payload.reasoning_reason)
+          }
+
+          if (typeof payload?.adaptive_policy_version === 'string') {
+            setCurrentAdaptivePolicyVersion(payload.adaptive_policy_version)
           }
 
           if (typeof payload?.service_tier === 'string') {

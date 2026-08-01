@@ -2492,6 +2492,7 @@ export const zh: Translations = {
       thinking: '思考',
       fast: '快速',
       effort: '推理强度',
+      auto: '自动',
       minimal: '最小',
       low: '低',
       medium: '中',

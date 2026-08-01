@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   currentPickerSelection,
   displayModelName,
+  formatAdaptiveReasoningStatusLabel,
   formatModelStatusLabel,
   reasoningEffortLabel
 } from './model-status-label'
@@ -37,6 +38,13 @@ describe('model-status-label', () => {
   it('always surfaces the effort (default medium) so the level is visible', () => {
     expect(formatModelStatusLabel('openai/gpt-5.5', { reasoningEffort: 'medium' })).toBe('GPT-5.5 · Med')
     expect(formatModelStatusLabel('openai/gpt-5.5')).toBe('GPT-5.5 · Med')
+  })
+
+  it('formats Auto before and after the gateway chooses an effort', () => {
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', '')).toBe('GPT-5.6 Sol · Auto')
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', 'low')).toBe('Low · Auto')
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', 'medium')).toBe('Medium · Auto')
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', 'high')).toBe('High · Auto')
   })
 
   it('returns just the placeholder name when there is no model', () => {

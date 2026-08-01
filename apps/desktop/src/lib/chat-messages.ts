@@ -50,6 +50,9 @@ export type GatewayEventPayload = {
   model?: string
   provider?: string
   reasoning_effort?: string
+  reasoning_mode?: 'auto' | 'inherit' | 'manual'
+  reasoning_reason?: string
+  adaptive_policy_version?: string
   service_tier?: string
   fast?: boolean
   approval_mode?: string

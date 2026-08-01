@@ -8,11 +8,13 @@ import {
   $currentCwd,
   $currentFastMode,
   $currentReasoningEffort,
+  $currentReasoningMode,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModelSource,
-  setCurrentReasoningEffort
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode
 } from '@/store/session'
 
 import { useHermesConfig } from './use-hermes-config'
@@ -44,6 +46,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     setCurrentFastMode(false)
     setCurrentModelSource('')
     setCurrentReasoningEffort('')
+    setCurrentReasoningMode('inherit')
     persistString(WORKSPACE_CWD_KEY, null)
   })
 
@@ -73,6 +76,42 @@ describe('useHermesConfig refreshHermesConfig', () => {
     expect($currentCwd.get()).toBe('/Users/example/repo/.worktrees/attached')
   })
 
+  it('seeds Auto only for a draft whose active profile enables adaptive reasoning', async () => {
+    mockConfig({ agent: { adaptive_reasoning: { enabled: true }, reasoning_effort: 'high' } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig(true)
+    })
+
+    expect($currentReasoningMode.get()).toBe('auto')
+    expect($currentReasoningEffort.get()).toBe('high')
+  })
+
+  it('seeds inherit when the active profile does not enable adaptive reasoning', async () => {
+    setCurrentReasoningMode('auto')
+    mockConfig({ agent: { adaptive_reasoning: { enabled: false } } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig(true)
+    })
+
+    expect($currentReasoningMode.get()).toBe('inherit')
+  })
+
+  it('does not replace an active session mode with a profile default', async () => {
+    setCurrentReasoningMode('manual')
+    mockConfig({ agent: { adaptive_reasoning: { enabled: true } } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: 'runtime-1' } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig(true)
+    })
+
+    expect($currentReasoningMode.get()).toBe('manual')
+  })
+
   it('does not let a stale forced config refresh overwrite newer draft selector intent', async () => {
     const profileConfig = deferred<Awaited<ReturnType<typeof getHermesConfig>>>()
     vi.mocked(getHermesConfig).mockReturnValueOnce(profileConfig.promise)
@@ -89,9 +128,10 @@ describe('useHermesConfig refreshHermesConfig', () => {
     // defaults are still loading. That newer picker intent owns the composer.
     markComposerSelectionManual()
     setCurrentReasoningEffort('high')
+    setCurrentReasoningMode('manual')
     setCurrentFastMode(false)
     profileConfig.resolve({
-      agent: { reasoning_effort: 'low', service_tier: 'priority' }
+      agent: { adaptive_reasoning: { enabled: true }, reasoning_effort: 'low', service_tier: 'priority' }
     } as Awaited<ReturnType<typeof getHermesConfig>>)
 
     await act(async () => {
@@ -99,6 +139,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     })
 
     expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentReasoningMode.get()).toBe('manual')
     expect($currentFastMode.get()).toBe(false)
   })
 
@@ -116,16 +157,21 @@ describe('useHermesConfig refreshHermesConfig', () => {
       refreshC = result.current.refreshHermesConfig(true)
     })
 
-    profileC.resolve({ agent: { reasoning_effort: 'low', service_tier: 'normal' } })
+    profileC.resolve({
+      agent: { adaptive_reasoning: { enabled: true }, reasoning_effort: 'low', service_tier: 'normal' }
+    })
     await act(async () => {
       await refreshC
     })
-    profileB.resolve({ agent: { reasoning_effort: 'high', service_tier: 'priority' } })
+    profileB.resolve({
+      agent: { adaptive_reasoning: { enabled: false }, reasoning_effort: 'high', service_tier: 'priority' }
+    })
     await act(async () => {
       await refreshB
     })
 
     expect($currentReasoningEffort.get()).toBe('low')
+    expect($currentReasoningMode.get()).toBe('auto')
     expect($currentFastMode.get()).toBe(false)
   })
 })

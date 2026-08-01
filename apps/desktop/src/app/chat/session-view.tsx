@@ -11,6 +11,7 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $currentReasoningMode,
   $lastVisibleMessageIsUser,
   $messages,
   $messagesEmpty,
@@ -42,6 +43,7 @@ export interface SessionView {
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
+  $reasoningMode: ReadableAtom<'auto' | 'inherit' | 'manual'>
 }
 
 export const PRIMARY_SESSION_VIEW: SessionView = {
@@ -56,6 +58,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $model: $currentModel,
   $provider: $currentProvider,
   $reasoningEffort: $currentReasoningEffort,
+  $reasoningMode: $currentReasoningMode,
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId
 }

@@ -984,6 +984,17 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Narrow opt-in policy for desktop/TUI Auto reasoning. This policy never
+        # selects another model/provider, fast tier, or delegation route.
+        "adaptive_reasoning": {
+            "enabled": False,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "default_effort": "medium",
+            "min_effort": "low",
+            "max_effort": "high",
+            "followup_policy": "escalate_only",
+        },
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false

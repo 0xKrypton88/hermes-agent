@@ -174,6 +174,9 @@ export interface ClientSessionState {
   model: string
   provider: string
   reasoningEffort: string
+  reasoningMode?: 'auto' | 'inherit' | 'manual'
+  reasoningReason?: string
+  adaptivePolicyVersion?: string
   serviceTier: string
   fast: boolean
   yolo: boolean

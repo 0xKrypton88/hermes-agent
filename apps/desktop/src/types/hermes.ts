@@ -302,6 +302,9 @@ export interface GatewayReadyPayload {
 
 export interface HermesConfig {
   agent?: {
+    adaptive_reasoning?: {
+      enabled?: boolean
+    }
     reasoning_effort?: string
     personalities?: Record<string, unknown>
     service_tier?: string
@@ -558,6 +561,9 @@ export interface SessionRuntimeInfo {
   personality?: string
   provider?: string
   reasoning_effort?: string
+  reasoning_mode?: 'auto' | 'inherit' | 'manual'
+  reasoning_reason?: string
+  adaptive_policy_version?: string
   running?: boolean
   service_tier?: string
   skills?: Record<string, string[]> | string[]

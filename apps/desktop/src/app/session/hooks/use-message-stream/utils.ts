@@ -6,7 +6,18 @@ import type { ClientSessionState } from '../../../types'
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'adaptivePolicyVersion'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'reasoningMode'
+    | 'reasoningReason'
+    | 'serviceTier'
+    | 'yolo'
   >
 >
 
@@ -35,6 +46,18 @@ export function sessionInfoStatePatch(payload: GatewayEventPayload | undefined):
 
   if (typeof payload?.reasoning_effort === 'string') {
     patch.reasoningEffort = payload.reasoning_effort
+  }
+
+  if (payload?.reasoning_mode === 'auto' || payload?.reasoning_mode === 'inherit' || payload?.reasoning_mode === 'manual') {
+    patch.reasoningMode = payload.reasoning_mode
+  }
+
+  if (typeof payload?.reasoning_reason === 'string') {
+    patch.reasoningReason = payload.reasoning_reason
+  }
+
+  if (typeof payload?.adaptive_policy_version === 'string') {
+    patch.adaptivePolicyVersion = payload.adaptive_policy_version
   }
 
   if (typeof payload?.service_tier === 'string') {

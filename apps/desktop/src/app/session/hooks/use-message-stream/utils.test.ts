@@ -38,6 +38,24 @@ describe('sessionInfoStatePatch / hasSessionInfoStatePatch', () => {
     expect(hasSessionInfoStatePatch(patch)).toBe(true)
     expect(hasSessionInfoStatePatch(sessionInfoStatePatch(payload({})))).toBe(false)
   })
+
+  it('extracts authoritative adaptive reasoning metadata for foreground and tile caches', () => {
+    expect(
+      sessionInfoStatePatch(
+        payload({
+          reasoning_effort: 'high',
+          reasoning_mode: 'auto',
+          reasoning_reason: 'unknown_root_cause',
+          adaptive_policy_version: '1'
+        })
+      )
+    ).toMatchObject({
+      adaptivePolicyVersion: '1',
+      reasoningEffort: 'high',
+      reasoningMode: 'auto',
+      reasoningReason: 'unknown_root_cause'
+    })
+  })
 })
 
 describe('delegateTaskPayloads', () => {

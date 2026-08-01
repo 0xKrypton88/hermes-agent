@@ -13,10 +13,12 @@ import {
   $activeSessionId,
   $currentFastMode,
   $currentReasoningEffort,
+  $currentReasoningMode,
   getCurrentModelSource,
   setCurrentFastMode,
   setCurrentModelSource,
-  setCurrentReasoningEffort
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode
 } from '@/store/session'
 
 import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
@@ -40,6 +42,7 @@ beforeEach(() => {
   setCurrentFastMode(false)
   setCurrentModelSource('')
   setCurrentReasoningEffort('')
+  setCurrentReasoningMode('inherit')
 })
 
 afterEach(() => {
@@ -48,7 +51,13 @@ afterEach(() => {
 })
 
 // Render the submenu inside an open menu/sub so its content (switches) mounts.
-function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; requestGateway: () => Promise<unknown> }) {
+function renderSubmenu(opts: {
+  fastControl: FastControl
+  model?: string
+  provider?: string
+  reasoning: boolean
+  requestGateway: () => Promise<unknown>
+}) {
   return render(
     <DropdownMenu open>
       <DropdownMenuContent>
@@ -58,9 +67,9 @@ function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; req
             effort="medium"
             fastControl={opts.fastControl}
             isActive
-            model="m1"
+            model={opts.model ?? 'm1'}
             onSelectModel={vi.fn()}
-            provider="p1"
+            provider={opts.provider ?? 'p1'}
             reasoning={opts.reasoning}
             requestGateway={opts.requestGateway as never}
           />
@@ -73,6 +82,64 @@ function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; req
 // Regression: editing the active row before a live session exists must stay
 // preset-only — the gateway's config.set falls back to global config when no
 // session matches, so it must not be called. (Caught in the second review.)
+describe('ModelEditSubmenu adaptive reasoning mode', () => {
+  it('renders Auto as the first reasoning choice and selects it for the draft only', () => {
+    const requestGateway = vi.fn().mockResolvedValue({})
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      reasoning: true,
+      requestGateway
+    })
+
+    const choices = screen.getAllByRole('menuitemradio')
+    expect(choices[0].textContent).toContain('Auto')
+    fireEvent.click(choices[0])
+
+    expect($currentReasoningMode.get()).toBe('auto')
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('enables Auto on the active session through the authoritative gateway', () => {
+    const requestGateway = vi.fn().mockResolvedValue({})
+    $activeSessionId.set('sess1')
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      reasoning: true,
+      requestGateway
+    })
+
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Auto' }))
+
+    expect($currentReasoningMode.get()).toBe('auto')
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      key: 'reasoning',
+      session_id: 'sess1',
+      value: 'auto'
+    })
+  })
+
+  it('makes the active primary session manual when an explicit effort is selected', () => {
+    const requestGateway = vi.fn().mockResolvedValue({})
+    $activeSessionId.set('sess1')
+    setCurrentReasoningMode('auto')
+    renderSubmenu({ fastControl: { kind: 'none' }, reasoning: true, requestGateway })
+
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'High' }))
+
+    expect($currentReasoningMode.get()).toBe('manual')
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      key: 'reasoning',
+      session_id: 'sess1',
+      value: 'high'
+    })
+  })
+})
+
 describe('ModelEditSubmenu no-session guard', () => {
   it('param fast: records explicit off in the draft but skips the gateway without a session', () => {
     const requestGateway = vi.fn().mockResolvedValue({})

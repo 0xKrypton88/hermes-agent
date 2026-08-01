@@ -6,7 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import {
+  $currentAdaptivePolicyVersion,
+  $currentReasoningEffort,
+  $currentReasoningMode,
+  $currentReasoningReason,
+  setCurrentAdaptivePolicyVersion,
+  setCurrentModel,
+  setCurrentProvider,
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  setCurrentReasoningReason
+} from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
@@ -22,10 +33,11 @@ let handleEvent: ((event: RpcEvent) => void) | null = null
 let refreshHermesConfig: ReturnType<typeof vi.fn<() => Promise<void>>>
 let refreshSessions: ReturnType<typeof vi.fn<() => Promise<void>>>
 let queryClient: QueryClient
+let sessionStates: Map<string, ClientSessionState>
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(ACTIVE_SID)
-  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+  const sessionStateByRuntimeIdRef = useRef(sessionStates)
 
   const stream = useMessageStream({
     activeGatewayProfile: ACTIVE_PROFILE,
@@ -64,14 +76,23 @@ beforeEach(() => {
   refreshHermesConfig = vi.fn<() => Promise<void>>(async () => undefined)
   refreshSessions = vi.fn<() => Promise<void>>(async () => undefined)
   queryClient = new QueryClient()
+  sessionStates = new Map()
   setCurrentModel('')
   setCurrentProvider('')
+  setCurrentReasoningEffort('')
+  setCurrentReasoningMode('inherit')
+  setCurrentReasoningReason('')
+  setCurrentAdaptivePolicyVersion('')
 })
 
 afterEach(() => {
   cleanup()
   setCurrentModel('')
   setCurrentProvider('')
+  setCurrentReasoningEffort('')
+  setCurrentReasoningMode('inherit')
+  setCurrentReasoningReason('')
+  setCurrentAdaptivePolicyVersion('')
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -136,6 +157,36 @@ describe('session.info model-options invalidation gating', () => {
     sessionInfo(ACTIVE_SID, { model: 'm2', provider: 'p1', running: true })
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: modelOptionsQueryKey(ACTIVE_PROFILE, ACTIVE_SID) })
+  })
+})
+
+describe('session.info adaptive reasoning authority', () => {
+  it('updates the foreground view and keeps background tile metadata isolated', async () => {
+    await mountStream()
+
+    sessionInfo(ACTIVE_SID, {
+      adaptive_policy_version: '1',
+      reasoning_effort: 'high',
+      reasoning_mode: 'auto',
+      reasoning_reason: 'unknown_root_cause'
+    })
+    sessionInfo('session-background', {
+      adaptive_policy_version: '1',
+      reasoning_effort: 'low',
+      reasoning_mode: 'auto',
+      reasoning_reason: 'micro'
+    })
+
+    expect($currentReasoningMode.get()).toBe('auto')
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentReasoningReason.get()).toBe('unknown_root_cause')
+    expect($currentAdaptivePolicyVersion.get()).toBe('1')
+    expect(sessionStates.get('session-background')).toMatchObject({
+      adaptivePolicyVersion: '1',
+      reasoningEffort: 'low',
+      reasoningMode: 'auto',
+      reasoningReason: 'micro'
+    })
   })
 })
 

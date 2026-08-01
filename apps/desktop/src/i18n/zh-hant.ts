@@ -2114,6 +2114,7 @@ export const zhHant = defineLocale({
       thinking: '思考',
       fast: '快速',
       effort: '推理強度',
+      auto: '自動',
       minimal: '最小',
       low: '低',
       medium: '中',
