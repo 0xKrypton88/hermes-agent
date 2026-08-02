@@ -1315,16 +1315,22 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         logger.info("Model %s not available on Groq, using %s", model_name, DEFAULT_GROQ_STT_MODEL)
         model_name = DEFAULT_GROQ_STT_MODEL
 
+    groq_config = _get_stt_section(_load_stt_config(), "groq")
+    prompt = str(groq_config.get("prompt") or "").strip()
+
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
         client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model=model_name,
-                    file=audio_file,
-                    response_format="text",
-                )
+                transcription_kwargs = {
+                    "model": model_name,
+                    "file": audio_file,
+                    "response_format": "text",
+                }
+                if prompt:
+                    transcription_kwargs["prompt"] = prompt
+                transcription = client.audio.transcriptions.create(**transcription_kwargs)
 
             transcript_text = str(transcription).strip()
             logger.info("Transcribed %s via Groq API (%s, %d chars)",
@@ -1768,7 +1774,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         return _transcribe_local_command(file_path, model_name)
 
     if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
+        groq_cfg = stt_config.get("groq") or {}
+        model_name = model or groq_cfg.get("model", DEFAULT_GROQ_STT_MODEL)
         return _transcribe_groq(file_path, model_name)
 
     if provider == "openai":

@@ -601,6 +601,11 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+_NON_CANCELLING_SESSION_END_REASONS = frozenset(
+    {"ws_disconnect", "ws_orphan_reap", "idle_timeout", "lru_evict"}
+)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -703,33 +708,33 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
-    # A session's in-flight async delegations end WITH the session (#55578):
-    # once nobody owns the return address, a still-running background subagent
-    # can only burn tokens and park an orphaned completion on the shared
-    # queue. Always interrupt delegations commissioned by THIS live UI session
-    # (its sid); additionally interrupt by durable session_key, but only when
-    # the TUI owns the lifecycle — closing a viewer tab on a live gateway
-    # session must not kill the gateway's own background work.
-    try:
-        from tools.async_delegation import interrupt_for_session
+    # Explicit user/session boundaries end their in-flight delegations (#55578).
+    # Automatic transport/retention cleanup only releases the runtime wrapper:
+    # durable delegation work and its completion survive for a later reattach.
+    # Explicit boundaries interrupt work commissioned by THIS live UI session
+    # (its sid), plus the durable session_key when the TUI owns the lifecycle;
+    # a viewer tab on a live gateway session never owns that durable lifecycle.
+    if end_reason not in _NON_CANCELLING_SESSION_END_REASONS:
+        try:
+            from tools.async_delegation import interrupt_for_session
 
-        _own_sid = str(session.get("_sid") or "")
-        if not _own_sid:
-            try:
-                with _sessions_lock:
-                    for _cand_sid, _cand in _sessions.items():
-                        if _cand is session:
-                            _own_sid = _cand_sid
-                            break
-            except Exception:
-                _own_sid = ""
-        interrupt_for_session(
-            session_key=str(session_key or "") if _tui_owns_lifecycle else "",
-            origin_ui_session_id=_own_sid,
-            reason=end_reason,
-        )
-    except Exception:
-        pass
+            _own_sid = str(session.get("_sid") or "")
+            if not _own_sid:
+                try:
+                    with _sessions_lock:
+                        for _cand_sid, _cand in _sessions.items():
+                            if _cand is session:
+                                _own_sid = _cand_sid
+                                break
+                except Exception:
+                    _own_sid = ""
+            interrupt_for_session(
+                session_key=str(session_key or "") if _tui_owns_lifecycle else "",
+                origin_ui_session_id=_own_sid,
+                reason=end_reason,
+            )
+        except Exception:
+            pass
 
     # Close the slash-worker subprocess as part of finalize itself, not just
     # in the callers. Defense-in-depth: every session-end path goes through
@@ -834,7 +839,88 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     )
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
+def _session_has_active_async_delegation(sid: str, session: dict | None) -> bool:
+    """Whether active/finalizing delegation work is owned by this session."""
+    if not session:
+        return False
+    try:
+        from tools.async_delegation import session_has_active_delegation
+
+        keys = {
+            str(session.get("session_key") or ""),
+            str(_session_lookup_key(session, fallback=sid) or ""),
+        }
+        agent = session.get("agent")
+        keys.add(str(getattr(agent, "session_id", "") or ""))
+        keys.discard("")
+
+        def _resolve(key: str) -> str:
+            try:
+                with _session_db(session) as db:
+                    if db is not None:
+                        return str(db.resolve_resume_session_id(key) or key)
+            except Exception:
+                pass
+            return key
+
+        return session_has_active_delegation(
+            origin_ui_session_id=sid,
+            session_keys=keys,
+            key_resolver=_resolve,
+        )
+    except Exception:
+        # Cleanup must fail safe: if ownership cannot be checked, keep the
+        # detached runtime rather than risking interruption of live compute.
+        return True
+
+
+def _restore_pending_async_delegations(sid: str, session: dict) -> int:
+    """Requeue this reattached session's durable pending completions."""
+    if session.get("_finalized") or _transport_is_dead(session.get("transport")):
+        return 0
+
+    home_token = None
+    try:
+        from tools.async_delegation import restore_undelivered_completions
+        from tools.process_registry import process_registry
+
+        keys = {
+            str(session.get("session_key") or ""),
+            str(_session_lookup_key(session, fallback=sid) or ""),
+        }
+        keys.discard("")
+        profile_home = session.get("profile_home")
+        if profile_home:
+            home_token = set_hermes_home_override(str(profile_home))
+        with _session_db(session) as db:
+
+            def _resolve_key(key: str) -> str:
+                if db is None:
+                    return key
+                try:
+                    return str(db.resolve_resume_session_id(key) or key)
+                except Exception:
+                    return key
+
+            return restore_undelivered_completions(
+                process_registry.completion_queue,
+                origin_ui_session_id=sid,
+                session_keys=keys,
+                key_resolver=_resolve_key,
+            )
+    except Exception:
+        logger.warning(
+            "Could not restore async delegation completions for session %s",
+            sid,
+            exc_info=True,
+        )
+        return 0
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _ws_session_is_orphaned(session: dict | None, sid: str = "") -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
     After ``handle_ws`` detaches a disconnected client it points the session at
@@ -844,6 +930,11 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    if not sid:
+        with _sessions_lock:
+            sid = next((key for key, candidate in _sessions.items() if candidate is session), "")
+    if _session_has_active_async_delegation(sid, session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -870,7 +961,15 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
         with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
+            candidate = _sessions.get(sid)
+            if (
+                candidate
+                and candidate.get("transport") is _detached_ws_transport
+                and _session_has_active_async_delegation(sid, candidate)
+            ):
+                _schedule_ws_orphan_reap(sid)
+                return
+            if not _ws_session_is_orphaned(candidate, sid):
                 return
             session = _pop_session_by_id(sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
@@ -948,6 +1047,8 @@ def _transport_is_dead(transport) -> bool:
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     if session.get("running") or _session_pending_kind(sid):
         return False
+    if _session_has_active_async_delegation(sid, session):
+        return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
     # so their forever-unset agent_ready must not make them immortal.
@@ -998,6 +1099,8 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # awaiting input, or still building), but WITHOUT the hours-scale age gate:
     # a detached session is eligible the moment it loses its client.
     if session.get("running") or _session_pending_kind(sid):
+        return False
+    if _session_has_active_async_delegation(sid, session):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
@@ -7391,6 +7494,7 @@ def _(rid, params: dict) -> dict:
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
+        _restore_pending_async_delegations(sid, record)
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -7488,6 +7592,7 @@ def _(rid, params: dict) -> dict:
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
+        _restore_pending_async_delegations(sid, record)
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
         auto_continue = _maybe_schedule_auto_continue(sid, record, target)
@@ -7636,6 +7741,8 @@ def _(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
+    if session:
+        _restore_pending_async_delegations(sid, session)
     auto_continue = (
         _maybe_schedule_auto_continue(sid, session, target) if session else None
     )
@@ -7773,7 +7880,11 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent, session)
+        # Keep this projection on the public one-argument compatibility path.
+        # Besides allowing callers/tests to wrap ``_session_info(agent)``, the
+        # helper already resolves the owning live session from ``_sessions`` so
+        # adaptive-reasoning metadata is still included.
+        return _session_info(agent)
     cwd = _display_session_cwd(session) or _default_session_cwd()
     override = session.get("model_override")
     override = override if isinstance(override, dict) else {}
@@ -7877,6 +7988,8 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+    if transport is not None:
+        _restore_pending_async_delegations(sid, session)
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
@@ -11045,6 +11158,8 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     chat (#55578).
     """
     if session.get("_finalized"):
+        return False
+    if _transport_is_dead(session.get("transport")):
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True

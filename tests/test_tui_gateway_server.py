@@ -2897,6 +2897,57 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert closed["count"] == 1
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["ws_disconnect", "ws_orphan_reap", "idle_timeout", "lru_evict"],
+)
+def test_automatic_cleanup_does_not_interrupt_async_delegation(monkeypatch, reason):
+    import contextlib
+    from tools import async_delegation as ad
+
+    interrupted = []
+    monkeypatch.setattr(
+        ad,
+        "interrupt_for_session",
+        lambda **kwargs: interrupted.append(kwargs) or 1,
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(None))
+
+    session = _session(agent=types.SimpleNamespace(session_id="durable-owner"))
+    session["_sid"] = "runtime-owner"
+    server._finalize_session(session, end_reason=reason)
+
+    assert interrupted == []
+
+
+@pytest.mark.parametrize("reason", ["tui_close", "tui_shutdown"])
+def test_explicit_session_end_preserves_async_delegation_interrupt(monkeypatch, reason):
+    import contextlib
+    from tools import async_delegation as ad
+
+    interrupted = []
+    monkeypatch.setattr(
+        ad,
+        "interrupt_for_session",
+        lambda **kwargs: interrupted.append(kwargs) or 1,
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(None))
+
+    session = _session(agent=types.SimpleNamespace(session_id="durable-owner"))
+    session["_sid"] = "runtime-owner"
+    server._finalize_session(session, end_reason=reason)
+
+    assert interrupted == [
+        {
+            "session_key": "session-key",
+            "origin_ui_session_id": "runtime-owner",
+            "reason": reason,
+        }
+    ]
+
+
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
     """A session that rebinds a live transport is NOT considered orphaned."""
 
@@ -2936,6 +2987,71 @@ def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     server._schedule_ws_orphan_reap("any-sid")
     assert fired["timer"] is False
+
+
+def test_async_delegation_protects_detached_session_cleanup_until_settled(monkeypatch):
+    from tools import async_delegation as ad
+
+    sid = "delegation-owner-ui"
+    session_key = "delegation-owner-durable"
+    now = time.time()
+    session = _idle_evictable_session(now) | {
+        "session_key": session_key,
+        "transport": server._detached_ws_transport,
+    }
+    scheduled = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            self.daemon = False
+            scheduled.append(self)
+
+        def start(self):
+            return None
+
+    with ad._records_lock:
+        ad._records["deleg_cleanup_guard"] = {
+            "delegation_id": "deleg_cleanup_guard",
+            "status": "finalizing",
+            "session_key": session_key,
+            "origin_ui_session_id": sid,
+            "parent_session_id": "delegation-owner-parent",
+        }
+
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_session_pending_kind", lambda _sid: "")
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)),
+    )
+    server._sessions[sid] = session
+    try:
+        assert server._ws_session_is_orphaned(session) is False
+        assert server._session_is_evictable(sid, session, now) is False
+        assert server._session_is_lru_evictable(sid, session) is False
+
+        server._schedule_ws_orphan_reap(sid)
+        assert len(scheduled) == 1
+        scheduled.pop(0).callback()
+
+        assert server._sessions[sid] is session
+        assert torn_down == []
+        assert len(scheduled) == 1, "protected orphan cleanup must retry after grace"
+
+        with ad._records_lock:
+            ad._records.pop("deleg_cleanup_guard", None)
+        scheduled.pop(0).callback()
+
+        assert sid not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        with ad._records_lock:
+            ad._records.pop("deleg_cleanup_guard", None)
+        server._sessions.pop(sid, None)
 
 
 def test_init_session_fires_reset_hook(monkeypatch):
@@ -3135,6 +3251,29 @@ def test_async_delegation_event_prefers_origin_ui_session(monkeypatch):
 
     assert server._notification_event_belongs_elsewhere("other-sid", other, evt) is True
     assert server._notification_event_belongs_elsewhere("origin-sid", mine, evt) is False
+
+
+def test_detached_session_cannot_claim_its_async_completion(monkeypatch):
+    detached = _session(
+        session_key="detached-owner",
+        transport=server._detached_ws_transport,
+    )
+    unrelated = _session(session_key="unrelated-owner", transport=object())
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_detached",
+        "session_key": "detached-owner",
+        "origin_ui_session_id": "detached-sid",
+    }
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"detached-sid": detached, "unrelated-sid": unrelated},
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    assert server._session_owns_notification_event("detached-sid", detached, event) is False
+    assert server._session_owns_notification_event("unrelated-sid", unrelated, event) is False
 
 
 def test_notification_event_follows_compression_continuation(monkeypatch):
@@ -10603,6 +10742,86 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
     finally:
         server._sessions.pop("sid-a", None)
         server._sessions.pop("sid-b", None)
+
+
+@pytest.mark.parametrize("method", ["session.resume", "session.activate"])
+def test_session_transport_rebind_restores_pending_async_completion(monkeypatch, method):
+    from tools import async_delegation as ad
+
+    class _DB:
+        def get_session(self, key):
+            return {"id": key, "cwd": "", "source": "desktop"}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, key):
+            return key
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
+    live_transport = object()
+    calls = []
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live", session_id="durable-owner"),
+        session_key="durable-owner",
+        transport=server._detached_ws_transport,
+        created_at=time.time(),
+        last_active=time.time(),
+    )
+    server._sessions["runtime-owner"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "current_transport", lambda: live_transport)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {"model": "model-live"})
+    monkeypatch.setattr(
+        ad,
+        "restore_undelivered_completions",
+        lambda _queue, **kwargs: calls.append(kwargs) or 1,
+    )
+
+    params = {"session_id": "runtime-owner"}
+    if method == "session.resume":
+        params["session_id"] = "durable-owner"
+    try:
+        response = server._methods[method]("rebind", params)
+        assert "result" in response
+        assert session["transport"] is live_transport
+        targeted = [call for call in calls if call.get("session_keys")]
+        assert len(targeted) == 1
+        assert targeted[0]["origin_ui_session_id"] == "runtime-owner"
+        assert "durable-owner" in targeted[0]["session_keys"]
+    finally:
+        server._sessions.pop("runtime-owner", None)
+
+
+def test_session_transport_rebind_survives_completion_restore_failure(monkeypatch):
+    from tools import async_delegation as ad
+
+    live_transport = object()
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live", session_id="durable-owner"),
+        session_key="durable-owner",
+        transport=server._detached_ws_transport,
+    )
+    server._sessions["runtime-owner"] = session
+    monkeypatch.setattr(server, "current_transport", lambda: live_transport)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        ad,
+        "restore_undelivered_completions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("state db unavailable")),
+    )
+
+    try:
+        response = server._methods["session.activate"](
+            "rebind-failure", {"session_id": "runtime-owner"}
+        )
+        assert "result" in response
+        assert response["result"]["session_id"] == "runtime-owner"
+        assert session["transport"] is live_transport
+    finally:
+        server._sessions.pop("runtime-owner", None)
 
 
 # ── session.most_recent ──────────────────────────────────────────────

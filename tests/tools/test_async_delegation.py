@@ -143,6 +143,25 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_session_has_active_delegation_matches_runtime_and_durable_owners():
+    probe = getattr(ad, "session_has_active_delegation", None)
+    assert callable(probe), "async delegation must expose an ownership/activity API"
+
+    with ad._records_lock:
+        ad._records["deleg_owned"] = {
+            "delegation_id": "deleg_owned",
+            "status": "finalizing",
+            "session_key": "durable-session",
+            "origin_ui_session_id": "runtime-ui",
+            "parent_session_id": "lineage-parent",
+        }
+
+    assert probe(origin_ui_session_id="runtime-ui") is True
+    assert probe(session_keys={"durable-session"}) is True
+    assert probe(session_keys={"lineage-parent"}) is True
+    assert probe(origin_ui_session_id="other-ui", session_keys={"other-session"}) is False
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -227,6 +246,35 @@ def test_interrupt_all_signals_running_children():
     evt = _drain_for(r["delegation_id"])
     assert evt is not None
     assert evt["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("reason", ["user_reset", "user_interrupt"])
+def test_interrupt_for_session_preserves_explicit_cancellation(reason):
+    gate = threading.Event()
+    interrupted = []
+
+    result = ad.dispatch_async_delegation(
+        goal="explicit cancellation",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="durable-owner",
+        parent_session_id="lineage-owner",
+        origin_ui_session_id="runtime-owner",
+        runner=lambda: (
+            gate.wait(timeout=60),
+            {"status": "interrupted", "summary": None, "error": reason},
+        )[1],
+        interrupt_fn=lambda: (interrupted.append(reason), gate.set()),
+        max_async_children=1,
+    )
+
+    assert ad.interrupt_for_session(
+        parent_session_id="lineage-owner", reason=reason
+    ) == 1
+    assert interrupted == [reason]
+    assert _drain_for(result["delegation_id"])["status"] == "interrupted"
 
 
 def test_completed_records_pruned_to_cap():
@@ -492,6 +540,63 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.complete_completion_delivery("deleg_claim", "consumer-b")
     assert not ad.claim_completion_delivery("deleg_claim", "consumer-c")
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
+
+
+def test_targeted_restore_replays_only_owner_and_exactly_once():
+    import queue as queue_mod
+
+    def _persist_pending(delegation_id, session_key, origin_ui_session_id):
+        dispatched_at = time.time()
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "parent_session_id": f"{session_key}-parent",
+            "origin_session_id": "",
+            "dispatched_at": dispatched_at,
+        }
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "parent_session_id": record["parent_session_id"],
+            "status": "completed",
+            "summary": f"result for {session_key}",
+            "dispatched_at": dispatched_at,
+            "completed_at": dispatched_at + 1,
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
+
+    _persist_pending("deleg_owner_a", "owner-a", "detached-ui-a")
+    _persist_pending("deleg_owner_b", "owner-b", "live-ui-b")
+    target = queue_mod.Queue()
+
+    try:
+        restored = ad.restore_undelivered_completions(
+            target,
+            session_keys={"owner-a"},
+            origin_ui_session_id="resumed-ui-a",
+        )
+    except TypeError:
+        restored = 0
+    assert restored == 1
+    event = target.get_nowait()
+    assert event["delegation_id"] == "deleg_owner_a"
+    assert target.empty()
+
+    claim = ad.claim_event_delivery(event, "resume-test")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+
+    assert ad.restore_undelivered_completions(
+        target,
+        session_keys={"owner-a"},
+        origin_ui_session_id="resumed-ui-a",
+    ) == 0
+    assert target.empty()
+    assert ad.get_durable_delegation("deleg_owner_b")["delivery_state"] == "pending"
 
 
 # ---------------------------------------------------------------------------

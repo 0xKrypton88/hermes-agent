@@ -30,6 +30,7 @@ class FakeWebSocket {
   // errors (a dead remote). Mirrors a VPS going away after the first connect.
   static mode: 'open' | 'fail' = 'open'
   static instances: FakeWebSocket[] = []
+  static requests: Array<{ method: string; params?: Record<string, unknown>; url: string }> = []
 
   readyState = 0
   private listeners: Record<string, Set<Listener>> = {}
@@ -61,6 +62,33 @@ class FakeWebSocket {
   close() {
     this.readyState = FakeWebSocket.CLOSED
     this.emit('close', {})
+  }
+
+  send(data: string) {
+    const request = JSON.parse(data) as {
+      id: number
+      method: string
+      params?: Record<string, unknown>
+    }
+
+    FakeWebSocket.requests.push({ method: request.method, params: request.params, url: this.url })
+
+    const response =
+      request.method === 'session.active_list'
+        ? {
+            id: request.id,
+            jsonrpc: '2.0',
+            result: { sessions: [{ id: 'runtime-fails' }, { id: 'runtime-survives' }] }
+          }
+        : request.method === 'session.activate' && request.params?.session_id === 'runtime-fails'
+          ? {
+              error: { code: 5000, message: 'activation failed' },
+              id: request.id,
+              jsonrpc: '2.0'
+            }
+          : { id: request.id, jsonrpc: '2.0', result: {} }
+
+    queueMicrotask(() => this.emit('message', { data: JSON.stringify(response) }))
   }
 
   // Force-drop an open socket, as a sleeping laptop / restarted remote would.
@@ -146,6 +174,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
+  FakeWebSocket.requests = []
   connectionApplied = null
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
@@ -199,6 +228,36 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('reattaches every live runtime once per gateway connection epoch without coupling sibling failures', async () => {
+    const { rerender } = render(<Harness />)
+    await flushAsync()
+    await flushAsync()
+
+    expect(FakeWebSocket.requests.filter(request => request.method === 'session.active_list')).toHaveLength(1)
+    expect(
+      FakeWebSocket.requests
+        .filter(request => request.method === 'session.activate')
+        .map(request => request.params?.session_id)
+    ).toEqual(['runtime-fails', 'runtime-survives'])
+    expect($gatewayState.get()).toBe('open')
+
+    rerender(<Harness />)
+    await flushAsync()
+    expect(FakeWebSocket.requests.filter(request => request.method === 'session.active_list')).toHaveLength(1)
+
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    await advanceBackoff()
+    await flushAsync()
+
+    expect(FakeWebSocket.requests.filter(request => request.method === 'session.active_list')).toHaveLength(2)
+    expect(
+      FakeWebSocket.requests
+        .filter(request => request.method === 'session.activate')
+        .map(request => request.params?.session_id)
+    ).toEqual(['runtime-fails', 'runtime-survives', 'runtime-fails', 'runtime-survives'])
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

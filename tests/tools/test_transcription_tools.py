@@ -255,6 +255,22 @@ class TestTranscribeGroq:
         assert result["provider"] == "groq"
         mock_client.close.assert_called_once()
 
+    def test_passes_configured_prompt(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "Groq and Whisper large-v3"
+        config = {"groq": {"prompt": "Groq, Whisper large-v3, Hermes"}}
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3")
+
+        assert result["success"] is True
+        assert mock_client.audio.transcriptions.create.call_args.kwargs["prompt"] == "Groq, Whisper large-v3, Hermes"
+
     def test_whitespace_stripped(self, monkeypatch, sample_wav):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
 

@@ -39,19 +39,69 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
+_PROJECT_AREA_PROMPT = (
+    "Generate a short session title using exactly this format: PROJECT - AREA. "
+    "PROJECT is the stable product, system, or repository name; preserve canonical spelling "
+    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase. "
+    "Use the user's language for ordinary words, but preserve established project names and "
+    "English technical terms. Keep the complete title at 40 characters or fewer. "
+    "Never use prompt-like prefixes such as Help with, Hjälp med, I want, Jag vill, Review, "
+    "Granska, Test of, Test av, Workflows for, or Arbetsflöden för. "
+    "Return ONLY the title text, with no quotes or trailing punctuation."
+)
+
+_PROJECT_AREA_PROMPT_PINNED_LANGUAGE = (
+    "Generate a short session title using exactly this format: PROJECT - AREA. "
+    "PROJECT is the stable product, system, or repository name; preserve canonical spelling "
+    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase. "
+    "Write ordinary words in {language}, but preserve established project names and English "
+    "technical terms. Keep the complete title at 40 characters or fewer. "
+    "Never use prompt-like prefixes such as Help with, Hjälp med, I want, Jag vill, Review, "
+    "Granska, Test of, Test av, Workflows for, or Arbetsflöden för. "
+    "Return ONLY the title text, with no quotes or trailing punctuation."
+)
+
+_PROMPT_LIKE_TITLE_PREFIXES = (
+    "help with",
+    "hjälp med",
+    "i want",
+    "jag vill",
+    "review ",
+    "granska ",
+    "test of",
+    "test av",
+    "workflows for",
+    "arbetsflöden för",
+)
+
 
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
         return str(
-            ((load_config() or {}).get("auxiliary") or {})
+            ((load_config_readonly() or {}).get("auxiliary") or {})
             .get("title_generation", {})
             .get("language", "")
         ).strip()
     except Exception:
         return ""
+
+
+def _title_style() -> str:
+    """Return the configured title style, failing closed to legacy behavior."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = str(
+            ((load_config_readonly() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("style", "descriptive")
+        ).strip().lower().replace("-", "_")
+        return "project_area" if value == "project_area" else "descriptive"
+    except Exception:
+        return "descriptive"
 
 
 def _auto_title_enabled() -> bool:
@@ -69,6 +119,27 @@ def _auto_title_enabled() -> bool:
     except Exception:
         logger.debug("Failed to read title_generation.enabled", exc_info=True)
         return True
+
+
+def _summarize_user_message(user_message: str) -> str:
+    """Collapse a slash-skill-expanded turn back to what the user typed.
+
+    A ``/skill`` invocation expands into a message that embeds the whole skill
+    body, so feeding it to the titler verbatim titles the session after the
+    *skill's* prose — "Kick off a task in a fresh isolated git worktree" — not
+    after the user's request. Reuse the canonical scaffolding parser so the
+    model sees ``/work — fix the title leak`` instead.
+    """
+    if not user_message:
+        return ""
+    try:
+        from agent.skill_commands import describe_skill_invocation
+
+        described = describe_skill_invocation(user_message)
+    except Exception:
+        logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
+        return user_message
+    return described if described is not None else user_message
 
 
 def generate_title(
@@ -110,11 +181,23 @@ def generate_title(
             logger.debug("Title runtime validator raised; proceeding", exc_info=True)
 
     # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
+    user_snippet = _summarize_user_message(user_message)[:500]
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 
     language = _title_language()
-    prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT
+    style = _title_style()
+    if style == "project_area":
+        prompt = (
+            _PROJECT_AREA_PROMPT_PINNED_LANGUAGE.format(language=language)
+            if language
+            else _PROJECT_AREA_PROMPT
+        )
+    else:
+        prompt = (
+            _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language)
+            if language
+            else _TITLE_PROMPT
+        )
 
     messages = [
         {"role": "system", "content": prompt},
@@ -143,8 +226,31 @@ def generate_title(
         title = title.strip('"\'')
         if title.lower().startswith("title:"):
             title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
+        # A title is one line. A model that ignores "return ONLY the title" and
+        # answers the prompt instead (a shell transcript, a bulleted plan) would
+        # otherwise be stored verbatim and truncated mid-command. Keep the first
+        # non-empty line — the closest thing to a title in that response.
+        title = next((line.strip() for line in title.splitlines() if line.strip()), "")
+        if style == "project_area":
+            # Accept common typographic separators from otherwise-compliant
+            # models, then enforce the configured contract before persistence.
+            title = title.replace(" — ", " - ").replace(" – ", " - ")
+            title = title.rstrip(".!?:;").strip()
+            lowered = title.casefold()
+            if lowered.startswith(_PROMPT_LIKE_TITLE_PREFIXES):
+                return None
+            if len(title) > 40 or title.count(" - ") != 1:
+                return None
+            project, area = (part.strip() for part in title.split(" - ", 1))
+            if (
+                not project
+                or not area
+                or area.casefold().startswith(_PROMPT_LIKE_TITLE_PREFIXES)
+            ):
+                return None
+            title = f"{project} - {area}"
+        elif len(title) > 80:
+            # Preserve the legacy descriptive-style limit unchanged.
             title = title[:77] + "..."
         return title if title else None
     except Exception as e:

@@ -2,6 +2,7 @@ import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@h
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
+import { createGatewayOpenEpochHandler } from '@/lib/live-session-reattach'
 import { setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
@@ -22,6 +23,7 @@ const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionSt
 
 interface RegistryConfig {
   onEvent: (event: GatewayEvent) => void
+  onOpen: (gateway: HermesGateway) => Promise<void> | void
 }
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
@@ -209,6 +211,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
 
 function createSecondary(profile: string): Secondary {
   const gateway = new HermesGateway()
+  const handleOpenEpoch = createGatewayOpenEpochHandler(() => g.config?.onOpen(gateway))
 
   const entry: Secondary = {
     profile,
@@ -223,6 +226,7 @@ function createSecondary(profile: string): Secondary {
 
   entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
   entry.offState = gateway.onState(state => {
+    handleOpenEpoch(state)
     reportGatewayState(profile, state)
 
     if (state === 'open') {

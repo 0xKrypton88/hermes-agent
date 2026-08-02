@@ -224,6 +224,23 @@ class TestTranscribeAudio:
         assert result["success"] is True
         mock_openai.assert_called_once()
 
+    def test_dispatches_to_configured_groq_model(self, tmp_path):
+        audio_file = tmp_path / "test.ogg"
+        audio_file.write_bytes(b"fake audio")
+
+        config = {
+            "provider": "groq",
+            "groq": {"model": "whisper-large-v3"},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"), \
+             patch("tools.transcription_tools._transcribe_groq", return_value={"success": True, "transcript": "hej"}) as mock_groq:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(str(audio_file))
+
+        assert result["success"] is True
+        mock_groq.assert_called_once_with(str(audio_file), "whisper-large-v3")
+
     def test_no_provider_returns_error(self, tmp_path):
         audio_file = tmp_path / "test.ogg"
         audio_file.write_bytes(b"fake audio")
