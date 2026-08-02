@@ -3968,8 +3968,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    session_key = "session-batch-requeue-isolated"
     session = _session(
-        session_key="session-a",
+        session_key=session_key,
         agent=_BlockingNotificationAgent(turns),
         running=True,
     )
@@ -3977,7 +3978,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         {
             "type": "completion",
             "session_id": f"proc_batch_{index}",
-            "session_key": "session-a",
+            "session_key": session_key,
             "command": "safe-test-command",
             "exit_code": 0,
             "output": f"owned-{index}",
@@ -4205,9 +4206,8 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     ]
 
 
-def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
-    """Without an explicit workspace, cwd is left null so the session groups
-    under "No workspace" rather than the gateway's launch directory."""
+def test_ensure_session_db_row_persists_terminal_launch_cwd(monkeypatch, tmp_path):
+    """A terminal session's launch cwd is a user-selected workspace."""
     created = []
 
     class _FakeDB:
@@ -4224,7 +4224,56 @@ def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": None,
+            "cwd": str(tmp_path),
+        }
+    ]
+
+
+def test_ensure_session_db_row_drops_desktop_launch_cwd(monkeypatch, tmp_path):
+    """Desktop launch cwd is an app-start artifact, not a picked workspace."""
+    created = []
+
+    class _FakeDB:
+        def create_session(
+            self,
+            key,
+            source=None,
+            model=None,
+            model_config=None,
+            parent_session_id=None,
+            cwd=None,
+            profile_name=None,
+        ):
+            created.append(
+                {
+                    "key": key,
+                    "source": source,
+                    "model": model,
+                    "model_config": model_config,
+                    "cwd": cwd,
+                }
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    server._ensure_session_db_row(
+        {"session_key": "k1", "cwd": str(tmp_path), "source": "desktop"}
+    )
+
+    assert created == [
+        {
+            "key": "k1",
+            "source": "desktop",
+            "model": "test-model",
+            "model_config": None,
+            "cwd": None,
+        }
     ]
 
 
