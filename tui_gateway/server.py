@@ -2189,6 +2189,21 @@ def _session_cwd(session: dict | None) -> str:
     return _completion_cwd()
 
 
+# Sources whose launch directory is an app-start artifact, not a workspace the
+# user picked. Terminal sessions start in a directory the user deliberately cd'd
+# into, so their own cwd remains meaningful.
+_LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
+
+
+def _persisted_session_cwd(session: dict) -> str | None:
+    """The session-owned cwd to persist, excluding gateway-wide fallbacks."""
+    if session.get("explicit_cwd"):
+        return _session_cwd(session)
+    if _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE:
+        return None
+    return str(session.get("cwd") or "") or None
+
+
 def _heal_dead_cwd(cwd: str) -> str:
     """Resolve a session cwd that points at a now-deleted directory.
 
@@ -2383,7 +2398,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model=row_model,
             model_config=model_config or None,
             parent_session_id=parent_session_id,
-            cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
@@ -4496,12 +4511,15 @@ def _session_assignment_root_id(db, session_id: str) -> str:
     current_id = str(session_id or "").strip()
     if not current_id or db is None:
         return current_id
+    get_session = getattr(db, "get_session", None)
+    if not callable(get_session):
+        return current_id
     seen: set[str] = set()
     for _ in range(100):
         if not current_id or current_id in seen:
             break
         seen.add(current_id)
-        row = db.get_session(current_id)
+        row = get_session(current_id)
         if not isinstance(row, dict):
             break
         model_config = row.get("model_config")
@@ -4517,7 +4535,7 @@ def _session_assignment_root_id(db, session_id: str) -> str:
         parent_id = str(row.get("parent_session_id") or "").strip()
         if not parent_id:
             break
-        parent = db.get_session(parent_id)
+        parent = get_session(parent_id)
         if not isinstance(parent, dict) or parent.get("end_reason") != "compression":
             break
         current_id = parent_id
@@ -14298,7 +14316,8 @@ def _discover_repos_payload(
                 agg = _agg(root)
                 if entry.get("label"):
                     agg["label"] = entry["label"]
-                agg["last_active"] = max(agg["last_active"], float(entry.get("last_seen") or 0))
+                # last_seen is scan freshness, not user activity. A checkout
+                # with zero Hermes sessions has no activity to rank.
 
         if conn is not None:
             _read(conn)
