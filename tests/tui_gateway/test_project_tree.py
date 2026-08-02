@@ -58,6 +58,14 @@ def _lane_ids(project):
     return [g["id"] for repo in project["repos"] for g in repo["groups"]]
 
 
+def _sessions_of(project):
+    return [session for repo in project["repos"] for group in repo["groups"] for session in group["sessions"]]
+
+
+def _real_project_ids(tree):
+    return {project["id"] for project in tree["projects"] if project["id"] != pt.NO_PROJECT_ID}
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -310,8 +318,9 @@ def test_scoped_session_ids_is_union_of_placed_sessions():
 
     tree = pt.build_tree([project], [owned, auto, homeless], [], resolve, hydrate=True)
 
-    assert set(tree["scoped_session_ids"]) == {owned["id"], auto["id"]}
-    assert homeless["id"] not in tree["scoped_session_ids"]
+    assert set(tree["scoped_session_ids"]) == {owned["id"], auto["id"], homeless["id"]}
+    home = next(project for project in tree["projects"] if project["id"] == pt.NO_PROJECT_ID)
+    assert [row["id"] for row in _sessions_of(home)] == [homeless["id"]]
 
 
 def test_overview_drops_session_rows_but_keeps_counts_and_previews():
@@ -418,8 +427,8 @@ def test_junk_root_never_becomes_an_auto_project():
     tree = pt.build_tree([], [junk, real], [], resolve, hydrate=True, is_junk_root=is_junk)
 
     ids = {p["id"] for p in tree["projects"]}
-    assert ids == {"/www/app"}
-    assert junk["id"] not in tree["scoped_session_ids"]
+    assert ids == {"/www/app", pt.NO_PROJECT_ID}
+    assert junk["id"] in tree["scoped_session_ids"]
     assert real["id"] in tree["scoped_session_ids"]
 
 
@@ -462,8 +471,8 @@ def test_broad_default_non_git_cwd_stays_unscoped():
         is_junk_cwd=lambda path: path in {"/home/test", "/home/test/.hermes"},
     )
 
-    assert tree["projects"] == []
-    assert detached["id"] not in tree["scoped_session_ids"]
+    assert [project["id"] for project in tree["projects"]] == [pt.NO_PROJECT_ID]
+    assert tree["scoped_session_ids"] == [detached["id"]]
 
 
 def test_colliding_repo_basenames_disambiguate_labels():
