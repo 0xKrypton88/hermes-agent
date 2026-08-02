@@ -479,3 +479,83 @@ def test_colliding_repo_basenames_disambiguate_labels():
     labels = sorted(p["label"] for p in tree["projects"])
 
     assert labels == ["x/proj", "y/proj"]
+
+
+def test_explicit_session_assignment_overrides_workspace_project_but_preserves_repo_lane():
+    projects = [
+        _project("product-a", "Product A", ["/repos/product-a"]),
+        _project("product-b", "Product B", ["/repos/product-b"]),
+    ]
+    session = _session(
+        "/repos/product-a/.worktrees/feature",
+        branch="feature/routing",
+        project_assignment={
+            "project_id": "product-b",
+            "source": "manual",
+            "locked": True,
+            "confidence": None,
+            "reason": "manual move",
+        },
+    )
+    resolve = _resolver(
+        {
+            "/repos/product-a/.worktrees/feature": (
+                "/repos/product-a",
+                "/repos/product-a/.worktrees/feature",
+            )
+        }
+    )
+
+    tree = pt.build_tree(projects, [session], [], resolve, hydrate=True)
+    target = next(project for project in tree["projects"] if project["id"] == "product-b")
+
+    assert [row["id"] for row in _sessions_of(target)] == [session["id"]]
+    assert target["repos"][0]["id"] == "/repos/product-a"
+    assert target["repos"][0]["groups"][0]["path"] == "/repos/product-a/.worktrees/feature"
+    assert target["repos"][0]["groups"][0]["sessions"][0]["project_assignment"]["locked"] is True
+
+
+def test_locked_assignment_to_an_archived_project_stays_unscoped():
+    projects = [
+        _project("product-a", "Product A", ["/repos/product-a"]),
+        _project("product-b", "Product B", ["/repos/product-b"], archived=True),
+    ]
+    session = _session(
+        "/repos/product-a",
+        project_assignment={
+            "project_id": "product-b",
+            "source": "manual",
+            "locked": True,
+            "confidence": None,
+            "reason": "manual move",
+        },
+    )
+
+    tree = pt.build_tree(projects, [session], [], resolve=lambda _cwd: None, hydrate=True)
+
+    product_a = next(project for project in tree["projects"] if project["id"] == "product-a")
+    home = next(project for project in tree["projects"] if project["id"] == pt.NO_PROJECT_ID)
+    assert _sessions_of(product_a) == []
+    assert [row["id"] for row in _sessions_of(home)] == [session["id"]]
+    assert "product-b" not in _real_project_ids(tree)
+
+
+def test_locked_no_project_does_not_fall_back_to_workspace_or_auto_project():
+    projects = [_project("product-a", "Product A", ["/repos/product-a"])]
+    session = _session(
+        "/repos/product-a",
+        project_assignment={
+            "project_id": None,
+            "source": "manual",
+            "locked": True,
+            "confidence": None,
+            "reason": "manual move",
+        },
+    )
+
+    tree = pt.build_tree(projects, [session], [], resolve=lambda _cwd: None, hydrate=True)
+
+    product_a = next(project for project in tree["projects"] if project["id"] == "product-a")
+    home = next(project for project in tree["projects"] if project["id"] == pt.NO_PROJECT_ID)
+    assert _sessions_of(product_a) == []
+    assert [row["id"] for row in _sessions_of(home)] == [session["id"]]

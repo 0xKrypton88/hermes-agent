@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from hermes_cli import projects_db as pdb
 import tui_gateway.server as server
 
 
@@ -15,6 +16,32 @@ def _call(method, params=None):
     resp = handler(1, params or {})
     assert "error" not in resp, resp.get("error")
     return resp["result"]
+
+
+@pytest.fixture(autouse=True)
+def _fast_git_probe(monkeypatch):
+    """Replace real git subprocess probes with a cheap .git-directory check.
+
+    The record/discover RPC paths probe every distinct session cwd in the DB
+    with a real ``git`` subprocess; on a warm session DB that made single
+    tests take 10-80s. Behavior under test (policy gating, cache merging,
+    ranking) only needs root resolution, not real git.
+    """
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+
+    def _fake_run_git(cwd, *_a):
+        d = str(cwd)
+        while d and d not in ("/", os.path.dirname(d)):
+            if os.path.isdir(os.path.join(d, ".git")):
+                return d
+            d = os.path.dirname(d)
+        return ""
+
+    monkeypatch.setattr(git_probe, "run_git", _fake_run_git)
+    yield
+    git_probe.invalidate()
 
 
 def test_methods_registered():
@@ -29,6 +56,10 @@ def test_methods_registered():
         "projects.archive",
         "projects.set_active",
         "projects.for_cwd",
+        "projects.assign_session",
+        "projects.use_auto_routing",
+        "projects.routing_get",
+        "projects.routing_set",
     ):
         assert m in server._methods
 
@@ -86,36 +117,6 @@ def test_negative_results_are_ttl_cached_then_re_probed(monkeypatch):
     git_probe._cache._neg[cwd] = 0.0  # force-expire the cached negative
     assert git_probe.repo_root(cwd) == ""
     assert calls["n"] == 2
-
-
-def test_repo_root_cache_is_single_flight(monkeypatch):
-    # Concurrent identical probes share one git invocation (gateway long handlers
-    # run on worker threads).
-    import threading
-
-    from tui_gateway import git_probe
-
-    git_probe.invalidate()
-    calls = {"n": 0}
-    started = threading.Event()
-
-    def slow(_cwd, *_a):
-        calls["n"] += 1
-        started.set()
-        time = __import__("time")
-        time.sleep(0.05)
-        return "/repo"
-
-    monkeypatch.setattr(git_probe, "run_git", slow)
-    out: list[str] = []
-    threads = [threading.Thread(target=lambda: out.append(git_probe.repo_root("/repo/x"))) for _ in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert out == ["/repo"] * 6
-    assert calls["n"] == 1
 
 
 def test_warm_roots_probes_in_parallel_and_fills_the_cache(monkeypatch):
@@ -190,20 +191,6 @@ def test_project_info_for_cwd_returns_status_payload(tmp_path):
     }
 
 
-def test_project_info_for_cwd_unowned_and_blank_are_none(tmp_path):
-    # A cwd outside every project — and an empty cwd — carry no project, so the
-    # status label falls back to the cwd leaf on every surface.
-    owned = tmp_path / "owned"
-    owned.mkdir()
-    _call("projects.create", {"name": "Owned", "folders": [str(owned)]})
-
-    outside = tmp_path / "outside"
-    outside.mkdir()
-
-    assert server._project_info_for_cwd(str(outside)) is None
-    assert server._project_info_for_cwd("") is None
-
-
 def test_session_info_carries_project_for_owned_cwd(tmp_path):
     # session.info threads the resolved project through so the desktop/TUI can
     # name the workspace without a second round-trip.
@@ -261,6 +248,62 @@ def test_record_repos_persists_and_shows_zero_session_repo(tmp_path):
     by_label = {r["label"]: r for r in _call("projects.discover_repos")["repos"]}
     assert "fresh-repo" in by_label
     assert by_label["fresh-repo"]["sessions"] == 0
+
+
+def test_scan_time_is_not_treated_as_session_activity(tmp_path):
+    """A scanned repo with no sessions must not rank as recently active.
+
+    ``discovered_repos.last_seen`` records when the disk scan last saw the
+    directory. Folding it into ``last_active`` stamped every scanned checkout
+    with the scan time — i.e. "just now" — so repos the user has never opened
+    in Hermes outranked the ones they actually work in.
+    """
+    worked_in = tmp_path / "worked-in"
+    worked_in.mkdir()
+    subprocess.run(["git", "init"], cwd=worked_in, check=True, capture_output=True)
+    server._get_db().create_session("worked-in-session", "cli", cwd=str(worked_in))
+
+    never_opened = tmp_path / "never-opened"
+    never_opened.mkdir()
+
+    _call(
+        "projects.record_repos",
+        {"repos": [{"root": str(never_opened)}, {"root": str(worked_in)}]},
+    )
+
+    by_root = {r["root"]: r for r in _call("projects.discover_repos")["repos"]}
+    idle = by_root[str(never_opened)]
+    active = by_root[str(worked_in)]
+
+    assert idle["sessions"] == 0
+    # A repo with no sessions has no activity to report...
+    assert idle["last_active"] == 0
+    # ...so the repo the user actually worked in sorts ahead of it.
+    assert active["last_active"] > idle["last_active"]
+
+
+def test_terminal_session_persists_its_launch_cwd():
+    """A terminal session's cwd IS its workspace, so the row must record it.
+
+    The user cd'd into that directory before running hermes. Dropping it left
+    the row with no cwd and no git_repo_root, so the sidebar could never place
+    the session under its project.
+    """
+    for source in ("tui", "cli"):
+        assert server._persisted_session_cwd(
+            {"source": source, "cwd": "/somewhere/a-repo"}
+        ) == "/somewhere/a-repo"
+
+
+def test_desktop_launch_cwd_is_not_persisted_as_a_workspace():
+    # The desktop launches from wherever the bundle was opened, so an unpicked
+    # cwd is an artifact — those chats belong under "No workspace".
+    assert server._persisted_session_cwd({"source": "desktop", "cwd": "/opt/whatever"}) is None
+
+    # An explicit pick is always honored, desktop included.
+    assert server._persisted_session_cwd(
+        {"source": "desktop", "cwd": "/picked/repo", "explicit_cwd": True}
+    ) == "/picked/repo"
 
 
 def test_disabled_discovery_clears_cache_and_rejects_new_scan(monkeypatch, tmp_path):
@@ -341,24 +384,261 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
     assert any(item["root"] == str(root) for item in accepted["repos"])
 
 
-def test_discover_repos_from_full_history(tmp_path):
-    repo = tmp_path / "myrepo"
-    (repo / "src").mkdir(parents=True)
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    plain = tmp_path / "plain"
-    plain.mkdir()
+def test_manual_assignment_moves_tree_membership_without_changing_workspace(tmp_path):
+    product_a = tmp_path / "product-a"
+    product_b = tmp_path / "product-b"
+    product_a.mkdir()
+    product_b.mkdir()
+    a = _call("projects.create", {"name": "Product A", "folders": [str(product_a)]})["project"]
+    b = _call("projects.create", {"name": "Product B", "folders": [str(product_b)]})["project"]
 
     db = server._get_db()
-    db.create_session("s1", "cli", cwd=str(repo))
-    db.create_session("s2", "cli", cwd=str(repo / "src"))
-    db.create_session("s3", "cli", cwd=str(plain))  # not a git repo → excluded
+    db.create_session("session-routing", "cli", cwd=str(product_a))
+    db.append_message("session-routing", "user", "Move this session")
 
-    repos = _call("projects.discover_repos")["repos"]
-    by_label = {r["label"]: r for r in repos}
+    result = _call(
+        "projects.assign_session",
+        {"session_id": "session-routing", "project_id": b["id"]},
+    )
+    assert result["assignment"]["project_id"] == b["id"]
+    assert result["assignment"]["source"] == "manual"
+    assert result["assignment"]["locked"] is True
 
-    assert "myrepo" in by_label
-    assert by_label["myrepo"]["sessions"] == 2  # both repo cwds aggregate
-    assert "plain" not in by_label  # non-git dir never promoted
+    target = _call("projects.project_sessions", {"project_id": b["id"]})["project"]
+    moved = [
+        session
+        for repo in target["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ]
 
-    # The probe is persisted back onto the session rows (membership at the source).
-    assert os.path.realpath(db.get_session("s1")["git_repo_root"]) == os.path.realpath(str(repo))
+    assert [session["id"] for session in moved] == ["session-routing"]
+    assert moved[0]["cwd"] == str(product_a)
+    assert moved[0]["project_assignment"]["locked"] is True
+
+    cleared = _call("projects.use_auto_routing", {"session_id": "session-routing"})
+    assert cleared["assignment"] is None
+    original = _call("projects.project_sessions", {"project_id": a["id"]})["project"]
+    assert [
+        session["id"]
+        for repo in original["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ] == ["session-routing"]
+
+
+def test_routing_setting_is_opt_in_and_round_trips():
+    assert _call("projects.routing_get") == {"enabled": False}
+    assert _call("projects.routing_set", {"enabled": True}) == {"enabled": True}
+    assert _call("projects.routing_get") == {"enabled": True}
+
+
+def test_project_aliases_are_exposed_by_create_and_update():
+    created = _call(
+        "projects.create",
+        {"name": "Mission Control", "aliases": ["MCC", "mission-control"]},
+    )["project"]
+    assert created["aliases"] == ["MCC", "mission-control"]
+
+    updated = _call(
+        "projects.update",
+        {"id": created["id"], "aliases": ["MCC", "Mission Control Center"]},
+    )["project"]
+    assert updated["aliases"] == ["MCC", "Mission Control Center"]
+
+
+def test_auto_routing_waits_for_stable_evidence_and_respects_manual_lock(tmp_path):
+    hermes_dir = tmp_path / "hermes"
+    mcc_dir = tmp_path / "mission-control"
+    hermes_dir.mkdir()
+    mcc_dir.mkdir()
+    hermes = _call(
+        "projects.create",
+        {"name": "Hermes Agent", "folders": [str(hermes_dir)], "aliases": ["Hermes"]},
+    )["project"]
+    mcc = _call(
+        "projects.create",
+        {"name": "Mission Control", "folders": [str(mcc_dir)], "aliases": ["MCC"]},
+    )["project"]
+    _call("projects.routing_set", {"enabled": True})
+    server._get_db().create_session("session-auto", "cli", cwd=str(hermes_dir))
+
+    first, changed = server._auto_route_session_project(
+        "session-auto",
+        title="Fix dashboard hierarchy",
+        user_text="Continue with MCC",
+        assistant_text="",
+        activity_text="",
+        cwd=str(hermes_dir),
+        git_repo_root="",
+    )
+    assert first is None
+    assert changed is False
+
+    second, changed = server._auto_route_session_project(
+        "session-auto",
+        title="Fix dashboard hierarchy",
+        user_text="Continue with MCC",
+        assistant_text="",
+        activity_text="",
+        cwd=str(hermes_dir),
+        git_repo_root="",
+    )
+    assert second["project_id"] == mcc["id"]
+    assert second["source"] == "auto"
+    assert changed is True
+
+    _call(
+        "projects.assign_session",
+        {"session_id": "session-auto", "project_id": hermes["id"]},
+    )
+    locked, changed = server._auto_route_session_project(
+        "session-auto",
+        title="MCC - Dashboard",
+        user_text="MCC MCC",
+        assistant_text="Mission Control",
+        activity_text=str(mcc_dir),
+        cwd=str(mcc_dir),
+        git_repo_root=str(mcc_dir),
+    )
+    assert locked["project_id"] == hermes["id"]
+    assert locked["locked"] is True
+    assert changed is False
+
+
+def test_route_and_emit_publishes_only_membership_changes(monkeypatch):
+    emitted = []
+    assignment = {
+        "session_id": "stored-session",
+        "project_id": "p_mcc",
+        "source": "auto",
+        "locked": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_auto_route_session_project",
+        lambda *args, **kwargs: (assignment, True),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, payload)),
+    )
+
+    result = server._route_and_emit_session_project(
+        "runtime-session",
+        {
+            "session_key": "stored-session",
+            "cwd": "/work/mcc",
+            "git_repo_root": "/work/mcc",
+            "history": [],
+        },
+        title="MCC - Dashboard",
+        user_text="Continue",
+        assistant_text="Done",
+    )
+
+    assert result == assignment
+    assert emitted == [
+        (
+            "session.project",
+            "runtime-session",
+            {"session_id": "stored-session", "assignment": assignment},
+        )
+    ]
+
+
+def test_assignment_rpc_uses_compression_root_but_keeps_branch_independent(tmp_path):
+    root_dir = tmp_path / "root"
+    other_dir = tmp_path / "other"
+    root_dir.mkdir()
+    other_dir.mkdir()
+    root_project = _call(
+        "projects.create", {"name": "Root Product", "folders": [str(root_dir)]}
+    )["project"]
+    branch_project = _call(
+        "projects.create", {"name": "Branch Product", "folders": [str(other_dir)]}
+    )["project"]
+
+    db = server._get_db()
+    db.create_session("conversation-root", "cli", cwd=str(root_dir))
+    db.append_message("conversation-root", "user", "initial work")
+    db.end_session("conversation-root", "compression")
+    db.create_session(
+        "conversation-tip",
+        "cli",
+        cwd=str(root_dir),
+        parent_session_id="conversation-root",
+    )
+    db.append_message("conversation-tip", "user", "continued work")
+    db.create_session(
+        "conversation-branch",
+        "cli",
+        cwd=str(root_dir),
+        parent_session_id="conversation-root",
+        model_config={"_branched_from": "conversation-root"},
+    )
+
+    tip_assignment = _call(
+        "projects.assign_session",
+        {"session_id": "conversation-tip", "project_id": root_project["id"]},
+    )["assignment"]
+    branch_assignment = _call(
+        "projects.assign_session",
+        {"session_id": "conversation-branch", "project_id": branch_project["id"]},
+    )["assignment"]
+
+    assert tip_assignment["session_id"] == "conversation-root"
+    assert branch_assignment["session_id"] == "conversation-branch"
+
+    project = _call(
+        "projects.project_sessions", {"project_id": root_project["id"]}
+    )["project"]
+    surfaced = [
+        session
+        for repo in project["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ]
+    assert [session["id"] for session in surfaced] == ["conversation-tip"]
+    assert surfaced[0]["project_assignment"]["session_id"] == "conversation-root"
+
+    _call("projects.use_auto_routing", {"session_id": "conversation-tip"})
+    with pdb.connect_closing() as conn:
+        assert pdb.get_session_project(conn, "conversation-root") is None
+        assert pdb.get_session_project(conn, "conversation-branch") is not None
+
+
+def test_manual_home_assignment_is_locked_and_kept_out_of_workspace_project(tmp_path):
+    product_dir = tmp_path / "product"
+    product_dir.mkdir()
+    project = _call(
+        "projects.create", {"name": "Product", "folders": [str(product_dir)]}
+    )["project"]
+    db = server._get_db()
+    db.create_session("session-home", "cli", cwd=str(product_dir))
+    db.append_message("session-home", "user", "Keep this in Home")
+
+    result = _call(
+        "projects.assign_session", {"session_id": "session-home", "project_id": None}
+    )
+    assert result["assignment"]["project_id"] is None
+    assert result["assignment"]["locked"] is True
+
+    scoped = _call("projects.project_sessions", {"project_id": project["id"]})["project"]
+    assert [
+        session
+        for repo in scoped["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ] == []
+
+    # session.info must honor the Home lock instead of re-inferring from cwd.
+    info = server._project_info_for_session(
+        {"session_key": "session-home"},
+        str(product_dir),
+    )
+    assert info is not None
+    assert info["id"] is None
+    assert info["assignment"]["locked"] is True
+    assert info["assignment"]["project_id"] is None

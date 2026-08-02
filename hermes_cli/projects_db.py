@@ -24,6 +24,7 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS projects (
     color         TEXT,
     board_slug    TEXT,
     primary_path  TEXT,
+    aliases       TEXT NOT NULL DEFAULT '[]',
     created_at    INTEGER NOT NULL,
     archived      INTEGER NOT NULL DEFAULT 0
 );
@@ -84,6 +86,32 @@ CREATE TABLE IF NOT EXISTS project_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+
+-- A session's durable product-project identity. Workspace/cwd remains on the
+-- session row in state.db; this table only controls project membership.
+CREATE TABLE IF NOT EXISTS session_project_assignments (
+    session_id  TEXT PRIMARY KEY,
+    project_id  TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    source      TEXT NOT NULL CHECK(source IN ('auto', 'manual')),
+    locked      INTEGER NOT NULL DEFAULT 0,
+    confidence  REAL,
+    reason      TEXT,
+    updated_at  INTEGER NOT NULL
+);
+
+-- Automatic reassignment is deliberately stable rather than twitchy: a new
+-- candidate must repeat before replacing an existing automatic assignment.
+CREATE TABLE IF NOT EXISTS session_project_candidates (
+    session_id    TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    confidence    REAL NOT NULL,
+    reason        TEXT,
+    observations  INTEGER NOT NULL DEFAULT 1,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_project_assignments_project
+    ON session_project_assignments(project_id);
 
 -- Git repos found by scanning the filesystem (desktop "repo-first" discovery).
 -- Cached here so the overview is instant after the first scan instead of
@@ -200,7 +228,7 @@ def connect_closing(db_path: Optional[Path] = None):
 
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color", "aliases")
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -208,7 +236,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
-            _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+            definition = "aliases TEXT NOT NULL DEFAULT '[]'" if col == "aliases" else f"{col} TEXT"
+            _add_column_if_missing(conn, "projects", col, definition)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +274,7 @@ class Project:
     primary_path: Optional[str] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
+    aliases: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -259,7 +289,36 @@ class Project:
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
+            "aliases": list(self.aliases),
         }
+
+
+def _normalize_aliases(aliases: Optional[Iterable[str]]) -> List[str]:
+    """Trim and case-insensitively de-duplicate human routing aliases."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for raw in aliases or []:
+        alias = str(raw or "").strip()
+        if not alias:
+            continue
+        if len(alias) > 80:
+            raise ValueError("project aliases must be at most 80 characters")
+        key = alias.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(alias)
+    return result
+
+
+def _aliases_from_row(row: sqlite3.Row) -> List[str]:
+    if "aliases" not in row.keys() or not row["aliases"]:
+        return []
+    try:
+        value = json.loads(row["aliases"])
+    except (TypeError, ValueError):
+        return []
+    return _normalize_aliases(value if isinstance(value, list) else [])
 
 
 def _project_from_row(row: sqlite3.Row) -> Project:
@@ -275,6 +334,7 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
         archived=bool(row["archived"]) if "archived" in keys else False,
+        aliases=_aliases_from_row(row),
     )
 
 
@@ -330,6 +390,7 @@ def create_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    aliases: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a project and return its id.
 
@@ -344,6 +405,7 @@ def create_project(
     slug_candidate = normalize_slug(slug) if slug else _slugify(name)
     pid = _new_project_id()
     now = _now()
+    normalized_aliases = _normalize_aliases(aliases)
 
     folder_paths: List[str] = []
     for f in folders or []:
@@ -362,8 +424,8 @@ def create_project(
         conn.execute(
             "INSERT INTO projects "
             "(id, slug, name, description, icon, color, board_slug, "
-            " primary_path, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            " primary_path, aliases, created_at, archived) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 pid,
                 unique,
@@ -373,6 +435,7 @@ def create_project(
                 color,
                 normalize_slug(board_slug) if board_slug else None,
                 primary,
+                json.dumps(normalized_aliases, ensure_ascii=False),
                 now,
             ),
         )
@@ -422,6 +485,7 @@ def update_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    aliases: Optional[Iterable[str]] = None,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
 
@@ -449,6 +513,9 @@ def update_project(
     if board_slug is not None:
         sets.append("board_slug = ?")
         params.append(normalize_slug(board_slug) if board_slug.strip() else None)
+    if aliases is not None:
+        sets.append("aliases = ?")
+        params.append(json.dumps(_normalize_aliases(aliases), ensure_ascii=False))
     if not sets:
         return False
     params.append(project_id)
@@ -591,12 +658,286 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Durable session -> project identity
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SessionProjectAssignment:
+    session_id: str
+    project_id: Optional[str]
+    source: str
+    locked: bool
+    confidence: Optional[float]
+    reason: Optional[str]
+    updated_at: int
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "source": self.source,
+            "locked": self.locked,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "updated_at": self.updated_at,
+        }
+
+
+def _assignment_from_row(row: sqlite3.Row) -> SessionProjectAssignment:
+    return SessionProjectAssignment(
+        session_id=row["session_id"],
+        project_id=row["project_id"],
+        source=row["source"],
+        locked=bool(row["locked"]),
+        confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+        reason=row["reason"],
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def get_session_project(
+    conn: sqlite3.Connection, session_id: str
+) -> Optional[SessionProjectAssignment]:
+    row = conn.execute(
+        "SELECT * FROM session_project_assignments WHERE session_id = ?",
+        (str(session_id),),
+    ).fetchone()
+    return _assignment_from_row(row) if row else None
+
+
+def list_session_projects(conn: sqlite3.Connection) -> dict[str, SessionProjectAssignment]:
+    rows = conn.execute("SELECT * FROM session_project_assignments").fetchall()
+    return {row["session_id"]: _assignment_from_row(row) for row in rows}
+
+
+def read_session_projects(db_path: Path) -> dict[str, SessionProjectAssignment]:
+    """Read assignments without creating/migrating projects.db.
+
+    Sidebar/session list endpoints open foreign profile DBs read-only; they must
+    never mkdir or run schema init against another profile's store.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return {}
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM session_project_assignments").fetchall()
+        return {row["session_id"]: _assignment_from_row(row) for row in rows}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
+def _validate_assignment_project(conn: sqlite3.Connection, project_id: str) -> None:
+    row = conn.execute(
+        "SELECT archived FROM projects WHERE id = ?", (str(project_id),)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no such project: {project_id}")
+    if bool(row["archived"]):
+        raise ValueError(f"project is archived: {project_id}")
+
+
+def _clean_confidence(value: Optional[float]) -> Optional[float]:
+    return None if value is None else max(0.0, min(1.0, float(value)))
+
+
+def _write_assignment_locked(
+    conn: sqlite3.Connection,
+    session_id: str,
+    project_id: Optional[str],
+    *,
+    source: str,
+    confidence: Optional[float],
+    reason: Optional[str],
+) -> None:
+    now = _now()
+    locked = 1 if source == "manual" else 0
+    conn.execute(
+        "INSERT INTO session_project_assignments "
+        "(session_id, project_id, source, locked, confidence, reason, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "project_id = excluded.project_id, source = excluded.source, "
+        "locked = excluded.locked, confidence = excluded.confidence, "
+        "reason = excluded.reason, updated_at = excluded.updated_at",
+        (
+            session_id,
+            project_id,
+            source,
+            locked,
+            _clean_confidence(confidence),
+            (str(reason).strip()[:200] or None) if reason is not None else None,
+            now,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM session_project_candidates WHERE session_id = ?", (session_id,)
+    )
+
+
+def assign_session_project(
+    conn: sqlite3.Connection,
+    session_id: str,
+    project_id: Optional[str],
+    *,
+    source: str = "manual",
+    confidence: Optional[float] = None,
+    reason: Optional[str] = None,
+) -> SessionProjectAssignment:
+    """Persist project identity without changing the session's workspace.
+
+    Manual assignments are locks. An automatic write never replaces such a
+    lock; the user must explicitly clear it first.
+    """
+    sid = str(session_id or "").strip()
+    pid = str(project_id).strip() if project_id is not None else None
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    if source not in {"auto", "manual"}:
+        raise ValueError("assignment source must be 'auto' or 'manual'")
+    if source == "auto" and not pid:
+        raise ValueError("automatic assignment requires a project")
+    if project_id is not None and not pid:
+        raise ValueError("project_id must not be empty")
+    if pid is not None:
+        _validate_assignment_project(conn, pid)
+
+    existing = get_session_project(conn, sid)
+    if source == "auto" and existing is not None and existing.locked:
+        return existing
+
+    with write_txn(conn):
+        _write_assignment_locked(
+            conn,
+            sid,
+            pid,
+            source=source,
+            confidence=confidence,
+            reason=reason,
+        )
+    assignment = get_session_project(conn, sid)
+    if assignment is None:  # pragma: no cover - write invariant
+        raise RuntimeError("session project assignment was not persisted")
+    return assignment
+
+
+def clear_session_project(conn: sqlite3.Connection, session_id: str) -> bool:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM session_project_assignments WHERE session_id = ?", (sid,)
+        )
+        conn.execute("DELETE FROM session_project_candidates WHERE session_id = ?", (sid,))
+    return cur.rowcount > 0
+
+
+def observe_auto_project(
+    conn: sqlite3.Connection,
+    session_id: str,
+    project_id: str,
+    *,
+    confidence: float,
+    reason: Optional[str] = None,
+    required_observations: int = 2,
+    immediate_confidence: float = 0.9,
+) -> Optional[SessionProjectAssignment]:
+    """Record one routing observation and assign only after stable evidence.
+
+    A strong first observation may create an initial automatic assignment.
+    Reclassification always requires repeated observations. Manual locks are
+    returned unchanged.
+    """
+    sid = str(session_id or "").strip()
+    pid = str(project_id or "").strip()
+    if not sid:
+        raise ValueError("session_id must not be empty")
+    _validate_assignment_project(conn, pid)
+    score = _clean_confidence(confidence) or 0.0
+    required = max(1, int(required_observations))
+    existing = get_session_project(conn, sid)
+
+    if existing is not None and existing.locked:
+        return existing
+    if existing is not None and existing.project_id == pid:
+        return assign_session_project(
+            conn, sid, pid, source="auto", confidence=score, reason=reason
+        )
+    if existing is None and score >= float(immediate_confidence):
+        return assign_session_project(
+            conn, sid, pid, source="auto", confidence=score, reason=reason
+        )
+
+    now = _now()
+    should_assign = False
+    with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT project_id, observations FROM session_project_candidates "
+            "WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+        observations = (
+            int(candidate["observations"]) + 1
+            if candidate is not None and candidate["project_id"] == pid
+            else 1
+        )
+        conn.execute(
+            "INSERT INTO session_project_candidates "
+            "(session_id, project_id, confidence, reason, observations, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "project_id = excluded.project_id, confidence = excluded.confidence, "
+            "reason = excluded.reason, observations = excluded.observations, "
+            "updated_at = excluded.updated_at",
+            (sid, pid, score, (str(reason).strip()[:200] or None) if reason else None, observations, now),
+        )
+        should_assign = observations >= required
+        if should_assign:
+            _write_assignment_locked(
+                conn,
+                sid,
+                pid,
+                source="auto",
+                confidence=score,
+                reason=reason,
+            )
+
+    return get_session_project(conn, sid) if should_assign else existing
+
+
+# ---------------------------------------------------------------------------
 # Active-project pointer (project_meta KV)
 # ---------------------------------------------------------------------------
 
 
 _ACTIVE_META_KEY = "active_id"
 _DISCOVERY_POLICY_META_KEY = "repo_discovery_policy"
+_SESSION_ROUTING_META_KEY = "session_routing_enabled"
+
+
+def set_session_routing_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SESSION_ROUTING_META_KEY, "1" if enabled else "0"),
+        )
+
+
+def is_session_routing_enabled(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT value FROM project_meta WHERE key = ?", (_SESSION_ROUTING_META_KEY,)
+    ).fetchone()
+    return bool(row and row["value"] == "1")
 
 
 def set_active(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
