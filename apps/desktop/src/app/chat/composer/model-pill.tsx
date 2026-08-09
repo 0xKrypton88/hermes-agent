@@ -10,7 +10,7 @@ import { releaseTypingFocus } from '@/components/ui/keyboard-first'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
-import { formatModelStatusLabel } from '@/lib/model-status-label'
+import { formatAdaptiveReasoningStatusLabel, formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
 
@@ -50,6 +50,7 @@ export function ModelPill({
   const currentProvider = model.provider || viewProvider
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
+  const reasoningMode = useStore(view.$reasoningMode)
   const modelSource = useStore($currentModelSource)
   const defaultEffort = useStore($defaultReasoningEffort)
   const runtimeId = useStore(view.$runtimeId)
@@ -95,7 +96,9 @@ export function ModelPill({
     <>
       {currentModel.trim() ? (
         <span className="truncate">
-          {formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort })}
+          {reasoningMode === 'auto'
+            ? formatAdaptiveReasoningStatusLabel(currentModel, reasoningEffort)
+            : formatModelStatusLabel(currentModel, { defaultEffort, fastMode, reasoningEffort })}
         </span>
       ) : (
         <GlyphSpinner className="opacity-50" spinner="braille" />

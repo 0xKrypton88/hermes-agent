@@ -8,7 +8,7 @@ import {
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
 
-import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
+import { type FastControl, type ModelEditOptionsPatch, ModelEditSubmenu } from './model-edit-submenu'
 
 // Radix calls these on open; jsdom doesn't implement them.
 beforeAll(() => {
@@ -28,9 +28,12 @@ function renderSubmenu(opts: {
   effort?: string
   fastControl: FastControl
   isActive?: boolean
+  model?: string
   onSelectModel?: (model: string) => void
-  onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
+  onSetOptions: (patch: ModelEditOptionsPatch) => void
+  provider?: string
   reasoning: boolean
+  reasoningMode?: 'auto' | 'inherit' | 'manual'
 }) {
   return render(
     <DropdownMenu open>
@@ -42,11 +45,12 @@ function renderSubmenu(opts: {
             effort={opts.effort ?? 'medium'}
             fastControl={opts.fastControl}
             isActive={opts.isActive ?? true}
-            model="m1"
+            model={opts.model ?? 'm1'}
             onSelectModel={opts.onSelectModel ?? vi.fn()}
             onSetOptions={opts.onSetOptions}
-            provider="p1"
+            provider={opts.provider ?? 'p1'}
             reasoning={opts.reasoning}
+            reasoningMode={opts.reasoningMode}
           />
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -76,7 +80,7 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     // Thinking starts on (medium); toggling it off reports 'none'.
     fireEvent.click(screen.getByRole('switch'))
 
-    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'none' })
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'none', reasoningMode: 'manual' })
   })
 
   it('thinking: toggling back on restores the row level, not the hardcoded default', () => {
@@ -91,7 +95,23 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
 
     fireEvent.click(screen.getByRole('switch'))
 
-    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high' })
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high', reasoningMode: 'manual' })
+  })
+
+  it('Sol route exposes Auto and reports reasoningMode', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      model: 'gpt-5.6-sol',
+      onSetOptions,
+      provider: 'openai-codex',
+      reasoning: true,
+      reasoningMode: 'manual'
+    })
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Auto' }))
+
+    expect(onSetOptions).toHaveBeenCalledWith({ reasoningMode: 'auto' })
   })
 
   it('variant fast: swaps the model only when the row is active', () => {

@@ -2788,6 +2788,8 @@ def _ensure_session_db_row(session: dict) -> None:
             )
     if (reasoning := session.get("create_reasoning_override")) is not None:
         model_config["reasoning_config"] = reasoning
+    if (adaptive := _adaptive_reasoning_metadata(session)) is not None:
+        model_config["adaptive_reasoning"] = adaptive
     create_service_tier_override = session.get("create_service_tier_override")
     if create_service_tier_override is not None:
         # Empty string is the in-memory sentinel for an explicit normal tier:
@@ -3966,6 +3968,11 @@ def _runtime_model_config(
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    adaptive = _adaptive_reasoning_metadata(session)
+    if adaptive is not None:
+        config["adaptive_reasoning"] = adaptive
+    elif session is not None:
+        config.pop("adaptive_reasoning", None)
 
     return config
 
@@ -4730,6 +4737,8 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
+        if pin_session_override and not one_turn and session.get("reasoning_mode") == "auto":
+            _mark_session_reasoning_manual(session)
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
@@ -4756,6 +4765,8 @@ def _apply_model_switch(
     # agent in place; the override dict makes that choice survive a rebuild
     # without touching shared process state.
     if pin_session_override and isinstance(session, dict) and not one_turn:
+        if not agent and session.get("reasoning_mode") == "auto":
+            _mark_session_reasoning_manual(session)
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
@@ -5490,11 +5501,17 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    decision = (session or {}).get("adaptive_reasoning_decision")
+    decision = decision if isinstance(decision, dict) else {}
+    reasoning_mode = str((session or {}).get("reasoning_mode") or "inherit")
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
         or mirror.get("provider", getattr(agent, "provider", "")),
+        "reasoning_mode": reasoning_mode,
         "reasoning_effort": reasoning_effort,
+        "reasoning_reason": str(decision.get("reason_code") or ""),
+        "adaptive_policy_version": str(decision.get("policy_version") or ""),
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,
@@ -6748,9 +6765,14 @@ def _make_agent(
     model_override: dict | str | None = None,
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
+    adaptive_reasoning_state: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
 ):
+    # Accepted so resume overrides can splat through without TypeError;
+    # session dicts restore mode via _apply_adaptive_reasoning_state /
+    # _deferred_session_record.
+    _ = adaptive_reasoning_state
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
     # leaving the process boundary as the only experimental variable.
@@ -8117,14 +8139,30 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    adaptive_reasoning_state: dict | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
+    adaptive_state = (
+        adaptive_reasoning_state if isinstance(adaptive_reasoning_state, dict) else {}
+    )
+    adaptive_decision = adaptive_state.get("decision")
+    adaptive_decision = (
+        adaptive_decision if isinstance(adaptive_decision, dict) else {}
+    )
     info = {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "model": model or _resolve_model(),
+        "reasoning_mode": str(adaptive_state.get("mode") or "inherit"),
+        "reasoning_effort": str(
+            adaptive_decision.get("effort") or adaptive_state.get("floor") or ""
+        ),
+        "reasoning_reason": str(adaptive_decision.get("reason_code") or ""),
+        "adaptive_policy_version": str(
+            adaptive_decision.get("policy_version") or ""
+        ),
         "tools": {},
         "skills": {},
         "lazy": True,
@@ -8149,11 +8187,17 @@ def _deferred_session_record(
     profile_home: Path | None = None,
     lazy: bool = False,
     model_override=None,
+    adaptive_reasoning_state: dict | None = None,
     resume_runtime_overrides: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
+    adaptive_state = (
+        adaptive_reasoning_state if isinstance(adaptive_reasoning_state, dict) else {}
+    )
+    adaptive_mode = str(adaptive_state.get("mode") or "inherit").strip().lower()
+    adaptive_decision = adaptive_state.get("decision")
     return {
         "agent": None,
         "agent_error": None,
@@ -8175,6 +8219,13 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "reasoning_mode": (
+            adaptive_mode if adaptive_mode in _ADAPTIVE_REASONING_MODES else "inherit"
+        ),
+        "reasoning_floor": adaptive_state.get("floor"),
+        "adaptive_reasoning_decision": (
+            dict(adaptive_decision) if isinstance(adaptive_decision, dict) else None
+        ),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
@@ -8314,7 +8365,7 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
+        return _session_info(agent, session)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
     # its workspace was wherever the gateway process happened to start, so the
@@ -8322,16 +8373,15 @@ def _fallback_session_info(session: dict) -> dict:
     # rebound correctly (#71254). `branch` is always emitted ("" outside a git
     # repo) so a client can clear a stale label instead of retaining it — the
     # same contract `_lazy_session_info` above already follows.
-    cwd = _session_cwd(session)
-    return {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-        "model": _resolve_model(),
-        "skills": {},
-        "tools": {},
-    }
+    cwd = _display_session_cwd(session) or _default_session_cwd()
+    override = session.get("model_override")
+    override = override if isinstance(override, dict) else {}
+    return _lazy_resume_info(
+        cwd,
+        model=str(override.get("model") or ""),
+        provider=str(override.get("provider") or ""),
+        adaptive_reasoning_state=_adaptive_reasoning_metadata(session),
+    )
 
 
 def _reconcile_display_with_live(
@@ -9996,6 +10046,16 @@ def _run_prompt_submit(
                     return
                 prompt = ctx.message
 
+            # Auto is a pre-request effort decision only: one fixed runtime was
+            # selected at session creation/resume, and no model/tool/prompt route
+            # changes occur inside the agent loop.
+            _prepare_adaptive_reasoning_turn(
+                sid,
+                session,
+                text if isinstance(text, str) else str(text),
+                history,
+            )
+
             # Decide image routing per-turn based on active provider/model.
             # "native" → pass pixels to the main model as OpenAI-style content
             # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
@@ -11462,9 +11522,48 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 return _ok(rid, {"key": key, "value": "clamp"})
 
+            if arg == "auto":
+                if global_scope or session is None:
+                    return _err(rid, 4002, "adaptive reasoning requires a live session")
+                policy = _adaptive_reasoning_config()
+                if not policy.get("enabled"):
+                    return _err(rid, 4002, "adaptive reasoning is disabled")
+
+                from agent.adaptive_reasoning import AUTO_MODEL, AUTO_PROVIDER
+
+                agent = session.get("agent")
+                if agent is not None and (
+                    getattr(agent, "model", None) != AUTO_MODEL
+                    or getattr(agent, "provider", None) != AUTO_PROVIDER
+                ):
+                    return _err(
+                        rid, 4002, "adaptive reasoning requires the fixed runtime"
+                    )
+
+                session["reasoning_mode"] = "auto"
+                session["reasoning_floor"] = None
+                session["adaptive_reasoning_decision"] = None
+                session["model_override"] = {
+                    "model": AUTO_MODEL,
+                    "provider": AUTO_PROVIDER,
+                }
+                session.pop("create_reasoning_override", None)
+                if agent is not None:
+                    agent.reasoning_config = None
+                    agent.service_tier = None
+                    _persist_live_session_runtime(session)
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(agent, session),
+                    )
+                return _ok(rid, {"key": key, "value": "auto"})
+
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            if session is not None:
+                _mark_session_reasoning_manual(session, arg)
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:
