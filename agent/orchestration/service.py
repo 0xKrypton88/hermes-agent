@@ -576,7 +576,7 @@ def _dispatch_active_worker_async(
 
         delivery_ok = bool(async_delivery_supported())
     except Exception:
-        delivery_ok = True
+        delivery_ok = False
 
     if not delivery_ok or not routing["session_key"]:
         return _terminal_blocked_result(
@@ -705,14 +705,6 @@ def _dispatch_active_worker_async(
         )
 
     delegation_id = str(dispatch.get("delegation_id") or "")
-    # Foreground ownership must be empty after dispatch; async registry owns it.
-    try:
-        children = getattr(agent, "_active_children", None)
-        if isinstance(children, list):
-            children.clear()
-    except Exception:
-        pass
-
     ack = _async_ack_response(
         family=decision.family,
         concrete_model=concrete_model,

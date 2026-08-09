@@ -598,3 +598,66 @@ def test_messaging_terra_capacity_rejection_no_sync_fallback(tmp_path, monkeypat
     ack = (result.response.get("final_response") or "").lower()
     assert any(tok in ack for tok in ("busy", "capacity", "unavailable", "try again"))
     assert agent._active_children == []
+
+
+def test_messaging_async_delivery_probe_error_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    agent = _canary_agent()
+    root = _canary_root()
+
+    with patch("agent.orchestration.service.load_config", return_value=root), patch(
+        "agent.orchestration.service.execute_worker_run"
+    ) as exec_mock, patch(
+        "gateway.session_context.async_delivery_supported",
+        side_effect=RuntimeError("delivery state unavailable"),
+    ), patch(
+        "tools.async_delegation.dispatch_async_delegation"
+    ) as dispatch_mock:
+        result = _complete_active(
+            agent,
+            "Implement a multi-step feature with tests",
+            root=root,
+        )
+
+    exec_mock.assert_not_called()
+    dispatch_mock.assert_not_called()
+    assert result.acted is True
+    assert result.pending_worker is False
+    assert result.legacy_continue is False
+    assert result.response.get("completed") is False
+    status = str(
+        result.response.get("status")
+        or (result.response.get("orchestration") or {}).get("status")
+        or ""
+    ).upper()
+    assert status in {"BLOCKED", "UNAVAILABLE", "UNSUPPORTED"}
+
+
+def test_messaging_async_dispatch_preserves_preexisting_parent_children(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    agent = _canary_agent()
+    root = _canary_root()
+    existing_child = SimpleNamespace(session_id="existing-child")
+    agent._active_children.append(existing_child)
+
+    with patch("agent.orchestration.service.load_config", return_value=root), patch(
+        "gateway.session_context.async_delivery_supported", return_value=True
+    ), patch(
+        "tools.approval.get_current_session_key",
+        return_value=agent._gateway_session_key,
+    ), patch(
+        "tools.async_delegation.dispatch_async_delegation",
+        return_value={"status": "dispatched", "delegation_id": "deleg-existing"},
+    ):
+        result = _complete_active(
+            agent,
+            "Implement a multi-step feature with tests",
+            root=root,
+        )
+
+    assert result.response["orchestration"]["delegation_id"] == "deleg-existing"
+    assert agent._active_children == [existing_child]
