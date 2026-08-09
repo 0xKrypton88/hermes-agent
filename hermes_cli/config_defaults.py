@@ -962,6 +962,10 @@ DEFAULT_CONFIG = {
         },
         "title_generation": {
             "enabled": True,
+            # descriptive (default) | project_area — project_area is opt-in.
+            "style": "descriptive",
+            # initial (default) | adaptive — adaptive retitle is opt-in.
+            "mode": "initial",
             "provider": "auto",
             "model": "",
             "base_url": "",

@@ -994,7 +994,7 @@ class SessionSchemaMixin:
             try:
                 cursor.execute(
                     """UPDATE sessions AS older
-                       SET title = NULL
+                       SET title = NULL, title_source = NULL, title_meta = NULL
                        WHERE title IS NOT NULL
                          AND EXISTS (
                              SELECT 1 FROM sessions AS newer

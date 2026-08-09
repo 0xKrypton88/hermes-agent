@@ -3343,40 +3343,46 @@ def compress_context(
                     # _set_session_title transfers the title off a hidden
                     # compression ancestor rather than raising on the conflict.
                     if old_title:
-                        # Read provenance BEFORE the write: transferring the
-                        # title off a hidden compression ancestor clears the
-                        # ancestor's row, so reading afterwards always returns
-                        # None and the child would be stamped "user" — freezing
-                        # an auto-title that should still be upgradeable.
-                        _src = None
+                        # Preserve the exact visible title, provenance, and
+                        # title_meta on the live continuation. Prefer the
+                        # atomic inherit helper (moves the unique alias off the
+                        # hidden predecessor); fall back to the older
+                        # copy+restore-source path for third-party state
+                        # proxies that predate inherit_session_title.
                         try:
-                            _src = agent._session_db.get_session_title_source(
-                                old_session_id
+                            inherit_title = getattr(
+                                agent._session_db, "inherit_session_title", None
                             )
-                        except Exception as _src_err:
-                            logger.debug(
-                                "Could not read title provenance: %s", _src_err
-                            )
-                        try:
-                            agent._session_db.set_session_title(
-                                agent.session_id, old_title
-                            )
-                        except (ValueError, Exception) as e:
-                            logger.debug("Could not propagate title on compression: %s", e)
-                        else:
-                            # set_session_title() records "user"; restore the
-                            # original authority so an inherited auto-title
-                            # stays upgradeable and a manual one stays pinned.
-                            if _src is not None:
+                            if callable(inherit_title):
+                                inherit_title(old_session_id, agent.session_id)
+                            else:
+                                _src = None
                                 try:
-                                    agent._session_db.set_session_title_source(
-                                        agent.session_id, _src
+                                    _src = agent._session_db.get_session_title_source(
+                                        old_session_id
                                     )
                                 except Exception as _src_err:
                                     logger.debug(
-                                        "Could not propagate title provenance: %s",
+                                        "Could not read title provenance: %s",
                                         _src_err,
                                     )
+                                agent._session_db.set_session_title(
+                                    agent.session_id, old_title
+                                )
+                                if _src is not None:
+                                    try:
+                                        agent._session_db.set_session_title_source(
+                                            agent.session_id, _src
+                                        )
+                                    except Exception as _src_err:
+                                        logger.debug(
+                                            "Could not propagate title provenance: %s",
+                                            _src_err,
+                                        )
+                        except Exception as e:
+                            logger.debug(
+                                "Could not propagate title on compression: %s", e
+                            )
 
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
