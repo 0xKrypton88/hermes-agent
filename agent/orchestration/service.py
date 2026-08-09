@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,7 @@ from agent.orchestration.config import OrchestrationConfig, load_orchestration_c
 from agent.orchestration.contracts import (
     CompiledTask,
     ExecutionTrace,
+    ModelFamily,
     RoutingDecision,
     RuleId,
     TaskSpec,
@@ -45,6 +47,31 @@ _REPLY_CONTEXT_RE = re.compile(
 _SLACK_APP_CONTEXT_RE = re.compile(
     r"\A\[Slack app context: user is viewing channel [^\]\r\n]+\]\r?\n\r?\n"
 )
+
+# Messaging platforms where heavy Terra/Sol active workers must leave the
+# foreground turn via the durable async-delegation rail.
+_MESSAGING_ASYNC_PLATFORMS = frozenset(
+    {
+        "slack",
+        "telegram",
+        "discord",
+        "whatsapp",
+        "signal",
+        "matrix",
+        "mattermost",
+        "feishu",
+        "homeassistant",
+        "email",
+        "sms",
+        "dingtalk",
+        "wecom",
+        "weixin",
+        "qqbot",
+        "bluebubbles",
+        "yuanbao",
+    }
+)
+_ASYNC_ACTIVE_FAMILIES = frozenset({ModelFamily.TERRA, ModelFamily.SOL})
 
 
 def load_config() -> Dict[str, Any]:
@@ -405,6 +432,348 @@ def _failure_signature(worker_result: WorkerRunResult) -> Optional[str]:
     return ":".join(p for p in parts if p)
 
 
+def _messaging_platform(agent: Any, origin: Optional[TurnOrigin] = None) -> str:
+    if origin is not None and origin.platform:
+        return str(origin.platform).strip().lower()
+    return str(getattr(agent, "platform", "") or "").strip().lower()
+
+
+def _should_async_active_worker(
+    decision: RoutingDecision,
+    *,
+    agent: Any,
+    origin: Optional[TurnOrigin] = None,
+) -> bool:
+    """Heavy Terra/Sol on messaging origins use durable async delegation."""
+    if decision is None or decision.requires_approval or decision.blocked:
+        return False
+    if decision.family not in _ASYNC_ACTIVE_FAMILIES:
+        return False
+    return _messaging_platform(agent, origin) in _MESSAGING_ASYNC_PLATFORMS
+
+
+class _AsyncParentProxy:
+    """Proxy that keeps async worker children off the foreground parent list.
+
+    Lifecycle ownership belongs to ``tools.async_delegation``; attaching
+    children to the live parent would demote follow-ups to queue and retain
+    active-child ownership across restart/recovery.
+    """
+
+    __slots__ = ("_parent", "_active_children", "_active_children_lock")
+
+    def __init__(self, parent: Any):
+        import threading
+
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_active_children", [])
+        object.__setattr__(self, "_active_children_lock", threading.Lock())
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_parent"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(object.__getattribute__(self, "_parent"), name, value)
+
+
+def _resolve_async_origin_routing(
+    agent: Any, *, origin: Optional[TurnOrigin] = None
+) -> Dict[str, str]:
+    """Capture routable session identity before leaving the parent thread."""
+    session_key = ""
+    origin_ui_session_id = ""
+    origin_session_id = ""
+    try:
+        from tools.approval import get_current_session_key
+
+        session_key = str(get_current_session_key(default="") or "")
+    except Exception:
+        session_key = ""
+    if not session_key and origin is not None:
+        session_key = str(origin.session_key or "")
+    if not session_key:
+        session_key = str(getattr(agent, "_gateway_session_key", "") or "")
+    try:
+        from gateway.session_context import get_session_env
+
+        origin_ui_session_id = str(get_session_env("HERMES_UI_SESSION_ID", "") or "")
+        origin_session_id = str(get_session_env("HERMES_SESSION_ID", "") or "")
+    except Exception:
+        pass
+    if not origin_session_id:
+        origin_session_id = str(getattr(agent, "session_id", "") or "")
+    return {
+        "session_key": session_key,
+        "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
+        "parent_session_id": str(getattr(agent, "session_id", "") or ""),
+    }
+
+
+def _max_async_children() -> int:
+    try:
+        from tools.delegate_tool import _get_max_async_children
+
+        return int(_get_max_async_children())
+    except Exception:
+        return 3
+
+
+def _concrete_model_for_decision(
+    decision: RoutingDecision, cfg: OrchestrationConfig
+) -> str:
+    concrete = str(decision.concrete_model_alias or "")
+    if concrete and concrete.lower() not in {"luna", "terra", "sol"}:
+        return concrete
+    try:
+        from agent.orchestration.config import resolve_family_model
+
+        _, resolved = resolve_family_model(cfg, decision.family.value)
+        if resolved and str(resolved).lower() not in {"luna", "terra", "sol"}:
+            return str(resolved)
+    except Exception:
+        pass
+    return concrete or decision.family.value.lower()
+
+
+def _async_ack_response(
+    *,
+    family: ModelFamily,
+    concrete_model: str,
+    correlation_id: str,
+    delegation_id: str,
+) -> str:
+    label = family.value.title()
+    return (
+        f"On it — routing this to {label} (`{concrete_model}`) in the background. "
+        f"I'll post the result in this thread when it finishes "
+        f"(ref `{delegation_id}`)."
+    )
+
+
+def _dispatch_active_worker_async(
+    *,
+    agent: Any,
+    spec: TaskSpec,
+    decision: RoutingDecision,
+    compiled: CompiledTask,
+    cfg: OrchestrationConfig,
+    correlation_id: str,
+    task_id: Optional[str],
+    trace: ExecutionTrace,
+    origin: Optional[TurnOrigin] = None,
+) -> OrchestrationTurnResult:
+    """Dispatch Terra/Sol on the durable async rail; return a human ack."""
+    from tools.async_delegation import dispatch_async_delegation
+
+    routing = _resolve_async_origin_routing(agent, origin=origin)
+    concrete_model = _concrete_model_for_decision(decision, cfg)
+
+    try:
+        from gateway.session_context import async_delivery_supported
+
+        delivery_ok = bool(async_delivery_supported())
+    except Exception:
+        delivery_ok = True
+
+    if not delivery_ok or not routing["session_key"]:
+        return _terminal_blocked_result(
+            mode="active",
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            trace=replace(
+                trace,
+                concrete_model=concrete_model or trace.concrete_model,
+                verification_outcome=VerificationOutcome.BLOCK.value,
+                error_class="async_delivery_unsupported",
+            ),
+            cfg=cfg,
+            status="UNSUPPORTED",
+            final_response=(
+                "Background routing isn't available for this session, so I "
+                "won't start an unroutable Terra/Sol worker. Please retry from "
+                "a durable messaging conversation."
+            ),
+            guard_reason_codes=(RuleId.R_MODE_ACTIVE.value,),
+            verification_outcome=VerificationOutcome.BLOCK.value,
+        )
+
+    proxy = _AsyncParentProxy(agent)
+    started = time.time()
+
+    def _runner() -> Dict[str, Any]:
+        try:
+            turn = _run_active_worker_loop(
+                agent=proxy,
+                spec=spec,
+                decision=decision,
+                compiled=compiled,
+                cfg=cfg,
+                correlation_id=correlation_id,
+                task_id=task_id,
+                trace=trace,
+            )
+        except Exception as exc:  # noqa: BLE001 — must finalize the async unit
+            logger.debug("async active orchestration runner failed", exc_info=True)
+            return {
+                "status": "error",
+                "summary": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "model": concrete_model,
+                "api_calls": 0,
+                "duration_seconds": round(time.time() - started, 2),
+            }
+
+        response = turn.response if isinstance(turn.response, dict) else {}
+        summary = response.get("final_response")
+        if summary is None and turn.worker_result is not None:
+            summary = _human_worker_response(turn.worker_result.final_response)
+        success = bool(response.get("completed", False))
+        model = concrete_model
+        if turn.trace is not None and turn.trace.concrete_model:
+            model = turn.trace.concrete_model
+        elif turn.worker_result is not None and turn.worker_result.model:
+            model = turn.worker_result.model
+        usage = response.get("usage") or {}
+        return {
+            "status": "completed" if success else "error",
+            "summary": summary,
+            "error": None
+            if success
+            else (
+                (turn.worker_result.error_class if turn.worker_result else None)
+                or response.get("status")
+                or "orchestration_failed"
+            ),
+            "model": model,
+            "api_calls": int(usage.get("output_tokens") or 0)
+            + int(usage.get("input_tokens") or 0),
+            "duration_seconds": round(time.time() - started, 2),
+            "exit_reason": "orchestration_active_async",
+            "orchestration": response.get("orchestration"),
+        }
+
+    def _interrupt() -> None:
+        children = list(getattr(proxy, "_active_children", []) or [])
+        for child in children:
+            try:
+                if hasattr(child, "interrupt"):
+                    child.interrupt()
+            except Exception:
+                pass
+
+    dispatch = dispatch_async_delegation(
+        goal=spec.objective,
+        context=compiled.brief,
+        toolsets=list(compiled.toolsets),
+        role="leaf",
+        model=concrete_model,
+        session_key=routing["session_key"],
+        parent_session_id=routing["parent_session_id"] or None,
+        origin_ui_session_id=routing["origin_ui_session_id"],
+        origin_session_id=routing["origin_session_id"],
+        runner=_runner,
+        interrupt_fn=_interrupt,
+        max_async_children=_max_async_children(),
+    )
+
+    if dispatch.get("status") != "dispatched":
+        # Messaging capacity must NOT silently fall back to blocking Terra/Sol.
+        return _terminal_blocked_result(
+            mode="active",
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            trace=replace(
+                trace,
+                concrete_model=concrete_model or trace.concrete_model,
+                verification_outcome=VerificationOutcome.BLOCK.value,
+                error_class="async_capacity_rejected",
+            ),
+            cfg=cfg,
+            status="BUSY",
+            final_response=(
+                "I'm at capacity for background Terra/Sol work right now "
+                "(async delegation pool is full). Please try again shortly — "
+                "I won't block this chat with a synchronous heavy worker."
+            ),
+            guard_reason_codes=(RuleId.R_MODE_ACTIVE.value,),
+            verification_outcome=VerificationOutcome.BLOCK.value,
+        )
+
+    delegation_id = str(dispatch.get("delegation_id") or "")
+    # Foreground ownership must be empty after dispatch; async registry owns it.
+    try:
+        children = getattr(agent, "_active_children", None)
+        if isinstance(children, list):
+            children.clear()
+    except Exception:
+        pass
+
+    ack = _async_ack_response(
+        family=decision.family,
+        concrete_model=concrete_model,
+        correlation_id=correlation_id,
+        delegation_id=delegation_id,
+    )
+    final_trace = replace(
+        trace,
+        concrete_provider=decision.concrete_provider or trace.concrete_provider,
+        concrete_model=concrete_model or trace.concrete_model,
+        verification_outcome="ASYNC_DISPATCHED",
+        legacy_parent_executed=False,
+        effective_mode="active",
+        worker_id=delegation_id,
+    )
+    try:
+        persist_trace(
+            final_trace,
+            cfg,
+            session_db=getattr(agent, "_session_db", None),
+            record_usage=False,
+        )
+    except Exception:
+        logger.debug("orchestration async dispatch trace persist failed", exc_info=True)
+
+    response = {
+        "final_response": ack,
+        "messages": [],
+        "orchestration": {
+            "correlation_id": correlation_id,
+            "family": decision.family.value,
+            "reasoning": decision.reasoning.value,
+            "mode": "active",
+            "status": "dispatched",
+            "worker_id": None,
+            "delegation_id": delegation_id,
+            "concrete_model": concrete_model,
+            "model": concrete_model,
+            "async": True,
+        },
+        "completed": True,
+        "status": "dispatched",
+    }
+    return OrchestrationTurnResult(
+        mode="active",
+        acted=True,
+        legacy_continue=False,
+        task_spec=spec,
+        decision=decision,
+        compiled=compiled,
+        trace=final_trace,
+        worker_result=None,
+        response=response,
+        guard_reason_codes=(),
+        pending_worker=False,
+        correlation_id=correlation_id,
+        cfg_snapshot=cfg,
+    )
+
+
 def _run_active_worker_loop(
     *,
     agent: Any,
@@ -665,17 +1034,31 @@ def complete_active_orchestration(
         task_id=str(task_id or getattr(agent, "_current_turn_id", "") or trace.task_id),
         session_id=str(getattr(agent, "session_id", "") or trace.session_id),
     )
+    origin = turn_origin_from_agent(agent)
     try:
-        result = _run_active_worker_loop(
-            agent=agent,
-            spec=plan.task_spec,
-            decision=plan.decision,
-            compiled=plan.compiled,
-            cfg=cfg,
-            correlation_id=correlation_id,
-            task_id=task_id,
-            trace=trace,
-        )
+        if _should_async_active_worker(plan.decision, agent=agent, origin=origin):
+            result = _dispatch_active_worker_async(
+                agent=agent,
+                spec=plan.task_spec,
+                decision=plan.decision,
+                compiled=plan.compiled,
+                cfg=cfg,
+                correlation_id=correlation_id,
+                task_id=task_id,
+                trace=trace,
+                origin=origin,
+            )
+        else:
+            result = _run_active_worker_loop(
+                agent=agent,
+                spec=plan.task_spec,
+                decision=plan.decision,
+                compiled=plan.compiled,
+                cfg=cfg,
+                correlation_id=correlation_id,
+                task_id=task_id,
+                trace=trace,
+            )
     except Exception as exc:
         logger.debug("active orchestration worker loop failed closed", exc_info=True)
         result = _fail_closed_active_error(
@@ -896,16 +1279,30 @@ def maybe_orchestrate_turn(
             pass
         return result
 
-    result = _run_active_worker_loop(
-        agent=agent,
-        spec=spec,
-        decision=decision,
-        compiled=compiled,
-        cfg=cfg,
-        correlation_id=correlation_id,
-        task_id=task_id,
-        trace=replace(trace, legacy_parent_executed=False),
-    )
+    active_trace = replace(trace, legacy_parent_executed=False)
+    if _should_async_active_worker(decision, agent=agent, origin=origin):
+        result = _dispatch_active_worker_async(
+            agent=agent,
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            cfg=cfg,
+            correlation_id=correlation_id,
+            task_id=task_id,
+            trace=active_trace,
+            origin=origin,
+        )
+    else:
+        result = _run_active_worker_loop(
+            agent=agent,
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            cfg=cfg,
+            correlation_id=correlation_id,
+            task_id=task_id,
+            trace=active_trace,
+        )
     try:
         agent._last_orchestration_result = result
     except Exception:
