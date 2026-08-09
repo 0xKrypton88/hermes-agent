@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -463,8 +464,6 @@ class _AsyncParentProxy:
     __slots__ = ("_parent", "_active_children", "_active_children_lock")
 
     def __init__(self, parent: Any):
-        import threading
-
         object.__setattr__(self, "_parent", parent)
         object.__setattr__(self, "_active_children", [])
         object.__setattr__(self, "_active_children_lock", threading.Lock())
