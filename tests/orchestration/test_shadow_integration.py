@@ -283,10 +283,11 @@ def test_active_mode_blocks_required_approval(tmp_path, monkeypatch):
         and result.trace.verification_outcome
         in {VerificationOutcome.REQUIRE_APPROVAL.value, "REQUIRE_APPROVAL"}
     )
-    assert result.legacy_continue is True or (
-        isinstance(result.response, dict)
-        and result.response.get("completed") is False
-    )
+    assert result.legacy_continue is False
+    assert result.acted is True
+    assert isinstance(result.response, dict)
+    assert result.response.get("completed") is False
+    assert str(result.response.get("status", "")).upper() == "REQUIRE_APPROVAL"
 
 
 def test_active_mode_preserves_parent_turn_lifecycle_and_correlates_worker_usage(

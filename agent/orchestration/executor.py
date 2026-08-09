@@ -145,6 +145,27 @@ def _reasoning_config(effort: ReasoningEffort) -> Dict[str, Any]:
     return {"effort": effort.value}
 
 
+def _allowed_side_effects_from_request(req: WorkerRunRequest):
+    """Resolve allowed side effects from the compiled/requested task binding."""
+    allowed = set()
+    for raw in req.allowed_side_effects or ():
+        try:
+            allowed.add(SideEffectClass(raw))
+        except ValueError:
+            continue
+    if not allowed:
+        # Safe default: read-only. Callers that want WRITE must bind it.
+        allowed = {SideEffectClass.NONE, SideEffectClass.READ}
+    else:
+        allowed.add(SideEffectClass.NONE)
+        allowed.add(SideEffectClass.READ)
+    # Never silently elevate destructive/financial/external from the request
+    # tuple alone without host approval — strip those if present.
+    allowed.discard(SideEffectClass.DESTRUCTIVE)
+    allowed.discard(SideEffectClass.FINANCIAL)
+    return frozenset(allowed)
+
+
 def _install_worker_policy_context(
     req: WorkerRunRequest,
     *,
@@ -167,12 +188,9 @@ def _install_worker_policy_context(
         except Exception:
             pass
 
-    allowed = {
-        SideEffectClass.NONE,
-        SideEffectClass.READ,
-        SideEffectClass.WRITE,
-    }
-    # Destructive/financial stay approval-gated unless already approved.
+    # Bind capabilities from the compiled/requested task. Destructive /
+    # financial / external remain approval-gated.
+    allowed = _allowed_side_effects_from_request(req)
     ctx = PolicyContext(
         session_id=str(
             req.parent_session_id or getattr(parent_agent, "session_id", "") or ""
@@ -182,7 +200,7 @@ def _install_worker_policy_context(
         ),
         tool_call_id=str(req.correlation_id or ""),
         is_worker=True,
-        allowed_side_effects=frozenset(allowed),
+        allowed_side_effects=allowed,
         approval_store=store,
         allow_worker_self_approve=False,
     )
@@ -193,6 +211,65 @@ def _install_worker_policy_context(
     except Exception:
         pass
     return token
+
+
+def _owned_child_cleanup(child: Any, parent_agent: Any) -> None:
+    """Interrupt/close/unregister ownership reused from delegation seams.
+
+    Python cannot kill a running worker thread. This path fails closed for the
+    caller: interrupt the child, drop registry/_active_children entries, and
+    close resources so the parent returns with deterministic cleanup even when
+    the child ignores the initial cancellation signal.
+    """
+    if child is None:
+        return
+    try:
+        if hasattr(child, "interrupt"):
+            child.interrupt()
+    except Exception:
+        logger.debug("owned child interrupt failed", exc_info=True)
+
+    subagent_id = getattr(child, "_subagent_id", None)
+    if subagent_id:
+        try:
+            from tools.delegate_tool import _unregister_subagent, interrupt_subagent
+
+            try:
+                interrupt_subagent(subagent_id)
+            except Exception:
+                pass
+            _unregister_subagent(subagent_id, agent=child)
+        except Exception:
+            logger.debug("owned child unregister failed", exc_info=True)
+
+    if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+        try:
+            lock = getattr(parent_agent, "_active_children_lock", None)
+            children = parent_agent._active_children
+            if lock:
+                with lock:
+                    if child in children:
+                        children.remove(child)
+            elif child in children:
+                children.remove(child)
+        except Exception:
+            logger.debug("owned child active_children cleanup failed", exc_info=True)
+
+    try:
+        if hasattr(child, "close"):
+            child.close()
+    except Exception:
+        logger.debug("owned child close failed", exc_info=True)
+
+    try:
+        from agent import relay_runtime
+
+        runtime = relay_runtime.get_runtime(create=False)
+        child_session_id = str(getattr(child, "session_id", "") or "")
+        if runtime is not None and child_session_id:
+            runtime.unregister_subagent({"child_session_id": child_session_id})
+    except Exception:
+        logger.debug("owned child relay unregister failed", exc_info=True)
 
 
 def _reset_worker_policy_context(token) -> None:
@@ -407,6 +484,7 @@ def execute_worker_run(
 
     child_ctx = contextvars.copy_context()
 
+    needs_owned_cleanup = False
     try:
         pool = DaemonThreadPoolExecutor(max_workers=1)
         try:
@@ -416,22 +494,14 @@ def execute_worker_run(
                 if cancel_check and cancel_check():
                     cancelled = True
                     error_class = "cancelled"
-                    try:
-                        if hasattr(child, "interrupt"):
-                            child.interrupt()
-                    except Exception:
-                        pass
+                    needs_owned_cleanup = True
                     future.cancel()
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     error_class = "timeout"
-                    try:
-                        if hasattr(child, "interrupt"):
-                            child.interrupt()
-                    except Exception:
-                        pass
+                    needs_owned_cleanup = True
                     future.cancel()
                     break
                 try:
@@ -455,9 +525,15 @@ def execute_worker_run(
                 pool.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 pool.shutdown(wait=False)
+            if needs_owned_cleanup:
+                # Deterministic interrupt/close/registry ownership even when
+                # the child thread ignores cancellation. Does not claim the
+                # underlying thread was killed.
+                _owned_child_cleanup(child, parent_agent)
     except Exception as exc:
         error_class = type(exc).__name__
         logger.debug("worker executor failed: %s", exc, exc_info=True)
+        _owned_child_cleanup(child, parent_agent)
     finally:
         _reset_worker_policy_context(policy_token)
 

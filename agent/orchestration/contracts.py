@@ -184,6 +184,9 @@ class WorkerRunRequest:
     parent_session_id: Optional[str] = None
     parent_turn_id: Optional[str] = None
     task_id: Optional[str] = None
+    # Side-effect classes the compiled/requested task may exercise without
+    # host approval. Destructive/financial/external stay approval-gated.
+    allowed_side_effects: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

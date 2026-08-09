@@ -110,6 +110,63 @@ def _base_trace(
     )
 
 
+def _terminal_blocked_result(
+    *,
+    mode: str,
+    spec: TaskSpec,
+    decision: RoutingDecision,
+    compiled: CompiledTask,
+    trace: ExecutionTrace,
+    cfg: OrchestrationConfig,
+    status: str,
+    final_response: str,
+    guard_reason_codes: Tuple[str, ...],
+    verification_outcome: str,
+    approval_outcome: Optional[str] = None,
+) -> OrchestrationTurnResult:
+    """Build a fail-closed terminal orchestration response (no worker/legacy)."""
+    trace = replace(
+        trace,
+        verification_outcome=verification_outcome,
+        approval_outcome=approval_outcome,
+        rule_ids=tuple(dict.fromkeys(list(trace.rule_ids) + list(guard_reason_codes))),
+    )
+    try:
+        persist_trace(trace, cfg, session_db=None, record_usage=False)
+    except Exception:
+        logger.debug("orchestration terminal trace persist failed", exc_info=True)
+
+    response = {
+        "final_response": final_response,
+        "messages": [],
+        "orchestration": {
+            "correlation_id": trace.correlation_id,
+            "family": decision.family.value,
+            "reasoning": decision.reasoning.value,
+            "mode": mode,
+            "status": status,
+            "worker_id": None,
+        },
+        "completed": False,
+        "status": status,
+    }
+    return OrchestrationTurnResult(
+        mode=mode,
+        acted=True,
+        legacy_continue=False,
+        task_spec=spec,
+        decision=decision,
+        compiled=compiled,
+        trace=trace,
+        worker_result=None,
+        response=response,
+        guard_reason_codes=guard_reason_codes,
+        pending_worker=False,
+        correlation_id=trace.correlation_id,
+        cfg_snapshot=cfg,
+    )
+
+
 def _require_approval_result(
     *,
     mode: str,
@@ -119,51 +176,151 @@ def _require_approval_result(
     trace: ExecutionTrace,
     cfg: OrchestrationConfig,
 ) -> OrchestrationTurnResult:
-    trace = replace(
-        trace,
-        verification_outcome=VerificationOutcome.REQUIRE_APPROVAL.value,
-        approval_outcome="required",
-        rule_ids=tuple(
-            dict.fromkeys(
-                list(trace.rule_ids) + [RuleId.R_SIDE_EFFECT_APPROVAL.value]
-            )
-        ),
-    )
-    try:
-        persist_trace(trace, cfg, session_db=None, record_usage=False)
-    except Exception:
-        logger.debug("orchestration approval trace persist failed", exc_info=True)
-
-    response = {
-        "final_response": (
+    return _terminal_blocked_result(
+        mode=mode,
+        spec=spec,
+        decision=decision,
+        compiled=compiled,
+        trace=trace,
+        cfg=cfg,
+        status="REQUIRE_APPROVAL",
+        final_response=(
             "This task requires explicit user approval before an active worker "
             "can run (destructive/financial side effects)."
         ),
+        guard_reason_codes=(RuleId.R_SIDE_EFFECT_APPROVAL.value,),
+        verification_outcome=VerificationOutcome.REQUIRE_APPROVAL.value,
+        approval_outcome="required",
+    )
+
+
+def _ask_user_or_blocked_result(
+    *,
+    mode: str,
+    spec: TaskSpec,
+    decision: RoutingDecision,
+    compiled: CompiledTask,
+    trace: ExecutionTrace,
+    cfg: OrchestrationConfig,
+    ask_user: bool,
+) -> OrchestrationTurnResult:
+    if ask_user:
+        unknowns = ", ".join(spec.blocker_unknowns) or "additional user input"
+        return _terminal_blocked_result(
+            mode=mode,
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            trace=trace,
+            cfg=cfg,
+            status="ASK_USER",
+            final_response=(
+                "Active orchestration cannot proceed without clarifying: "
+                f"{unknowns}"
+            ),
+            guard_reason_codes=(RuleId.R_BLOCKER_UNKNOWN.value,),
+            verification_outcome=VerificationOutcome.ASK_USER.value,
+        )
+    return _terminal_blocked_result(
+        mode=mode,
+        spec=spec,
+        decision=decision,
+        compiled=compiled,
+        trace=trace,
+        cfg=cfg,
+        status="BLOCKED",
+        final_response=(
+            "Active orchestration blocked this task due to a capability or "
+            "policy mismatch."
+        ),
+        guard_reason_codes=(RuleId.R_CAPABILITY_MISMATCH.value,),
+        verification_outcome=VerificationOutcome.BLOCK.value,
+    )
+
+
+def _fail_closed_active_error(
+    *,
+    plan: Optional[OrchestrationTurnResult],
+    agent: Any,
+    exc: BaseException,
+    task_id: Optional[str] = None,
+) -> OrchestrationTurnResult:
+    """Safe finalized error when an active plan fails after selection."""
+    correlation_id = None
+    cfg = None
+    spec = None
+    decision = None
+    compiled = None
+    trace = None
+    if plan is not None:
+        correlation_id = plan.correlation_id
+        cfg = plan.cfg_snapshot
+        spec = plan.task_spec
+        decision = plan.decision
+        compiled = plan.compiled
+        trace = plan.trace
+    correlation_id = correlation_id or f"orch-{uuid.uuid4().hex[:12]}"
+    cfg = cfg or load_orchestration_config(load_config())
+    message = (
+        "Active orchestration failed closed before completing the worker run. "
+        "Legacy model execution was not used."
+    )
+    if decision is not None and spec is not None and compiled is not None:
+        if trace is None:
+            trace = _base_trace(
+                correlation_id=correlation_id,
+                agent=agent,
+                task_id=task_id,
+                mode="active",
+                decision=decision,
+                spec=spec,
+                cfg=cfg,
+                rule_ids=list(decision.rule_ids) + [RuleId.R_MODE_ACTIVE.value],
+            )
+        return _terminal_blocked_result(
+            mode="active",
+            spec=spec,
+            decision=decision,
+            compiled=compiled,
+            trace=replace(
+                trace,
+                error_class=type(exc).__name__,
+                task_id=str(
+                    task_id or getattr(agent, "_current_turn_id", "") or trace.task_id
+                ),
+            ),
+            cfg=cfg,
+            status="BLOCKED",
+            final_response=message,
+            guard_reason_codes=(RuleId.R_MODE_ACTIVE.value,),
+            verification_outcome=VerificationOutcome.BLOCK.value,
+        )
+    response = {
+        "final_response": message,
         "messages": [],
         "orchestration": {
-            "correlation_id": trace.correlation_id,
-            "family": decision.family.value,
-            "reasoning": decision.reasoning.value,
-            "mode": mode,
-            "status": "REQUIRE_APPROVAL",
+            "correlation_id": correlation_id,
+            "mode": "active",
+            "status": "BLOCKED",
             "worker_id": None,
+            "error_class": type(exc).__name__,
         },
         "completed": False,
-        "status": "REQUIRE_APPROVAL",
+        "status": "BLOCKED",
     }
     return OrchestrationTurnResult(
-        mode=mode,
-        acted=False,
-        legacy_continue=True,
+        mode="active",
+        acted=True,
+        legacy_continue=False,
         task_spec=spec,
         decision=decision,
         compiled=compiled,
         trace=trace,
         worker_result=None,
         response=response,
-        guard_reason_codes=(RuleId.R_SIDE_EFFECT_APPROVAL.value,),
+        guard_reason_codes=(RuleId.R_MODE_ACTIVE.value,),
         pending_worker=False,
-        correlation_id=trace.correlation_id,
+        correlation_id=correlation_id,
         cfg_snapshot=cfg,
     )
 
@@ -206,6 +363,7 @@ def _run_active_worker_loop(
     from agent.orchestration.tool_policy import (
         ApprovalStore,
         PolicyContext,
+        allowed_side_effects_for_task,
         set_active_policy_context,
         reset_active_policy_context,
     )
@@ -220,6 +378,7 @@ def _run_active_worker_loop(
     total_input = 0
     total_output = 0
     total_latency = 0
+    total_cost = 0.0
 
     store = getattr(agent, "_orch_approval_store", None)
     if store is None:
@@ -230,34 +389,14 @@ def _run_active_worker_loop(
             pass
 
     turn_id = str(getattr(agent, "_current_turn_id", "") or task_id or "")
+    allowed_effects = allowed_side_effects_for_task(spec)
     policy_token = set_active_policy_context(
         PolicyContext(
             session_id=str(getattr(agent, "session_id", "") or ""),
             turn_id=turn_id,
             tool_call_id=correlation_id,
             is_worker=True,
-            allowed_side_effects=frozenset(),  # filled per-enforce defaults in executor
-            approval_store=store,
-            allow_worker_self_approve=False,
-        )
-    )
-    # Reinstall with READ/WRITE allowed; destructive/financial still gated.
-    reset_active_policy_context(policy_token)
-    from agent.orchestration.contracts import SideEffectClass
-
-    policy_token = set_active_policy_context(
-        PolicyContext(
-            session_id=str(getattr(agent, "session_id", "") or ""),
-            turn_id=turn_id,
-            tool_call_id=correlation_id,
-            is_worker=True,
-            allowed_side_effects=frozenset(
-                {
-                    SideEffectClass.NONE,
-                    SideEffectClass.READ,
-                    SideEffectClass.WRITE,
-                }
-            ),
+            allowed_side_effects=allowed_effects,
             approval_store=store,
             allow_worker_self_approve=False,
         )
@@ -287,6 +426,7 @@ def _run_active_worker_loop(
                 parent_session_id=getattr(agent, "session_id", None),
                 parent_turn_id=getattr(agent, "_current_turn_id", None),
                 task_id=task_id,
+                allowed_side_effects=tuple(e.value for e in allowed_effects),
             )
 
             worker_result = execute_worker_run(req, parent_agent=agent, cfg=cfg)
@@ -294,6 +434,10 @@ def _run_active_worker_loop(
             total_input += int((worker_result.usage or {}).get("input_tokens") or 0)
             total_output += int((worker_result.usage or {}).get("output_tokens") or 0)
             total_latency += int(worker_result.latency_ms or 0)
+            attempt_cost = float(
+                (worker_result.usage or {}).get("estimated_cost_usd") or 0.0
+            )
+            total_cost += attempt_cost
 
             current = AttemptRecord(
                 family=family,
@@ -302,7 +446,7 @@ def _run_active_worker_loop(
                 schema_ok=_schema_ok(worker_result),
                 failure_signature=_failure_signature(worker_result),
                 prompt_fingerprint=strategy_change or "default",
-                cost_usd=float((worker_result.usage or {}).get("estimated_cost_usd") or 0.0),
+                cost_usd=attempt_cost,
                 duration_s=float((worker_result.latency_ms or 0) / 1000.0),
                 requires_approval=bool(decision.requires_approval),
             )
@@ -380,10 +524,7 @@ def _run_active_worker_loop(
         latency_ms=total_latency or last_worker.latency_ms,
         input_tokens=total_input,
         output_tokens=total_output,
-        estimated_cost_usd=float(
-            (last_worker.usage or {}).get("estimated_cost_usd") or 0.0
-        )
-        or None,
+        estimated_cost_usd=total_cost if total_cost > 0 else None,
         verification_outcome=outcome,
         escalation_reason=";".join(transitions) if transitions else None,
         error_class=last_worker.error_class,
@@ -465,16 +606,22 @@ def complete_active_orchestration(
         task_id=str(task_id or getattr(agent, "_current_turn_id", "") or trace.task_id),
         session_id=str(getattr(agent, "session_id", "") or trace.session_id),
     )
-    result = _run_active_worker_loop(
-        agent=agent,
-        spec=plan.task_spec,
-        decision=plan.decision,
-        compiled=plan.compiled,
-        cfg=cfg,
-        correlation_id=correlation_id,
-        task_id=task_id,
-        trace=trace,
-    )
+    try:
+        result = _run_active_worker_loop(
+            agent=agent,
+            spec=plan.task_spec,
+            decision=plan.decision,
+            compiled=plan.compiled,
+            cfg=cfg,
+            correlation_id=correlation_id,
+            task_id=task_id,
+            trace=trace,
+        )
+    except Exception as exc:
+        logger.debug("active orchestration worker loop failed closed", exc_info=True)
+        result = _fail_closed_active_error(
+            plan=plan, agent=agent, exc=exc, task_id=task_id
+        )
     if messages is not None and isinstance(result.response, dict):
         merged = list(messages)
         # Ensure role alternation: append assistant with worker final response.
@@ -618,23 +765,14 @@ def maybe_orchestrate_turn(
 
     # active — may create an isolated worker (never mutates parent cache).
     if intake.ask_user or decision.blocked:
-        result = OrchestrationTurnResult(
+        result = _ask_user_or_blocked_result(
             mode="active",
-            acted=False,
-            legacy_continue=True,
-            task_spec=spec,
+            spec=spec,
             decision=decision,
             compiled=compiled,
             trace=trace,
-            worker_result=None,
-            response=None,
-            guard_reason_codes=(
-                (RuleId.R_BLOCKER_UNKNOWN.value,)
-                if intake.ask_user
-                else (RuleId.R_CAPABILITY_MISMATCH.value,)
-            ),
-            correlation_id=correlation_id,
-            cfg_snapshot=cfg,
+            cfg=cfg,
+            ask_user=bool(intake.ask_user),
         )
         try:
             agent._last_orchestration_result = result

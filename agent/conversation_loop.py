@@ -1454,17 +1454,10 @@ def run_conversation(
             task_id=task_id,
             defer_worker=True,
         )
-        # Only short-circuit before prologue for non-pending terminal results
-        # that already carry a finalized response (e.g. REQUIRE_APPROVAL with
-        # legacy_continue). Pending workers always continue into prologue.
-        if (
-            _orch_turn is not None
-            and _orch_turn.acted
-            and not getattr(_orch_turn, "pending_worker", False)
-            and isinstance(_orch_turn.response, dict)
-            and _orch_turn.legacy_continue is False
-        ):
-            return _orch_turn.response
+        # Never short-circuit before prologue. Terminal REQUIRE_APPROVAL /
+        # ASK_USER / BLOCKED decisions and deferred active workers both need
+        # parent turn persistence / turn IDs / hooks first. Legacy ``off`` /
+        # ``shadow`` keep legacy_continue=True and fall through after prologue.
     except Exception:
         logger.debug("adaptive orchestrator boundary failed", exc_info=True)
 
@@ -1510,27 +1503,45 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
-    # Active orchestration: run the deferred worker after prologue so the
-    # parent turn id / user-message persistence / hooks are already in place.
-    # Worker result re-enters through the canonical finalize path.
-    if (
-        _orch_turn is not None
-        and getattr(_orch_turn, "pending_worker", False)
-        and not _orch_turn.legacy_continue
-    ):
+    # Active orchestration after prologue: parent turn id / user-message
+    # persistence / hooks are already in place. Pending workers launch here;
+    # terminal REQUIRE_APPROVAL / ASK_USER / BLOCKED responses finalize without
+    # launching a worker or falling through to the legacy model loop. Any
+    # completion exception fails closed with a safe blocked response.
+    if _orch_turn is not None and not _orch_turn.legacy_continue:
         try:
-            from agent.orchestration.service import complete_active_orchestration
-
-            _orch_turn = complete_active_orchestration(
-                _orch_turn,
-                agent,
-                task_id=effective_task_id,
-                messages=messages,
+            from agent.orchestration.service import (
+                complete_active_orchestration,
+                _fail_closed_active_error,
             )
+
+            if getattr(_orch_turn, "pending_worker", False):
+                try:
+                    _orch_turn = complete_active_orchestration(
+                        _orch_turn,
+                        agent,
+                        task_id=effective_task_id,
+                        messages=messages,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "active orchestration completion failed closed",
+                        exc_info=True,
+                    )
+                    _orch_turn = _fail_closed_active_error(
+                        plan=_orch_turn,
+                        agent=agent,
+                        exc=exc,
+                        task_id=effective_task_id,
+                    )
+
             if (
                 _orch_turn is not None
-                and _orch_turn.acted
                 and isinstance(_orch_turn.response, dict)
+                and (
+                    _orch_turn.acted
+                    or not getattr(_orch_turn, "pending_worker", False)
+                )
             ):
                 final_response = _orch_turn.response.get("final_response")
                 orch_messages = _orch_turn.response.get("messages") or list(messages)
@@ -1542,13 +1553,23 @@ def run_conversation(
                         {"role": "assistant", "content": final_response}
                     ]
                 messages = orch_messages
+                failed = not bool(_orch_turn.response.get("completed", True))
+                exit_reason = "orchestration_active"
+                status = str(
+                    _orch_turn.response.get("status")
+                    or (_orch_turn.response.get("orchestration") or {}).get("status")
+                    or ""
+                ).upper()
+                if status in {"REQUIRE_APPROVAL", "ASK_USER", "BLOCKED", "BLOCK"}:
+                    exit_reason = f"orchestration_{status.lower()}"
+                    failed = True
                 try:
                     return finalize_turn(
                         agent,
                         final_response=final_response,
                         api_call_count=0,
                         interrupted=False,
-                        failed=not bool(_orch_turn.response.get("completed", True)),
+                        failed=failed,
                         messages=messages,
                         conversation_history=conversation_history,
                         effective_task_id=effective_task_id,
@@ -1556,7 +1577,7 @@ def run_conversation(
                         user_message=user_message,
                         original_user_message=original_user_message,
                         _should_review_memory=_should_review_memory,
-                        _turn_exit_reason="orchestration_active",
+                        _turn_exit_reason=exit_reason,
                     )
                 except Exception:
                     # Fallback: return the orchestration response with merged
@@ -1566,8 +1587,60 @@ def run_conversation(
                         "messages": messages,
                         "final_response": final_response,
                     }
-        except Exception:
-            logger.debug("active orchestration completion failed", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "active orchestration post-prologue path failed closed",
+                exc_info=True,
+            )
+            try:
+                from agent.orchestration.service import _fail_closed_active_error
+
+                closed = _fail_closed_active_error(
+                    plan=_orch_turn, agent=agent, exc=exc, task_id=effective_task_id
+                )
+                final_response = (closed.response or {}).get("final_response")
+                orch_messages = list(messages)
+                if final_response is not None and (
+                    not orch_messages
+                    or orch_messages[-1].get("role") != "assistant"
+                ):
+                    orch_messages = list(orch_messages) + [
+                        {"role": "assistant", "content": final_response}
+                    ]
+                try:
+                    return finalize_turn(
+                        agent,
+                        final_response=final_response,
+                        api_call_count=0,
+                        interrupted=False,
+                        failed=True,
+                        messages=orch_messages,
+                        conversation_history=conversation_history,
+                        effective_task_id=effective_task_id,
+                        turn_id=turn_id,
+                        user_message=user_message,
+                        original_user_message=original_user_message,
+                        _should_review_memory=_should_review_memory,
+                        _turn_exit_reason="orchestration_blocked",
+                    )
+                except Exception:
+                    return {
+                        **(closed.response or {}),
+                        "messages": orch_messages,
+                        "final_response": final_response,
+                        "completed": False,
+                        "status": "BLOCKED",
+                    }
+            except Exception:
+                return {
+                    "final_response": (
+                        "Active orchestration failed closed before completing "
+                        "the worker run. Legacy model execution was not used."
+                    ),
+                    "messages": list(messages),
+                    "completed": False,
+                    "status": "BLOCKED",
+                }
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
