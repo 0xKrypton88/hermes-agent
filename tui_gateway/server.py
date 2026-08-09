@@ -8428,7 +8428,11 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent, session)
+        # Keep this projection on the public one-argument compatibility path.
+        # Besides allowing callers/tests to wrap ``_session_info(agent)``, the
+        # helper already resolves the owning live session from ``_sessions`` so
+        # adaptive-reasoning metadata is still included.
+        return _session_info(agent)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
     # its workspace was wherever the gateway process happened to start, so the

@@ -5176,8 +5176,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    session_key = "session-batch-requeue-isolated"
     session = _session(
-        session_key="session-a",
+        session_key=session_key,
         agent=_BlockingNotificationAgent(turns),
         running=True,
     )
@@ -5185,7 +5186,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         {
             "type": "completion",
             "session_id": f"proc_batch_{index}",
-            "session_key": "session-a",
+            "session_key": session_key,
             "command": "safe-test-command",
             "exit_code": 0,
             "output": f"owned-{index}",
@@ -16605,21 +16606,23 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         server._sessions.pop("sid_trim", None)
 
 
-def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
+def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch, tmp_path):
     """A lazily-resumed session must report ITS workspace, not the gateway's.
 
     ``_fallback_session_info`` used ``_default_session_cwd()`` — the directory the
     gateway process happened to start in — so the desktop Files pane painted the
     wrong project for any session resumed without a built agent (#71254).
     """
+    session_cwd = tmp_path / "session-own-repo"
+    session_cwd.mkdir()
     monkeypatch.setattr(server, "_default_session_cwd", lambda: "/gateway/launch/dir")
     monkeypatch.setattr(server, "_git_branch_for_cwd", lambda cwd: "bb/feature")
     monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    info = server._fallback_session_info({"cwd": "/projects/session-own-repo"})
+    info = server._fallback_session_info({"cwd": str(session_cwd)})
 
-    assert info["cwd"] == "/projects/session-own-repo"
+    assert info["cwd"] == str(session_cwd)
     assert info["branch"] == "bb/feature"
 
 
