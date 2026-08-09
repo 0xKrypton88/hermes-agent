@@ -234,3 +234,9 @@ Exactly one documentation file:
 
 No production code, tests, config, services, runtime, dependency, or generated
 files are modified by WP0.
+
+## V1.1 follow-on
+
+Exact-ID Slack DM canary activation, trusted `TurnOrigin`, bilingual
+LUNA-class classifier path, and openai-codex family model maps are specified
+in `docs/design/adaptive-orchestrator-v1.1-canary.md`.
