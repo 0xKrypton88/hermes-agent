@@ -17,8 +17,11 @@ import {
   setCurrentFastMode,
   setCurrentModel,
   setCurrentPersonality,
+  setCurrentAdaptivePolicyVersion,
   setCurrentProvider,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  setCurrentReasoningReason,
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
@@ -930,7 +933,18 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'adaptivePolicyVersion'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'reasoningMode'
+    | 'reasoningReason'
+    | 'serviceTier'
+    | 'yolo'
   >
 >
 
@@ -984,6 +998,18 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
 
   if (state.reasoningEffort !== undefined) {
     setCurrentReasoningEffort(state.reasoningEffort)
+  }
+
+  if (state.reasoningMode !== undefined) {
+    setCurrentReasoningMode(state.reasoningMode)
+  }
+
+  if (state.reasoningReason !== undefined) {
+    setCurrentReasoningReason(state.reasoningReason)
+  }
+
+  if (state.adaptivePolicyVersion !== undefined) {
+    setCurrentAdaptivePolicyVersion(state.adaptivePolicyVersion)
   }
 
   if (state.serviceTier !== undefined) {
@@ -1048,6 +1074,18 @@ export function applyRuntimeInfo(
 
   if (typeof info.reasoning_effort === 'string') {
     sessionState.reasoningEffort = info.reasoning_effort
+  }
+
+  if (info.reasoning_mode === 'auto' || info.reasoning_mode === 'inherit' || info.reasoning_mode === 'manual') {
+    sessionState.reasoningMode = info.reasoning_mode
+  }
+
+  if (typeof info.reasoning_reason === 'string') {
+    sessionState.reasoningReason = info.reasoning_reason
+  }
+
+  if (typeof info.adaptive_policy_version === 'string') {
+    sessionState.adaptivePolicyVersion = info.adaptive_policy_version
   }
 
   if (typeof info.service_tier === 'string') {

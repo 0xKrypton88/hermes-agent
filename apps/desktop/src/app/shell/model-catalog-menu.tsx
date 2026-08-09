@@ -38,7 +38,12 @@ import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-c
 import { $defaultReasoningEffort } from '@/store/session'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
-import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
+import {
+  type FastControl,
+  type ModelEditOptionsPatch,
+  ModelEditSubmenu,
+  resolveFastControl
+} from './model-edit-submenu'
 
 // Lets the host dropdown (model-pill, a kanban field trigger, …) hand the panel
 // a way to dismiss itself so clicking a model row commits + closes, while the
@@ -53,6 +58,7 @@ export interface ModelChoice {
   fast: boolean
   model: string
   provider: string
+  reasoningMode?: 'auto' | 'inherit' | 'manual'
 }
 
 /**
@@ -75,7 +81,7 @@ export interface ModelMenuController {
   select: (model: string, provider: string) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
   setOptions: (
-    patch: { effort?: string; fast?: boolean },
+    patch: ModelEditOptionsPatch,
     row: { isActive: boolean; model: string; provider: string }
   ) => void
 }
@@ -461,6 +467,7 @@ export function ModelCatalogMenu({
                           }
                           provider={group.provider.slug}
                           reasoning={caps?.reasoning ?? true}
+                          reasoningMode={isCurrent ? (current.reasoningMode ?? 'inherit') : 'inherit'}
                         />
                       </DropdownMenuSub>
                     )

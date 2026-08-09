@@ -341,8 +341,14 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
-def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+def restore_undelivered_completions(
+    target_queue,
+    *,
+    origin_ui_session_id: str = "",
+    session_keys: Optional[set[str]] = None,
+    key_resolver: Optional[Callable[[str], str]] = None,
+) -> int:
+    """Enqueue durable pending completions as fresh turns.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
     stamp is added after the durable payload is deserialized and is never
@@ -352,7 +358,16 @@ def restore_undelivered_completions(target_queue) -> int:
     leave them queued for a consumer that can positively prove ownership,
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
+
+    With owner selectors, only completions belonging to that reattached
+    runtime/durable lineage are restored. Without selectors, startup behavior
+    remains unchanged and all pending completions are rehydrated.
     """
+    owner_ui = str(origin_ui_session_id or "")
+    owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
+    targeted = bool(owner_ui or owner_keys)
+    restored = 0
+
     recover_abandoned_delegations()
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
@@ -362,10 +377,31 @@ def restore_undelivered_completions(target_queue) -> int:
         ).fetchall()
         for _delegation_id, payload in rows:
             evt = json.loads(payload)
+            if targeted:
+                event_ui = str(evt.get("origin_ui_session_id") or "")
+                event_keys = {
+                    str(evt.get("session_key") or ""),
+                    str(evt.get("parent_session_id") or ""),
+                }
+                event_keys.discard("")
+                owned = bool(owner_ui and event_ui == owner_ui)
+                if not owned:
+                    owned = bool(owner_keys.intersection(event_keys))
+                if not owned and key_resolver is not None:
+                    for key in event_keys:
+                        try:
+                            if str(key_resolver(key) or key) in owner_keys:
+                                owned = True
+                                break
+                        except Exception:
+                            continue
+                if not owned:
+                    continue
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -622,6 +658,51 @@ def has_live_for_session(
             )
             for r in _records.values()
         )
+
+
+def session_has_active_delegation(
+    *,
+    origin_ui_session_id: str = "",
+    session_keys: Optional[set[str]] = None,
+    key_resolver: Optional[Callable[[str], str]] = None,
+) -> bool:
+    """Return whether active/finalizing work belongs to one session owner.
+
+    ``origin_ui_session_id`` covers the live runtime tab that dispatched the
+    work. ``session_keys`` covers durable session ids and parent-lineage ids;
+    an optional resolver lets a transport map a pre-compression key to its
+    current continuation without this module parsing another subsystem's DB.
+    """
+    owner_ui = str(origin_ui_session_id or "")
+    owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
+    if not owner_ui and not owner_keys:
+        return False
+
+    with _records_lock:
+        active = [
+            dict(record)
+            for record in _records.values()
+            if record.get("status") in {"running", "finalizing"}
+        ]
+
+    for record in active:
+        if owner_ui and str(record.get("origin_ui_session_id") or "") == owner_ui:
+            return True
+        record_keys = {
+            str(record.get("session_key") or ""),
+            str(record.get("parent_session_id") or ""),
+        }
+        record_keys.discard("")
+        if owner_keys.intersection(record_keys):
+            return True
+        if key_resolver is not None:
+            for key in record_keys:
+                try:
+                    if str(key_resolver(key) or key) in owner_keys:
+                        return True
+                except Exception:
+                    continue
+    return False
 
 
 def _new_delegation_id() -> str:

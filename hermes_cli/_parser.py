@@ -477,6 +477,25 @@ def build_top_level_parser():
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
     )
+    chat_parser.add_argument(
+        "--title-project",
+        default=None,
+        metavar="PROJECT",
+        help=(
+            "Neutral launch metadata: seed an auto session title as "
+            "'PROJECT - AREA' (requires --title-area). Source remains llm so "
+            "adaptive retitling can later change AREA."
+        ),
+    )
+    chat_parser.add_argument(
+        "--title-area",
+        default=None,
+        metavar="AREA",
+        help=(
+            "Neutral launch metadata: work-surface/area half of the "
+            "'PROJECT - AREA' auto seed (requires --title-project)."
+        ),
+    )
     _inherited_flag(
         chat_parser,
         "--tui",

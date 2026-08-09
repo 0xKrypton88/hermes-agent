@@ -98,6 +98,18 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Narrow GPT-5.6 Sol adaptive reasoning policy. Opt-in only: Auto
+        # effort routing stays off until the user enables this block. Route
+        # identity (provider/model) is fixed by policy and not a user surface.
+        "adaptive_reasoning": {
+            "enabled": False,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "default_effort": "medium",
+            "min_effort": "low",
+            "max_effort": "high",
+            "followup_policy": "escalate_only",
+        },
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -962,6 +974,10 @@ DEFAULT_CONFIG = {
         },
         "title_generation": {
             "enabled": True,
+            # descriptive (default) | project_area — project_area is opt-in.
+            "style": "descriptive",
+            # initial (default) | adaptive — adaptive retitle is opt-in.
+            "mode": "initial",
             "provider": "auto",
             "model": "",
             "base_url": "",

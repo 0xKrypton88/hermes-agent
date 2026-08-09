@@ -142,7 +142,12 @@ class TestFinalizeInterruptsOwnDelegations:
     def test_viewer_of_gateway_session_only_interrupts_by_origin(self, mock_get_db):
         """Closing a TUI viewer tab on a live gateway session must not kill
         the gateway's own background work — key-based interrupt is skipped,
-        origin-id interrupt (this tab's own dispatches) still applies."""
+        origin-id interrupt (this tab's own dispatches) still applies.
+
+        Uses an explicit close reason: automatic cleanup reasons
+        (``ws_orphan_reap`` / idle / LRU) are non-cancelling under the
+        durability overlay and skip interrupt entirely.
+        """
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"source": "telegram"}
         mock_get_db.return_value = mock_db
@@ -150,9 +155,24 @@ class TestFinalizeInterruptsOwnDelegations:
         with patch("tools.async_delegation.interrupt_for_session") as mock_int:
             _finalize_session(
                 self._make_session(session_key="agent:main:telegram:dm:123", sid="tab9"),
-                end_reason="ws_orphan_reap",
+                end_reason="tui_close",
             )
 
         kwargs = mock_int.call_args.kwargs
         assert kwargs["session_key"] == ""
         assert kwargs["origin_ui_session_id"] == "tab9"
+
+    @patch("tui_gateway.server._get_db")
+    def test_automatic_orphan_reap_does_not_interrupt_delegations(self, mock_get_db):
+        """Durability overlay: transport/orphan cleanup parks work for reattach."""
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"source": "tui"}
+        mock_get_db.return_value = mock_db
+
+        with patch("tools.async_delegation.interrupt_for_session") as mock_int:
+            _finalize_session(
+                self._make_session(session_key="sess_A", sid="tab9"),
+                end_reason="ws_orphan_reap",
+            )
+
+        mock_int.assert_not_called()

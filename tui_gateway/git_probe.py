@@ -39,7 +39,14 @@ _WARM_WORKERS = 8
 # enough that a freshly `git init`-ed / newly-created folder shows correctly
 # within a few seconds; long enough to collapse the hundreds of redundant probes
 # a single project-tree build (and rapid re-opens) would otherwise fire.
-_NEG_TTL = 30.0
+# How long a "not a git repo" answer stays cached before it's re-probed. This
+# must outlive a complete cold Projects-tree request: on Windows, bounded cleanup
+# of failed git processes can make the tree's multiple resolution phases span
+# more than the Desktop's 120-second RPC deadline. A shorter TTL makes a miss
+# expire *inside the same request* and re-runs the expensive probe in each phase.
+# Known repo/worktree mutations call invalidate(), so they still refresh
+# immediately; only an out-of-band `git init` can remain negative for this TTL.
+_NEG_TTL = 300.0
 
 
 def run_git(cwd: str, *args: str) -> str:

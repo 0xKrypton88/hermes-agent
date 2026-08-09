@@ -97,6 +97,7 @@ describe('ModelPill per-surface model label', () => {
       $model: atom('tile/claude-sonnet'),
       $provider: atom('anthropic'),
       $reasoningEffort: atom('high'),
+      $reasoningMode: atom('inherit' as const),
       $runtimeId: atom('tile-runtime'),
       $storedId: atom('stored-tile')
     }

@@ -658,6 +658,11 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+_NON_CANCELLING_SESSION_END_REASONS = frozenset(
+    {"ws_disconnect", "ws_orphan_reap", "idle_timeout", "lru_evict"}
+)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -760,33 +765,33 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
-    # A session's in-flight async delegations end WITH the session (#55578):
-    # once nobody owns the return address, a still-running background subagent
-    # can only burn tokens and park an orphaned completion on the shared
-    # queue. Always interrupt delegations commissioned by THIS live UI session
-    # (its sid); additionally interrupt by durable session_key, but only when
-    # the TUI owns the lifecycle — closing a viewer tab on a live gateway
-    # session must not kill the gateway's own background work.
-    try:
-        from tools.async_delegation import interrupt_for_session
+    # Explicit user/session boundaries end their in-flight delegations (#55578).
+    # Automatic transport/retention cleanup only releases the runtime wrapper:
+    # durable delegation work and its completion survive for a later reattach.
+    # Explicit boundaries interrupt work commissioned by THIS live UI session
+    # (its sid), plus the durable session_key when the TUI owns the lifecycle;
+    # a viewer tab on a live gateway session never owns that durable lifecycle.
+    if end_reason not in _NON_CANCELLING_SESSION_END_REASONS:
+        try:
+            from tools.async_delegation import interrupt_for_session
 
-        _own_sid = str(session.get("_sid") or "")
-        if not _own_sid:
-            try:
-                with _sessions_lock:
-                    for _cand_sid, _cand in _sessions.items():
-                        if _cand is session:
-                            _own_sid = _cand_sid
-                            break
-            except Exception:
-                _own_sid = ""
-        interrupt_for_session(
-            session_key=str(session_key or "") if _tui_owns_lifecycle else "",
-            origin_ui_session_id=_own_sid,
-            reason=end_reason,
-        )
-    except Exception:
-        pass
+            _own_sid = str(session.get("_sid") or "")
+            if not _own_sid:
+                try:
+                    with _sessions_lock:
+                        for _cand_sid, _cand in _sessions.items():
+                            if _cand is session:
+                                _own_sid = _cand_sid
+                                break
+                except Exception:
+                    _own_sid = ""
+            interrupt_for_session(
+                session_key=str(session_key or "") if _tui_owns_lifecycle else "",
+                origin_ui_session_id=_own_sid,
+                reason=end_reason,
+            )
+        except Exception:
+            pass
 
     # Close the slash-worker subprocess as part of finalize itself, not just
     # in the callers. Defense-in-depth: every session-end path goes through
@@ -941,7 +946,53 @@ def _close_session_by_id(
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
+def _restore_pending_async_delegations(sid: str, session: dict) -> int:
+    """Requeue this reattached session's durable pending completions."""
+    if session.get("_finalized") or _transport_is_dead(session.get("transport")):
+        return 0
+
+    home_token = None
+    try:
+        from tools.async_delegation import restore_undelivered_completions
+        from tools.process_registry import process_registry
+
+        keys = {
+            str(session.get("session_key") or ""),
+            str(_session_lookup_key(session, fallback=sid) or ""),
+        }
+        keys.discard("")
+        profile_home = session.get("profile_home")
+        if profile_home:
+            home_token = set_hermes_home_override(str(profile_home))
+        with _session_db(session) as db:
+
+            def _resolve_key(key: str) -> str:
+                if db is None:
+                    return key
+                try:
+                    return str(db.resolve_resume_session_id(key) or key)
+                except Exception:
+                    return key
+
+            return restore_undelivered_completions(
+                process_registry.completion_queue,
+                origin_ui_session_id=sid,
+                session_keys=keys,
+                key_resolver=_resolve_key,
+            )
+    except Exception:
+        logger.warning(
+            "Could not restore async delegation completions for session %s",
+            sid,
+            exc_info=True,
+        )
+        return 0
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _ws_session_is_orphaned(session: dict | None, sid: str = "") -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
     After ``handle_ws`` detaches a disconnected client it points the session at
@@ -951,6 +1002,14 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    if not sid:
+        with _sessions_lock:
+            sid = next(
+                (key for key, candidate in _sessions.items() if candidate is session),
+                "",
+            )
+    if _session_has_active_delegations(sid, session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -1051,19 +1110,23 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # mutual exclusion against _init_session / _close_session_by_id, which
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        reschedule = False
         session = None
         with _session_resume_lock:
-            current = _sessions.get(sid)
-            if not _ws_session_is_orphaned(current):
+            candidate = _sessions.get(sid)
+            # Detached sessions with live async work stay parked until the
+            # background child settles; reschedule rather than treating the
+            # active-delegation guard as "not orphaned" (which would drop the
+            # reap forever).
+            if (
+                candidate
+                and candidate.get("transport") is _detached_ws_transport
+                and _session_has_active_delegations(sid, candidate)
+            ):
+                _schedule_ws_orphan_reap(sid)
                 return
-            if _session_has_active_delegations(sid, current):
-                reschedule = True
-            else:
-                session = _pop_session_by_id(sid)
-        if reschedule:
-            _schedule_ws_orphan_reap(sid)
-            return
+            if not _ws_session_is_orphaned(candidate, sid):
+                return
+            session = _pop_session_by_id(sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
@@ -2788,6 +2851,8 @@ def _ensure_session_db_row(session: dict) -> None:
             )
     if (reasoning := session.get("create_reasoning_override")) is not None:
         model_config["reasoning_config"] = reasoning
+    if (adaptive := _adaptive_reasoning_metadata(session)) is not None:
+        model_config["adaptive_reasoning"] = adaptive
     create_service_tier_override = session.get("create_service_tier_override")
     if create_service_tier_override is not None:
         # Empty string is the in-memory sentinel for an explicit normal tier:
@@ -3109,6 +3174,119 @@ def _apply_managed(cfg: dict) -> dict:
         return managed_scope.apply_managed_overlay(cfg if isinstance(cfg, dict) else {})
     except Exception:
         return cfg
+
+
+_ADAPTIVE_REASONING_MODES = frozenset({"auto", "manual", "inherit"})
+
+
+def _adaptive_reasoning_config() -> dict:
+    """Load the narrow policy with upstream defaults and immutable route."""
+    from agent.adaptive_reasoning import AUTO_MODEL, AUTO_PROVIDER
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    defaults = dict(DEFAULT_CONFIG["agent"]["adaptive_reasoning"])
+    cfg = _load_cfg()
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
+    raw = agent_cfg.get("adaptive_reasoning") if isinstance(agent_cfg, dict) else {}
+    if isinstance(raw, dict):
+        defaults.update(raw)
+    # Route identity is policy, not a user-selectable routing surface.
+    defaults["provider"] = AUTO_PROVIDER
+    defaults["model"] = AUTO_MODEL
+    defaults["enabled"] = is_truthy_value(defaults.get("enabled"), default=False)
+    return defaults
+
+
+def _adaptive_reasoning_metadata(session: dict | None) -> dict | None:
+    if not isinstance(session, dict):
+        return None
+    mode = str(session.get("reasoning_mode") or "inherit").strip().lower()
+    floor = session.get("reasoning_floor")
+    decision = session.get("adaptive_reasoning_decision")
+    if mode == "inherit" and floor is None and not isinstance(decision, dict):
+        return None
+    metadata: dict = {"mode": mode if mode in _ADAPTIVE_REASONING_MODES else "inherit"}
+    if floor is not None:
+        metadata["floor"] = str(floor)
+    if isinstance(decision, dict):
+        compact = {
+            key: decision.get(key)
+            for key in ("effort", "work_class", "reason_code", "policy_version")
+            if decision.get(key) is not None
+        }
+        if compact:
+            metadata["decision"] = compact
+    return metadata
+
+
+def _apply_adaptive_reasoning_state(session: dict, state: dict | None) -> None:
+    state = state if isinstance(state, dict) else {}
+    mode = str(state.get("mode") or "inherit").strip().lower()
+    session["reasoning_mode"] = mode if mode in _ADAPTIVE_REASONING_MODES else "inherit"
+    session["reasoning_floor"] = state.get("floor")
+    decision = state.get("decision")
+    session["adaptive_reasoning_decision"] = (
+        dict(decision) if isinstance(decision, dict) else None
+    )
+
+
+def _mark_session_reasoning_manual(session: dict, effort: str | None = None) -> None:
+    session["reasoning_mode"] = "manual"
+    session["reasoning_floor"] = effort
+    session["adaptive_reasoning_decision"] = None
+
+
+def _prepare_adaptive_reasoning_turn(
+    sid: str, session: dict, prompt: str, history: list
+):
+    """Choose and apply Auto effort immediately before one model request."""
+    if session.get("reasoning_mode") != "auto":
+        return None
+    policy = _adaptive_reasoning_config()
+    if not policy.get("enabled"):
+        return None
+
+    from agent.adaptive_reasoning import (
+        AUTO_MODEL,
+        AUTO_PROVIDER,
+        decide_adaptive_reasoning,
+    )
+
+    agent = session.get("agent")
+    if agent is None:
+        return None
+    if (
+        str(getattr(agent, "provider", "") or "") != AUTO_PROVIDER
+        or str(getattr(agent, "model", "") or "") != AUTO_MODEL
+    ):
+        raise RuntimeError(
+            "adaptive reasoning requires its fixed runtime "
+            f"{AUTO_PROVIDER}/{AUTO_MODEL}"
+        )
+
+    decision = decide_adaptive_reasoning(
+        prompt=str(prompt or ""),
+        cwd=_session_cwd(session),
+        history=history,
+        current_floor=session.get("reasoning_floor"),
+        config=policy,
+    )
+    decision_dict = {
+        "provider": decision.provider,
+        "model": decision.model,
+        "effort": decision.effort,
+        "work_class": decision.work_class,
+        "reason_code": decision.reason_code,
+        "policy_version": decision.policy_version,
+    }
+    reasoning = {"enabled": True, "effort": decision.effort}
+    session["reasoning_floor"] = decision.effort
+    session["adaptive_reasoning_decision"] = decision_dict
+    session["create_reasoning_override"] = reasoning
+    agent.reasoning_config = reasoning
+    _persist_live_session_runtime(session)
+    _emit("session.info", sid, _session_info(agent, session))
+    return decision
 
 
 def _save_cfg(cfg: dict):
@@ -3738,6 +3916,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
+    adaptive_reasoning_state = model_config.get("adaptive_reasoning")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
     # Heal a bare ``"custom"`` provider stored by an older build (or any leak
@@ -3781,6 +3960,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config
+    if isinstance(adaptive_reasoning_state, dict):
+        overrides["adaptive_reasoning_state"] = adaptive_reasoning_state
     if service_tier.lower() == "normal":
         # None means "inherit the profile" at _make_agent. Empty string is a
         # real override that means "do not request a priority service tier".
@@ -3791,7 +3972,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
-def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+def _runtime_model_config(
+    agent, existing: dict | None = None, session: dict | None = None
+) -> dict:
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
@@ -3848,6 +4031,11 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    adaptive = _adaptive_reasoning_metadata(session)
+    if adaptive is not None:
+        config["adaptive_reasoning"] = adaptive
+    elif session is not None:
+        config.pop("adaptive_reasoning", None)
 
     return config
 
@@ -3875,7 +4063,7 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             parsed = json.loads(raw_config)
             if isinstance(parsed, dict):
                 existing_config = parsed
-        model_config = _runtime_model_config(agent, existing_config)
+        model_config = _runtime_model_config(agent, existing_config, session)
         create_service_tier_override = session.get("create_service_tier_override")
         if create_service_tier_override is not None:
             # _runtime_model_config sees agent.service_tier=None for explicit
@@ -4612,6 +4800,8 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
+        if pin_session_override and not one_turn and session.get("reasoning_mode") == "auto":
+            _mark_session_reasoning_manual(session)
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
@@ -4638,6 +4828,8 @@ def _apply_model_switch(
     # agent in place; the override dict makes that choice survive a rebuild
     # without touching shared process state.
     if pin_session_override and isinstance(session, dict) and not one_turn:
+        if not agent and session.get("reasoning_mode") == "auto":
+            _mark_session_reasoning_manual(session)
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
@@ -5133,6 +5325,194 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
         return None
 
 
+def _session_assignment_root_id(db, session_id: str) -> str:
+    """Stable compression root; branches and delegates remain independent."""
+    current_id = str(session_id or "").strip()
+    if not current_id or db is None:
+        return current_id
+    get_session = getattr(db, "get_session", None)
+    if not callable(get_session):
+        return current_id
+    seen: set[str] = set()
+    for _ in range(100):
+        if not current_id or current_id in seen:
+            break
+        seen.add(current_id)
+        row = get_session(current_id)
+        if not isinstance(row, dict):
+            break
+        model_config = row.get("model_config")
+        if isinstance(model_config, str):
+            try:
+                model_config = json.loads(model_config)
+            except (TypeError, ValueError):
+                model_config = {}
+        if isinstance(model_config, dict) and (
+            model_config.get("_branched_from") or model_config.get("_delegate_from")
+        ):
+            break
+        parent_id = str(row.get("parent_session_id") or "").strip()
+        if not parent_id:
+            break
+        parent = get_session(parent_id)
+        if not isinstance(parent, dict) or parent.get("end_reason") != "compression":
+            break
+        current_id = parent_id
+    return current_id
+
+
+def _project_info_for_session(session: dict | None, cwd: str) -> dict | None:
+    """Resolve durable project identity first, then fall back to workspace."""
+    session_key = str((session or {}).get("session_key") or "").strip()
+    session_key = _session_assignment_root_id(_get_db(), session_key)
+    if session_key:
+        try:
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as conn:
+                assignment = pdb.get_session_project(conn, session_key)
+                if assignment is None:
+                    pass
+                elif assignment.locked and not assignment.project_id:
+                    # Manual Home / No-project must never fall back to cwd.
+                    return {
+                        "id": None,
+                        "slug": None,
+                        "name": None,
+                        "primary_path": None,
+                        "assignment": assignment.to_dict(),
+                    }
+                elif assignment.project_id:
+                    project = pdb.get_project(conn, assignment.project_id)
+                    if project is not None and not project.archived:
+                        return {
+                            "id": project.id,
+                            "slug": project.slug,
+                            "name": project.name,
+                            "primary_path": project.primary_path,
+                            "assignment": assignment.to_dict(),
+                        }
+                    if assignment.locked:
+                        # Locked to a deleted/archived project stays Home.
+                        return {
+                            "id": None,
+                            "slug": None,
+                            "name": None,
+                            "primary_path": None,
+                            "assignment": assignment.to_dict(),
+                        }
+        except Exception:
+            logger.debug("failed to resolve assigned session project", exc_info=True)
+    return _project_info_for_cwd(cwd)
+
+
+def _auto_route_session_project(
+    session_id: str,
+    *,
+    title: str,
+    user_text: str,
+    assistant_text: str,
+    activity_text: str,
+    cwd: str,
+    git_repo_root: str,
+) -> tuple[dict | None, bool]:
+    """Observe project evidence; return (assignment, membership_changed)."""
+    from hermes_cli import projects_db as pdb
+    from tui_gateway.project_routing import choose_project
+
+    with pdb.connect_closing() as conn:
+        if not pdb.is_session_routing_enabled(conn):
+            return None, False
+        before = pdb.get_session_project(conn, session_id)
+        decision = choose_project(
+            pdb.list_projects(conn),
+            title=title,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            activity_text=activity_text,
+            cwd=cwd,
+            git_repo_root=git_repo_root,
+        )
+        if decision is None:
+            return (before.to_dict() if before is not None else None), False
+        assignment = pdb.observe_auto_project(
+            conn,
+            session_id,
+            decision.project_id,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+
+    if assignment is None:
+        return None, False
+    changed = before is None or before.project_id != assignment.project_id
+    return assignment.to_dict(), changed
+
+
+def _routing_activity_text(session: dict) -> str:
+    """Bound recent tool evidence for matching only; raw content is not persisted."""
+    parts: list[str] = []
+    history = session.get("history")
+    for message in (history[-16:] if isinstance(history, list) else []):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role == "tool":
+            parts.append(str(message.get("tool_name") or ""))
+            parts.append(str(message.get("content") or ""))
+        elif message.get("tool_calls"):
+            try:
+                parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
+            except (TypeError, ValueError):
+                pass
+        if sum(len(part) for part in parts) >= 8000:
+            break
+    return "\n".join(parts)[:8000]
+
+
+def _route_and_emit_session_project(
+    sid: str,
+    session: dict,
+    *,
+    title: str,
+    user_text: str,
+    assistant_text: str,
+) -> dict | None:
+    session_id = str(session.get("session_key") or sid).strip()
+    session_id = _session_assignment_root_id(_get_db(), session_id)
+    cwd = _display_session_cwd(session)
+    git_repo_root = str(session.get("git_repo_root") or "").strip()
+    if not git_repo_root and cwd:
+        try:
+            git_repo_root = _git_common_repo_root_for_cwd(cwd) or ""
+        except Exception:
+            git_repo_root = ""
+    profile_token = None
+    profile_home = session.get("profile_home")
+    if profile_home:
+        profile_token = set_hermes_home_override(str(profile_home))
+    try:
+        assignment, changed = _auto_route_session_project(
+            session_id,
+            title=title,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            activity_text=_routing_activity_text(session),
+            cwd=cwd,
+            git_repo_root=git_repo_root,
+        )
+    finally:
+        if profile_token is not None:
+            reset_hermes_home_override(profile_token)
+    if changed and assignment is not None:
+        _emit(
+            "session.project",
+            sid,
+            {"session_id": session_id, "assignment": assignment},
+        )
+    return assignment
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -5184,11 +5564,17 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    decision = (session or {}).get("adaptive_reasoning_decision")
+    decision = decision if isinstance(decision, dict) else {}
+    reasoning_mode = str((session or {}).get("reasoning_mode") or "inherit")
     info: dict = {
         "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
         "provider": pending_provider
         or mirror.get("provider", getattr(agent, "provider", "")),
+        "reasoning_mode": reasoning_mode,
         "reasoning_effort": reasoning_effort,
+        "reasoning_reason": str(decision.get("reason_code") or ""),
+        "adaptive_policy_version": str(decision.get("policy_version") or ""),
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,
@@ -5197,7 +5583,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": _project_info_for_session(session, cwd),
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
@@ -6442,9 +6828,14 @@ def _make_agent(
     model_override: dict | str | None = None,
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
+    adaptive_reasoning_state: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
 ):
+    # Accepted so resume overrides can splat through without TypeError;
+    # session dicts restore mode via _apply_adaptive_reasoning_state /
+    # _deferred_session_record.
+    _ = adaptive_reasoning_state
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
     # leaving the process boundary as the only experimental variable.
@@ -7811,14 +8202,30 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    adaptive_reasoning_state: dict | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
+    adaptive_state = (
+        adaptive_reasoning_state if isinstance(adaptive_reasoning_state, dict) else {}
+    )
+    adaptive_decision = adaptive_state.get("decision")
+    adaptive_decision = (
+        adaptive_decision if isinstance(adaptive_decision, dict) else {}
+    )
     info = {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "model": model or _resolve_model(),
+        "reasoning_mode": str(adaptive_state.get("mode") or "inherit"),
+        "reasoning_effort": str(
+            adaptive_decision.get("effort") or adaptive_state.get("floor") or ""
+        ),
+        "reasoning_reason": str(adaptive_decision.get("reason_code") or ""),
+        "adaptive_policy_version": str(
+            adaptive_decision.get("policy_version") or ""
+        ),
         "tools": {},
         "skills": {},
         "lazy": True,
@@ -7843,11 +8250,17 @@ def _deferred_session_record(
     profile_home: Path | None = None,
     lazy: bool = False,
     model_override=None,
+    adaptive_reasoning_state: dict | None = None,
     resume_runtime_overrides: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
+    adaptive_state = (
+        adaptive_reasoning_state if isinstance(adaptive_reasoning_state, dict) else {}
+    )
+    adaptive_mode = str(adaptive_state.get("mode") or "inherit").strip().lower()
+    adaptive_decision = adaptive_state.get("decision")
     return {
         "agent": None,
         "agent_error": None,
@@ -7869,6 +8282,13 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "reasoning_mode": (
+            adaptive_mode if adaptive_mode in _ADAPTIVE_REASONING_MODES else "inherit"
+        ),
+        "reasoning_floor": adaptive_state.get("floor"),
+        "adaptive_reasoning_decision": (
+            dict(adaptive_decision) if isinstance(adaptive_decision, dict) else None
+        ),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
@@ -8008,6 +8428,10 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
+        # Keep this projection on the public one-argument compatibility path.
+        # Besides allowing callers/tests to wrap ``_session_info(agent)``, the
+        # helper already resolves the owning live session from ``_sessions`` so
+        # adaptive-reasoning metadata is still included.
         return _session_info(agent)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
@@ -8016,16 +8440,15 @@ def _fallback_session_info(session: dict) -> dict:
     # rebound correctly (#71254). `branch` is always emitted ("" outside a git
     # repo) so a client can clear a stale label instead of retaining it — the
     # same contract `_lazy_session_info` above already follows.
-    cwd = _session_cwd(session)
-    return {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-        "model": _resolve_model(),
-        "skills": {},
-        "tools": {},
-    }
+    cwd = _display_session_cwd(session) or _default_session_cwd()
+    override = session.get("model_override")
+    override = override if isinstance(override, dict) else {}
+    return _lazy_resume_info(
+        cwd,
+        model=str(override.get("model") or ""),
+        provider=str(override.get("provider") or ""),
+        adaptive_reasoning_state=_adaptive_reasoning_metadata(session),
+    )
 
 
 def _reconcile_display_with_live(
@@ -8121,6 +8544,8 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+    if transport is not None:
+        _restore_pending_async_delegations(sid, session)
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
@@ -8934,6 +9359,8 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     """
     if session.get("_finalized"):
         return False
+    if _transport_is_dead(session.get("transport")):
+        return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
     evt_key = str(evt.get("session_key") or "")
@@ -9690,6 +10117,16 @@ def _run_prompt_submit(
                     return
                 prompt = ctx.message
 
+            # Auto is a pre-request effort decision only: one fixed runtime was
+            # selected at session creation/resume, and no model/tool/prompt route
+            # changes occur inside the agent loop.
+            _prepare_adaptive_reasoning_turn(
+                sid,
+                session,
+                text if isinstance(text, str) else str(text),
+                history,
+            )
+
             # Decide image routing per-turn based on active provider/model.
             # "native" → pass pixels to the main model as OpenAI-style content
             # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
@@ -9859,9 +10296,35 @@ def _run_prompt_submit(
             # sidebar repaints the moment a title lands, rather than waiting
             # for the next list refresh.
             _title_key = session.get("session_key") or sid
-            agent._on_session_title = lambda t, _k=_title_key: _emit(
-                "session.title", sid, {"session_id": _k, "title": t}
-            )
+            _route_user_text = text if isinstance(text, str) else ""
+
+            def _on_session_title(t: str, _k: str = _title_key) -> None:
+                _emit("session.title", sid, {"session_id": _k, "title": t})
+                try:
+                    assistant_text = ""
+                    history = session.get("history")
+                    if isinstance(history, list):
+                        for message in reversed(history):
+                            if (
+                                isinstance(message, dict)
+                                and message.get("role") == "assistant"
+                            ):
+                                assistant_text = str(message.get("content") or "")
+                                break
+                    _route_and_emit_session_project(
+                        sid,
+                        session,
+                        title=t,
+                        user_text=_route_user_text,
+                        assistant_text=assistant_text,
+                    )
+                except Exception:
+                    logger.debug(
+                        "automatic title-based project routing failed",
+                        exc_info=True,
+                    )
+
+            agent._on_session_title = _on_session_title
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -10071,6 +10534,22 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+
+            # Product-project identity is observed after every successful turn.
+            # Low-confidence evidence stays provisional in projects.db and does
+            # not interrupt the user; manual locks are preserved by the store.
+            if status == "complete" and isinstance(text, str) and text.strip():
+                try:
+                    _route_key = session.get("session_key") or sid
+                    _route_and_emit_session_project(
+                        sid,
+                        session,
+                        title=_session_live_title(session, _route_key),
+                        user_text=text,
+                        assistant_text=raw if isinstance(raw, str) else str(raw),
+                    )
+                except Exception:
+                    logger.debug("automatic session project routing failed", exc_info=True)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -11114,9 +11593,48 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 return _ok(rid, {"key": key, "value": "clamp"})
 
+            if arg == "auto":
+                if global_scope or session is None:
+                    return _err(rid, 4002, "adaptive reasoning requires a live session")
+                policy = _adaptive_reasoning_config()
+                if not policy.get("enabled"):
+                    return _err(rid, 4002, "adaptive reasoning is disabled")
+
+                from agent.adaptive_reasoning import AUTO_MODEL, AUTO_PROVIDER
+
+                agent = session.get("agent")
+                if agent is not None and (
+                    getattr(agent, "model", None) != AUTO_MODEL
+                    or getattr(agent, "provider", None) != AUTO_PROVIDER
+                ):
+                    return _err(
+                        rid, 4002, "adaptive reasoning requires the fixed runtime"
+                    )
+
+                session["reasoning_mode"] = "auto"
+                session["reasoning_floor"] = None
+                session["adaptive_reasoning_decision"] = None
+                session["model_override"] = {
+                    "model": AUTO_MODEL,
+                    "provider": AUTO_PROVIDER,
+                }
+                session.pop("create_reasoning_override", None)
+                if agent is not None:
+                    agent.reasoning_config = None
+                    agent.service_tier = None
+                    _persist_live_session_runtime(session)
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(agent, session),
+                    )
+                return _ok(rid, {"key": key, "value": "auto"})
+
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            if session is not None:
+                _mark_session_reasoning_manual(session, arg)
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:
@@ -11434,6 +11952,7 @@ def _(rid, params, pdb, conn) -> dict:
         icon=params.get("icon"),
         color=params.get("color"),
         board_slug=params.get("board_slug"),
+        aliases=params.get("aliases"),
     )
     if params.get("use"):
         pdb.set_active(conn, pid)
@@ -11452,8 +11971,57 @@ def _(rid, params, pdb, conn) -> dict:
         icon=params.get("icon"),
         color=params.get("color"),
         board_slug=params.get("board_slug"),
+        aliases=params.get("aliases"),
     )
     return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+@_projects_method("projects.assign_session")
+def _(rid, params, pdb, conn) -> dict:
+    requested_session_id = str(params.get("session_id") or "").strip()
+    if not requested_session_id:
+        raise ValueError("session_id required")
+    if "project_id" not in params:
+        raise ValueError("project_id required (null selects Home)")
+    session_db = _get_db()
+    if session_db is None or session_db.get_session(requested_session_id) is None:
+        raise ValueError(f"no such session: {requested_session_id}")
+    session_id = _session_assignment_root_id(session_db, requested_session_id)
+    raw_project_id = params.get("project_id")
+    project_id = str(raw_project_id).strip() if raw_project_id is not None else None
+    assignment = pdb.assign_session_project(
+        conn,
+        session_id,
+        project_id,
+        source="manual",
+        reason="manual move",
+    )
+    return _ok(rid, {"assignment": assignment.to_dict()})
+
+
+@_projects_method("projects.use_auto_routing")
+def _(rid, params, pdb, conn) -> dict:
+    requested_session_id = str(params.get("session_id") or "").strip()
+    if not requested_session_id:
+        raise ValueError("session_id required")
+    session_db = _get_db()
+    if session_db is None or session_db.get_session(requested_session_id) is None:
+        raise ValueError(f"no such session: {requested_session_id}")
+    session_id = _session_assignment_root_id(session_db, requested_session_id)
+    pdb.clear_session_project(conn, session_id)
+    return _ok(rid, {"assignment": None})
+
+
+@_projects_method("projects.routing_get")
+def _(rid, params, pdb, conn) -> dict:
+    return _ok(rid, {"enabled": pdb.is_session_routing_enabled(conn)})
+
+
+@_projects_method("projects.routing_set")
+def _(rid, params, pdb, conn) -> dict:
+    enabled = bool(params.get("enabled"))
+    pdb.set_session_routing_enabled(conn, enabled)
+    return _ok(rid, {"enabled": enabled})
 
 
 @_projects_method("projects.add_folder")
@@ -11771,6 +12339,14 @@ def _project_tree_inputs(
             )
         projects = [p.to_dict() for p in pdb.list_projects(conn)]
         active_id = pdb.get_active_id(conn)
+        assignments = pdb.list_session_projects(conn)
+        for session in sessions:
+            assignment_id = str(
+                session.get("_lineage_root_id") or session.get("id") or ""
+            )
+            assignment = assignments.get(assignment_id)
+            if assignment is not None:
+                session["project_assignment"] = assignment.to_dict()
         # backfill stays off the hot tree path — grouping uses the live resolver.
         discovered = (
             _discover_repos_payload(

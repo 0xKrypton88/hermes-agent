@@ -58,6 +58,14 @@ export function resolveFastControl(
   return { kind: 'none' }
 }
 
+export type ModelEditOptionsPatch = {
+  effort?: string
+  fast?: boolean
+  /** Adaptive Sol mode. Independent of effort; Auto only applies on the
+   *  fixed openai-codex / gpt-5.6-sol route. */
+  reasoningMode?: 'auto' | 'manual'
+}
+
 interface ModelEditSubmenuProps {
   /** The profile's configured default effort — what an unset row inherits.
    *  Passed in (not read from a store) so this submenu stays pure. */
@@ -77,11 +85,13 @@ interface ModelEditSubmenuProps {
    *  session, a preset store, or the gateway itself — the owning surface's
    *  controller decides what an edit means. That's what lets the same submenu
    *  drive a live chat session and a detached per-task override. */
-  onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
+  onSetOptions: (patch: ModelEditOptionsPatch) => void
   /** This row's provider slug. */
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  /** Live session/draft reasoning source mode (Auto vs manual effort). */
+  reasoningMode?: 'auto' | 'inherit' | 'manual'
 }
 
 export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
@@ -102,15 +112,19 @@ function ModelEditSubmenuBody({
   effort,
   fastControl,
   isActive,
+  model,
   onSelectModel,
   onSetOptions,
-  reasoning
+  provider,
+  reasoning,
+  reasoningMode = 'inherit'
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
   const copy = t.shell.modelOptions
 
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
+  const autoRoute = provider === 'openai-codex' && model === 'gpt-5.6-sol'
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -145,7 +159,12 @@ function ModelEditSubmenuBody({
           <Switch
             checked={thinkingOn}
             className="ml-auto"
-            onCheckedChange={checked => onSetOptions({ effort: checked ? effortValue || defaultEffort : 'none' })}
+            onCheckedChange={checked =>
+              onSetOptions({
+                effort: checked ? effortValue || defaultEffort : 'none',
+                reasoningMode: 'manual'
+              })
+            }
             size="xs"
           />
         </DropdownMenuItem>
@@ -160,7 +179,23 @@ function ModelEditSubmenuBody({
         <>
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
-          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
+          <DropdownMenuRadioGroup
+            onValueChange={value =>
+              value === 'auto'
+                ? onSetOptions({ reasoningMode: 'auto' })
+                : onSetOptions({ effort: value, reasoningMode: 'manual' })
+            }
+            value={autoRoute && reasoningMode === 'auto' ? 'auto' : effortValue}
+          >
+            {autoRoute ? (
+              <DropdownMenuRadioItem
+                className={dropdownMenuRow}
+                onSelect={event => event.preventDefault()}
+                value="auto"
+              >
+                {copy.auto}
+              </DropdownMenuRadioItem>
+            ) : null}
             {REASONING_EFFORTS.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}

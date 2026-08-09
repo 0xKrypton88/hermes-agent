@@ -15,10 +15,13 @@ import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from 
 import { $visibleModels } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
 import {
+  $currentReasoningMode,
   $defaultReasoningEffort,
   markComposerSelectionManual,
   setCurrentFastMode,
-  setCurrentReasoningEffort
+  setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  type ReasoningMode
 } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -61,6 +64,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
   const currentReasoningEffort = useStore(view.$reasoningEffort)
+  const currentReasoningMode = useStore(view.$reasoningMode ?? $currentReasoningMode)
   const modelPresets = useStore($modelPresets)
   const defaultEffort = useStore($defaultReasoningEffort) || DEFAULT_REASONING_EFFORT
   const visibleModels = useStore($visibleModels)
@@ -109,11 +113,18 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
   // Push a reasoning change onto the session that owns it, with rollback.
   const patchReasoning = async (next: string, previous: string, provider: string, model: string) => {
+    const previousMode = currentReasoningMode
+
     if (touchesPrimary) {
       markComposerSelectionManual()
+      setCurrentReasoningMode('manual')
       setCurrentReasoningEffort(next)
     } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+        ...state,
+        reasoningEffort: next,
+        reasoningMode: 'manual'
+      }))
     }
 
     // Preset-only without a session: the gateway's `config.set` falls back to
@@ -127,12 +138,56 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
     } catch (err) {
       if (touchesPrimary) {
+        setCurrentReasoningMode(previousMode)
         setCurrentReasoningEffort(previous)
       } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: previous }))
+        sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+          ...state,
+          reasoningEffort: previous,
+          reasoningMode: previousMode
+        }))
       }
 
       setModelPreset(provider, model, { effort: previous })
+      notifyError(err, t.shell.modelOptions.updateFailed)
+    }
+  }
+
+  // Auto is a session/draft mode rather than a model preset. The backend is
+  // authoritative for live sessions; a draft carries it into session.create.
+  const patchAuto = async () => {
+    const previousMode = currentReasoningMode
+
+    if (touchesPrimary) {
+      markComposerSelectionManual()
+      setCurrentReasoningMode('auto')
+    } else if (activeSessionId) {
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+        ...state,
+        reasoningMode: 'auto'
+      }))
+    }
+
+    if (!activeSessionId) {
+      return
+    }
+
+    try {
+      await requestGateway('config.set', {
+        key: 'reasoning',
+        session_id: activeSessionId,
+        value: 'auto'
+      })
+    } catch (err) {
+      if (touchesPrimary) {
+        setCurrentReasoningMode(previousMode)
+      } else {
+        sessionTileDelegate()?.updateSession(activeSessionId, state => ({
+          ...state,
+          reasoningMode: previousMode
+        }))
+      }
+
       notifyError(err, t.shell.modelOptions.updateFailed)
     }
   }
@@ -185,7 +240,8 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       effort: currentReasoningEffort,
       fast: currentFastMode,
       model: optionsModel,
-      provider: optionsProvider
+      provider: optionsProvider,
+      reasoningMode: currentReasoningMode as ReasoningMode
     },
 
     presetFor: (provider, model) => modelPresets[modelPresetKey(provider, model)] ?? {},
@@ -201,11 +257,20 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       // provider::model, not per-surface — a tile edit re-applies to that model
       // everywhere); the active model also gets it pushed onto its OWN session.
       // Non-active edits stay preset-only — no model switch, no session write.
+      // Auto is session-mode only and never becomes a model preset.
       if (patch.effort !== undefined || patch.fast !== undefined) {
-        setModelPreset(row.provider, row.model, patch)
+        setModelPreset(row.provider, row.model, {
+          ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
+          ...(patch.fast !== undefined ? { fast: patch.fast } : {})
+        })
       }
 
       if (!row.isActive) {
+        return
+      }
+
+      if (patch.reasoningMode === 'auto') {
+        void patchAuto()
         return
       }
 

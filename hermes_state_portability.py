@@ -420,6 +420,7 @@ class SessionPortabilityMixin:
             "cost_source",
             "pricing_version",
             "title",
+            "title_source",
         )
         message_text_fields = (
             "role",
@@ -494,6 +495,9 @@ class SessionPortabilityMixin:
                 clean_session["model_config"] = self._import_json_object_or_none(
                     clean_session.get("model_config"), "model_config"
                 )
+                clean_session["title_meta"] = self._import_json_object_or_none(
+                    clean_session.get("title_meta"), "title_meta"
+                )
                 clean_session["parent_session_id"] = self._import_text_or_none(
                     clean_session.get("parent_session_id"), "parent_session_id"
                 )
@@ -501,6 +505,13 @@ class SessionPortabilityMixin:
                     clean_session[field] = self._import_text_or_none(
                         clean_session.get(field), field
                     )
+                if clean_session["title_source"] not in {
+                    None,
+                    "derived",
+                    "llm",
+                    "user",
+                }:
+                    clean_session["title_source"] = None
 
                 clean_messages: List[Dict[str, Any]] = []
                 for message_index, message in enumerate(messages):
@@ -582,7 +593,8 @@ class SessionPortabilityMixin:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, title_source, title_meta,
+                           api_call_count, archived
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -592,8 +604,8 @@ class SessionPortabilityMixin:
                            :reasoning_tokens, :cwd, :git_branch, :git_repo_root,
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
-                           :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :cost_source, :pricing_version, :title, :title_source,
+                           :title_meta, :api_call_count, :archived
                        )""",
                     {
                         "id": session_id,
@@ -632,6 +644,8 @@ class SessionPortabilityMixin:
                         "cost_source": raw.get("cost_source"),
                         "pricing_version": raw.get("pricing_version"),
                         "title": raw.get("title"),
+                        "title_source": raw.get("title_source"),
+                        "title_meta": raw.get("title_meta"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
                     },

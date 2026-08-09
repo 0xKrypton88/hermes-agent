@@ -11,6 +11,7 @@ import {
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
   setCurrentServiceTier,
   setDefaultReasoningEffort,
   setIntroPersonality
@@ -87,6 +88,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         ])
 
         const reasoning = normalizeConfigEffort(config.agent?.reasoning_effort)
+        const reasoningMode = config.agent?.adaptive_reasoning?.enabled === true ? 'auto' : 'inherit'
         const tier = (config.agent?.service_tier ?? '').trim()
 
         // Publish the profile default regardless of whether the composer is
@@ -101,6 +103,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
           (force || getCurrentModelSource() !== 'manual')
 
         if (shouldSeedComposer) {
+          setCurrentReasoningMode(reasoningMode)
           setCurrentReasoningEffort(reasoning)
           setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()))
         }
