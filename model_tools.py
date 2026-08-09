@@ -1401,6 +1401,46 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+        # Adaptive Orchestrator V1 — authoritative pre-dispatch policy gate.
+        # Runs after middleware finalizes normalized args and before registry
+        # dispatch. No-op when no orchestration PolicyContext is active.
+        try:
+            from agent.orchestration.tool_policy import check_active_policy_or_none
+
+            _orch_decision = check_active_policy_or_none(
+                registry,
+                function_name,
+                function_args,
+                session_id=session_id or "",
+                turn_id=turn_id or "",
+                tool_call_id=tool_call_id or "",
+            )
+            if _orch_decision is not None and not _orch_decision.allowed:
+                block_msg = (
+                    f"Orchestration policy blocked '{function_name}': "
+                    f"{_orch_decision.reason_code}"
+                )
+                if _orch_decision.requires_approval:
+                    block_msg += " (approval required)"
+                result = tool_error(block_msg)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="orchestration_policy",
+                    error_message=block_msg,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
+        except Exception as _orch_err:
+            logger.debug("orchestration policy check error: %s", _orch_err)
+
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to

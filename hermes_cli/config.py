@@ -2033,6 +2033,20 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             "    base_url: https://...",
         ))
 
+    # ── orchestration section (Adaptive Orchestrator V1) ─────────────────
+    orch = config.get("orchestration")
+    if orch is not None:
+        try:
+            from agent.orchestration.config import validate_orchestration_dict
+            validate_orchestration_dict(orch if isinstance(orch, dict) else orch)
+        except Exception as exc:
+            issues.append(ConfigIssue(
+                "error",
+                f"orchestration config invalid: {exc}",
+                "Fix orchestration.mode (off|shadow|active) and required family aliases; "
+                "defaults preserve legacy single-model behavior when mode is off/shadow.",
+            ))
+
     # ── Root-level keys that look misplaced ──────────────────────────────
     # Only provider-like fields (base_url, api_key, …) are flagged. Arbitrary
     # unknown top-level keys are deliberately NOT warned about: top-level

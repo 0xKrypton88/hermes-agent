@@ -1437,6 +1437,29 @@ def run_conversation(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # ── Adaptive Orchestrator V1 (universal top-level turn boundary) ──
+    # Runs immediately before build_turn_context. Top-level sessions only;
+    # workers/children hit the recursion guard and fall through. ``off`` and
+    # ``shadow`` preserve legacy execution; ``active`` may return an isolated
+    # worker result without mutating parent cached prompt/tools/model.
+    try:
+        from agent.orchestration.service import maybe_orchestrate_turn
+
+        _orch_turn = maybe_orchestrate_turn(
+            agent,
+            user_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+        )
+        if (
+            _orch_turn is not None
+            and _orch_turn.acted
+            and isinstance(_orch_turn.response, dict)
+        ):
+            return _orch_turn.response
+    except Exception:
+        logger.debug("adaptive orchestrator boundary failed", exc_info=True)
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

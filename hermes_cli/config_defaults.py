@@ -3213,6 +3213,69 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Adaptive Orchestrator V1 — feature-flagged control plane.
+    # Disabled by default (mode off). Active is never the default.
+    # Family aliases map through config; product code must not hard-code
+    # concrete model names. See docs/design/adaptive-orchestrator-v1.md.
+    "orchestration": {
+        "enabled": False,
+        "mode": "off",  # off | shadow | active
+        "families": {
+            "LUNA": {
+                "provider_alias": "delegation",
+                "model_alias": "luna",
+                "reasoning_default": "low",
+                "toolsets": ["file", "web"],
+            },
+            "TERRA": {
+                "provider_alias": "delegation",
+                "model_alias": "terra",
+                "reasoning_default": "medium",
+                "toolsets": ["file", "web", "terminal", "browser"],
+            },
+            "SOL": {
+                "provider_alias": "delegation",
+                "model_alias": "sol",
+                "reasoning_default": "high",
+                "toolsets": ["file", "web", "terminal", "browser"],
+            },
+        },
+        "model_aliases": {
+            "luna": "",
+            "terra": "",
+            "sol": "",
+        },
+        "reasoning_capabilities": {
+            "low": True,
+            "medium": True,
+            "high": True,
+            "max": True,
+        },
+        "budgets": {
+            "max_attempts": 5,
+            "max_cost_usd": 2.0,
+            "max_duration_s": 600,
+            "child_timeout_seconds": 300,
+        },
+        "verification": {
+            "independent_for_sol": True,
+            "schema_retry_once": True,
+        },
+        "telemetry": {
+            "enabled": False,
+            "retain_days": 14,
+            "store_raw_prompt": False,
+        },
+        "approval": {
+            "require_for_destructive": True,
+            "require_for_financial": True,
+            "workers_cannot_self_approve": True,
+        },
+        "schema_version": "orch.task_spec.v1",
+        "policy_version": "orch.policy.v1",
+        "prompt_version": "orch.prompt.v1",
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
