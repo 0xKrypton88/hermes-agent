@@ -44,7 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -83,6 +83,15 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+# Active delivery claims expire after this TTL so a crashed consumer cannot
+# pin a row forever. Shared by claim_completion_delivery and the periodic
+# cross-process discover path.
+_DELIVERY_CLAIM_TTL_SECONDS = 300.0
+# How often a long-lived gateway watcher should scan state.db for durable
+# pending completions published by another process. Bounded to avoid busy
+# SQLite polling; the in-memory exclude-id guard prevents duplicate queueing
+# between scans.
+DURABLE_PENDING_SCAN_INTERVAL = 5.0
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -404,6 +413,71 @@ def restore_undelivered_completions(
     return restored
 
 
+def discover_pending_completions(
+    target_queue,
+    *,
+    exclude_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    """Enqueue durable pending completions that another process may have written.
+
+    Startup ``restore_undelivered_completions`` only runs once per process.
+    When a producer (dashboard, API server, etc.) persists a completed row into
+    the shared state.db and only puts the event on *its* in-memory
+    ``completion_queue``, a long-lived gateway never sees it until restart.
+    This helper is safe to call periodically from the idle watcher:
+
+    - skips rows that are already ``delivered`` / non-pending (SQL filter)
+    - skips rows with an *active* delivery claim (TTL-aware)
+    - skips ``exclude_ids`` already sitting on this process's queue / in flight
+    - stamps ``restored=True`` in-memory only (same ownership semantics as
+      startup restore; never persisted)
+
+    Returns the list of newly-enqueued ``delegation_id`` values so the caller
+    can extend its in-memory queued-id guard.
+    """
+    skip = {str(x) for x in (exclude_ids or set()) if str(x)}
+    enqueued: List[str] = []
+    now = time.time()
+    claim_floor = now - _DELIVERY_CLAIM_TTL_SECONDS
+
+    # Abandoned running rows become pending terminal events with event_json;
+    # pick those up on the same periodic cadence as cross-process completions.
+    try:
+        recover_abandoned_delegations()
+    except Exception:
+        logger.debug("discover_pending_completions: recover failed", exc_info=True)
+
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json, delivery_claim, delivery_claimed_at
+               FROM async_delegations
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+        for delegation_id, payload, claim, claimed_at in rows:
+            did = str(delegation_id or "")
+            if not did or did in skip:
+                continue
+            if claim and claimed_at is not None and float(claimed_at) >= claim_floor:
+                # Another consumer holds a live claim — do not duplicate.
+                continue
+            try:
+                evt = json.loads(payload)
+            except Exception:
+                logger.warning(
+                    "discover_pending_completions: bad event_json for %s", did,
+                )
+                continue
+            if not isinstance(evt, dict):
+                continue
+            evt["restored"] = True
+            target_queue.put(evt)
+            enqueued.append(did)
+            skip.add(did)
+    return enqueued
+
+
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
@@ -431,7 +505,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id, now, now, delegation_id,
+                now - _DELIVERY_CLAIM_TTL_SECONDS,
+            ),
         )
         return cur.rowcount == 1
 
