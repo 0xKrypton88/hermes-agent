@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from hermes_cli import projects_db as pdb
 import tui_gateway.server as server
 
 
@@ -55,6 +56,10 @@ def test_methods_registered():
         "projects.archive",
         "projects.set_active",
         "projects.for_cwd",
+        "projects.assign_session",
+        "projects.use_auto_routing",
+        "projects.routing_get",
+        "projects.routing_set",
     ):
         assert m in server._methods
 
@@ -379,3 +384,261 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
     assert any(item["root"] == str(root) for item in accepted["repos"])
 
 
+def test_manual_assignment_moves_tree_membership_without_changing_workspace(tmp_path):
+    product_a = tmp_path / "product-a"
+    product_b = tmp_path / "product-b"
+    product_a.mkdir()
+    product_b.mkdir()
+    a = _call("projects.create", {"name": "Product A", "folders": [str(product_a)]})["project"]
+    b = _call("projects.create", {"name": "Product B", "folders": [str(product_b)]})["project"]
+
+    db = server._get_db()
+    db.create_session("session-routing", "cli", cwd=str(product_a))
+    db.append_message("session-routing", "user", "Move this session")
+
+    result = _call(
+        "projects.assign_session",
+        {"session_id": "session-routing", "project_id": b["id"]},
+    )
+    assert result["assignment"]["project_id"] == b["id"]
+    assert result["assignment"]["source"] == "manual"
+    assert result["assignment"]["locked"] is True
+
+    target = _call("projects.project_sessions", {"project_id": b["id"]})["project"]
+    moved = [
+        session
+        for repo in target["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ]
+
+    assert [session["id"] for session in moved] == ["session-routing"]
+    assert moved[0]["cwd"] == str(product_a)
+    assert moved[0]["project_assignment"]["locked"] is True
+
+    cleared = _call("projects.use_auto_routing", {"session_id": "session-routing"})
+    assert cleared["assignment"] is None
+    original = _call("projects.project_sessions", {"project_id": a["id"]})["project"]
+    assert [
+        session["id"]
+        for repo in original["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ] == ["session-routing"]
+
+
+def test_routing_setting_is_opt_in_and_round_trips():
+    assert _call("projects.routing_get") == {"enabled": False}
+    assert _call("projects.routing_set", {"enabled": True}) == {"enabled": True}
+    assert _call("projects.routing_get") == {"enabled": True}
+
+
+def test_project_aliases_are_exposed_by_create_and_update():
+    created = _call(
+        "projects.create",
+        {"name": "Mission Control", "aliases": ["MCC", "mission-control"]},
+    )["project"]
+    assert created["aliases"] == ["MCC", "mission-control"]
+
+    updated = _call(
+        "projects.update",
+        {"id": created["id"], "aliases": ["MCC", "Mission Control Center"]},
+    )["project"]
+    assert updated["aliases"] == ["MCC", "Mission Control Center"]
+
+
+def test_auto_routing_waits_for_stable_evidence_and_respects_manual_lock(tmp_path):
+    hermes_dir = tmp_path / "hermes"
+    mcc_dir = tmp_path / "mission-control"
+    hermes_dir.mkdir()
+    mcc_dir.mkdir()
+    hermes = _call(
+        "projects.create",
+        {"name": "Hermes Agent", "folders": [str(hermes_dir)], "aliases": ["Hermes"]},
+    )["project"]
+    mcc = _call(
+        "projects.create",
+        {"name": "Mission Control", "folders": [str(mcc_dir)], "aliases": ["MCC"]},
+    )["project"]
+    _call("projects.routing_set", {"enabled": True})
+    server._get_db().create_session("session-auto", "cli", cwd=str(hermes_dir))
+
+    first, changed = server._auto_route_session_project(
+        "session-auto",
+        title="Fix dashboard hierarchy",
+        user_text="Continue with MCC",
+        assistant_text="",
+        activity_text="",
+        cwd=str(hermes_dir),
+        git_repo_root="",
+    )
+    assert first is None
+    assert changed is False
+
+    second, changed = server._auto_route_session_project(
+        "session-auto",
+        title="Fix dashboard hierarchy",
+        user_text="Continue with MCC",
+        assistant_text="",
+        activity_text="",
+        cwd=str(hermes_dir),
+        git_repo_root="",
+    )
+    assert second["project_id"] == mcc["id"]
+    assert second["source"] == "auto"
+    assert changed is True
+
+    _call(
+        "projects.assign_session",
+        {"session_id": "session-auto", "project_id": hermes["id"]},
+    )
+    locked, changed = server._auto_route_session_project(
+        "session-auto",
+        title="MCC - Dashboard",
+        user_text="MCC MCC",
+        assistant_text="Mission Control",
+        activity_text=str(mcc_dir),
+        cwd=str(mcc_dir),
+        git_repo_root=str(mcc_dir),
+    )
+    assert locked["project_id"] == hermes["id"]
+    assert locked["locked"] is True
+    assert changed is False
+
+
+def test_route_and_emit_publishes_only_membership_changes(monkeypatch):
+    emitted = []
+    assignment = {
+        "session_id": "stored-session",
+        "project_id": "p_mcc",
+        "source": "auto",
+        "locked": False,
+    }
+    monkeypatch.setattr(
+        server,
+        "_auto_route_session_project",
+        lambda *args, **kwargs: (assignment, True),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, payload)),
+    )
+
+    result = server._route_and_emit_session_project(
+        "runtime-session",
+        {
+            "session_key": "stored-session",
+            "cwd": "/work/mcc",
+            "git_repo_root": "/work/mcc",
+            "history": [],
+        },
+        title="MCC - Dashboard",
+        user_text="Continue",
+        assistant_text="Done",
+    )
+
+    assert result == assignment
+    assert emitted == [
+        (
+            "session.project",
+            "runtime-session",
+            {"session_id": "stored-session", "assignment": assignment},
+        )
+    ]
+
+
+def test_assignment_rpc_uses_compression_root_but_keeps_branch_independent(tmp_path):
+    root_dir = tmp_path / "root"
+    other_dir = tmp_path / "other"
+    root_dir.mkdir()
+    other_dir.mkdir()
+    root_project = _call(
+        "projects.create", {"name": "Root Product", "folders": [str(root_dir)]}
+    )["project"]
+    branch_project = _call(
+        "projects.create", {"name": "Branch Product", "folders": [str(other_dir)]}
+    )["project"]
+
+    db = server._get_db()
+    db.create_session("conversation-root", "cli", cwd=str(root_dir))
+    db.append_message("conversation-root", "user", "initial work")
+    db.end_session("conversation-root", "compression")
+    db.create_session(
+        "conversation-tip",
+        "cli",
+        cwd=str(root_dir),
+        parent_session_id="conversation-root",
+    )
+    db.append_message("conversation-tip", "user", "continued work")
+    db.create_session(
+        "conversation-branch",
+        "cli",
+        cwd=str(root_dir),
+        parent_session_id="conversation-root",
+        model_config={"_branched_from": "conversation-root"},
+    )
+
+    tip_assignment = _call(
+        "projects.assign_session",
+        {"session_id": "conversation-tip", "project_id": root_project["id"]},
+    )["assignment"]
+    branch_assignment = _call(
+        "projects.assign_session",
+        {"session_id": "conversation-branch", "project_id": branch_project["id"]},
+    )["assignment"]
+
+    assert tip_assignment["session_id"] == "conversation-root"
+    assert branch_assignment["session_id"] == "conversation-branch"
+
+    project = _call(
+        "projects.project_sessions", {"project_id": root_project["id"]}
+    )["project"]
+    surfaced = [
+        session
+        for repo in project["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ]
+    assert [session["id"] for session in surfaced] == ["conversation-tip"]
+    assert surfaced[0]["project_assignment"]["session_id"] == "conversation-root"
+
+    _call("projects.use_auto_routing", {"session_id": "conversation-tip"})
+    with pdb.connect_closing() as conn:
+        assert pdb.get_session_project(conn, "conversation-root") is None
+        assert pdb.get_session_project(conn, "conversation-branch") is not None
+
+
+def test_manual_home_assignment_is_locked_and_kept_out_of_workspace_project(tmp_path):
+    product_dir = tmp_path / "product"
+    product_dir.mkdir()
+    project = _call(
+        "projects.create", {"name": "Product", "folders": [str(product_dir)]}
+    )["project"]
+    db = server._get_db()
+    db.create_session("session-home", "cli", cwd=str(product_dir))
+    db.append_message("session-home", "user", "Keep this in Home")
+
+    result = _call(
+        "projects.assign_session", {"session_id": "session-home", "project_id": None}
+    )
+    assert result["assignment"]["project_id"] is None
+    assert result["assignment"]["locked"] is True
+
+    scoped = _call("projects.project_sessions", {"project_id": project["id"]})["project"]
+    assert [
+        session
+        for repo in scoped["repos"]
+        for group in repo["groups"]
+        for session in group["sessions"]
+    ] == []
+
+    # session.info must honor the Home lock instead of re-inferring from cwd.
+    info = server._project_info_for_session(
+        {"session_key": "session-home"},
+        str(product_dir),
+    )
+    assert info is not None
+    assert info["id"] is None
+    assert info["assignment"]["locked"] is True
+    assert info["assignment"]["project_id"] is None
