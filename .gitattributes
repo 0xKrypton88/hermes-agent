@@ -8,3 +8,6 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Keep the cross-platform session-title contract diff-clean on Windows.
+agent/session_title_meta.py text eol=lf
