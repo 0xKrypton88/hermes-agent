@@ -8,7 +8,10 @@ concrete model names.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.orchestration.activation import ActivationConfig
 
 
 VALID_MODES = frozenset({"off", "shadow", "active"})
@@ -19,33 +22,40 @@ FAMILY_NAMES = ("LUNA", "TERRA", "SOL")
 DEFAULT_ORCHESTRATION_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "mode": "off",  # off | shadow | active — active is never default
+    # V1.1 exact-ID activation. Absent section preserves global mode compat.
+    # default_mode applies when a trusted origin matches no rule; untrusted /
+    # missing origins can never activate (see activation.resolve_effective_mode).
+    "activation": {
+        "default_mode": "shadow",
+        "rules": [],
+    },
     "families": {
         # Aliases only — concrete models resolve via resolve_runtime_provider
         "LUNA": {
-            "provider_alias": "delegation",
+            "provider_alias": "openai-codex",
             "model_alias": "luna",
             "reasoning_default": "low",
             "toolsets": ["file", "web"],
         },
         "TERRA": {
-            "provider_alias": "delegation",
+            "provider_alias": "openai-codex",
             "model_alias": "terra",
             "reasoning_default": "medium",
             "toolsets": ["file", "web", "terminal", "browser"],
         },
         "SOL": {
-            "provider_alias": "delegation",
+            "provider_alias": "openai-codex",
             "model_alias": "sol",
             "reasoning_default": "high",
             "toolsets": ["file", "web", "terminal", "browser"],
         },
     },
-    # Family alias → concrete model id resolved at runtime from this map
-    # (or inheritance). Product code looks up aliases, never hard-codes names.
+    # Family alias → concrete openai-codex catalog model ids.
+    # Product code looks up aliases, never hard-codes names at call sites.
     "model_aliases": {
-        "luna": "",
-        "terra": "",
-        "sol": "",
+        "luna": "gpt-5.6-luna",
+        "terra": "gpt-5.6-terra",
+        "sol": "gpt-5.6-sol",
     },
     "reasoning_capabilities": {
         "low": True,
@@ -133,6 +143,7 @@ class OrchestrationConfig:
     schema_version: str
     policy_version: str
     prompt_version: str
+    activation: Optional["ActivationConfig"] = None
 
     @property
     def preserves_legacy_execution(self) -> bool:
@@ -216,6 +227,11 @@ def validate_orchestration_dict(raw: Mapping[str, Any]) -> None:
     if telemetry is not None and not isinstance(telemetry, Mapping):
         raise OrchestrationConfigError("orchestration.telemetry must be a mapping")
 
+    if "activation" in raw and raw.get("activation") is not None:
+        from agent.orchestration.activation import validate_activation_dict
+
+        validate_activation_dict(raw.get("activation"))
+
 
 def _parse_family(raw: Mapping[str, Any]) -> FamilyAlias:
     toolsets = tuple(raw.get("toolsets") or ())
@@ -252,6 +268,19 @@ def load_orchestration_config(
     telemetry_raw = merged.get("telemetry") or {}
     verification_raw = merged.get("verification") or {}
     approval_raw = merged.get("approval") or {}
+
+    from agent.orchestration.activation import parse_activation_config
+
+    # Preserve V1 compat: if caller omitted activation entirely, leave None so
+    # resolve_effective_mode uses global mode. Defaults include an empty rules
+    # list only when the section is merged from DEFAULT_ORCHESTRATION_CONFIG.
+    activation_raw = merged.get("activation")
+    if section is None:
+        activation = None
+    elif isinstance(section, Mapping) and "activation" not in section:
+        activation = None
+    else:
+        activation = parse_activation_config(activation_raw)
 
     return OrchestrationConfig(
         enabled=bool(merged["enabled"]),
@@ -291,6 +320,7 @@ def load_orchestration_config(
         schema_version=str(merged.get("schema_version") or "orch.task_spec.v1"),
         policy_version=str(merged.get("policy_version") or "orch.policy.v1"),
         prompt_version=str(merged.get("prompt_version") or "orch.prompt.v1"),
+        activation=activation,
     )
 
 

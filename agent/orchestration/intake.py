@@ -104,13 +104,31 @@ def parse_classifier_output(raw: Any) -> ClassifierOutput:
 
 
 def _heuristic_fallback(user_text: str) -> ClassifierOutput:
+    """English + Swedish fail-safe heuristic (used only when structured path fails)."""
     text = (user_text or "").lower()
     complexity = "low"
     impact = "low"
     side_effects: List[str] = [SideEffectClass.NONE.value]
     capabilities: List[str] = [CapabilityClass.READ.value]
 
-    if any(k in text for k in ("implement", "refactor", "research", "multi-step", "feature")):
+    if any(
+        k in text
+        for k in (
+            "implement",
+            "refactor",
+            "research",
+            "multi-step",
+            "feature",
+            "troubleshoot",
+            "debug",
+            "implementera",
+            "refaktorera",
+            "felsök",
+            "utred",
+            "undersök",
+            "funktion",
+        )
+    ):
         complexity = "moderate"
         impact = "moderate"
         side_effects = [SideEffectClass.WRITE.value]
@@ -119,13 +137,42 @@ def _heuristic_fallback(user_text: str) -> ClassifierOutput:
             CapabilityClass.WRITE.value,
             CapabilityClass.EXECUTE.value,
         ]
-    if any(k in text for k in ("security", "production", "credential", "payment", "deploy")):
+    if any(
+        k in text
+        for k in (
+            "security",
+            "production",
+            "credential",
+            "payment",
+            "deploy",
+            "säkerhet",
+            "produktion",
+            "betalning",
+            "driftsätt",
+            "legitimation",
+        )
+    ):
         complexity = "high"
         impact = "high"
-    if any(k in text for k in ("delete", "drop", "destroy", "wipe")):
+    if any(
+        k in text
+        for k in ("delete", "drop", "destroy", "wipe", "radera", "förstör", "töm")
+    ):
         side_effects = [SideEffectClass.DESTRUCTIVE.value]
         impact = "high"
-    if any(k in text for k in ("payment", "transfer", "trade", "order")):
+    if any(
+        k in text
+        for k in (
+            "payment",
+            "transfer",
+            "trade",
+            "order",
+            "betalning",
+            "överföring",
+            "handel",
+            "orderläggning",
+        )
+    ):
         side_effects = list(dict.fromkeys(side_effects + [SideEffectClass.FINANCIAL.value]))
         impact = "high"
 

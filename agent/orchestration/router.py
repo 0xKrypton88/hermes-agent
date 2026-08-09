@@ -85,10 +85,16 @@ def _base_family_and_reasoning(
         )
         return ModelFamily.SOL, reasoning, rules, True
 
+    objective_l = (spec.objective or "").lower()
     if high_consequence and (
-        "security" in spec.objective.lower()
-        or "production" in spec.objective.lower()
+        "security" in objective_l
+        or "production" in objective_l
+        or "säkerhet" in objective_l
+        or "produktion" in objective_l
+        or "credential" in objective_l
+        or "legitimation" in objective_l
         or SideEffectClass.FINANCIAL in spec.side_effects
+        or SideEffectClass.DESTRUCTIVE in spec.side_effects
         or impact is ImpactLevel.HIGH
     ):
         rules.append(RuleId.R_HIGH_CONSEQUENCE.value)

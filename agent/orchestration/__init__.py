@@ -26,6 +26,7 @@ from agent.orchestration.contracts import (
     VerificationResult,
     WorkerRunRequest,
 )
+from agent.orchestration.origin import TurnOrigin, turn_origin_from_agent, turn_origin_from_session_source
 from agent.orchestration.service import OrchestrationTurnResult, maybe_orchestrate_turn
 
 __all__ = [
@@ -47,6 +48,9 @@ __all__ = [
     "VerificationOutcome",
     "VerificationResult",
     "WorkerRunRequest",
+    "TurnOrigin",
+    "turn_origin_from_agent",
+    "turn_origin_from_session_source",
     "OrchestrationTurnResult",
     "maybe_orchestrate_turn",
 ]

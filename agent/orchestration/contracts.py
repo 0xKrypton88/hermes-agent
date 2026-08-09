@@ -226,3 +226,11 @@ class ExecutionTrace:
     escalation_reason: Optional[str] = None
     error_class: Optional[str] = None
     feedback: Optional[str] = None
+    # V1.1 trusted-origin / activation dimensions (ID-safe; no raw prompts).
+    origin_platform: Optional[str] = None
+    origin_workspace_id: Optional[str] = None
+    origin_channel_id: Optional[str] = None
+    origin_user_id: Optional[str] = None
+    effective_mode: Optional[str] = None
+    activation_rule_id: Optional[str] = None
+    legacy_parent_executed: bool = False
