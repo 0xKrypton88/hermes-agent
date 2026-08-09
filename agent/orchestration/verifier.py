@@ -124,13 +124,7 @@ def verify_attempt(
     require_approval: bool = False,
 ) -> VerificationResult:
     """Decide the next verification outcome for an attempt."""
-    if current.success and current.schema_ok:
-        return VerificationResult(
-            outcome=VerificationOutcome.RETURN,
-            reason_code="OK",
-            evidence=("attempt succeeded",),
-        )
-
+    # Approval outcomes take precedence over worker success/schema.
     if approval_denied:
         return VerificationResult(
             outcome=VerificationOutcome.BLOCK,
@@ -143,6 +137,13 @@ def verify_attempt(
             outcome=VerificationOutcome.REQUIRE_APPROVAL,
             reason_code=RuleId.R_SIDE_EFFECT_APPROVAL.value,
             evidence=("approval required",),
+        )
+
+    if current.success and current.schema_ok:
+        return VerificationResult(
+            outcome=VerificationOutcome.RETURN,
+            reason_code="OK",
+            evidence=("attempt succeeded",),
         )
 
     if ask_user_pending:

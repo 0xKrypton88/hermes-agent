@@ -74,9 +74,21 @@ class ApprovalStore:
         tool_name: str,
         action_digest: str,
         actor: str = "user",
+        trusted: bool = False,
     ) -> None:
+        """Record an approval.
+
+        Workers cannot mint approvals under any ``actor`` string. Only the
+        trusted host approval UX/hooks may pass ``trusted=True``.
+        """
         if actor == "worker":
             raise PermissionError("workers cannot self-approve")
+        active = get_active_policy_context()
+        if active is not None and active.is_worker and not trusted:
+            raise PermissionError("workers cannot mint user approvals")
+        if not trusted and actor != "user":
+            # Non-user actors require the trusted host path.
+            raise PermissionError("untrusted approval actor")
         key = self._key(session_id, turn_id, tool_call_id, tool_name, action_digest)
         self._records[key] = ApprovalRecord(
             session_id=session_id,
@@ -85,7 +97,7 @@ class ApprovalStore:
             tool_name=tool_name,
             action_digest=action_digest,
             status="approved",
-            actor=actor,
+            actor="user" if trusted else actor,
         )
 
     def deny(
@@ -230,6 +242,63 @@ def get_tool_risk_meta(registry: Any, name: str) -> ToolRiskMeta:
     return ToolRiskMeta(SideEffectClass.EXTERNAL, "moderate")
 
 
+_DESTRUCTIVE_ACTION_MARKERS = (
+    "rm -",
+    "rm -rf",
+    "rmdir",
+    "del /",
+    "remove-item",
+    "drop table",
+    "drop database",
+    "mkfs",
+    "format ",
+    "dd if=",
+    "wipe",
+    "shred ",
+)
+_FINANCIAL_ACTION_MARKERS = (
+    "payment",
+    "transfer",
+    "place_order",
+    "place-order",
+    "broker",
+    "trade",
+    "withdraw",
+    "wire ",
+)
+
+
+def normalize_action_risk(
+    tool_name: str,
+    args: Mapping[str, Any],
+    base: ToolRiskMeta,
+) -> ToolRiskMeta:
+    """Action-aware normalized classification across terminal/browser/API/MCP."""
+    blob_parts = [tool_name]
+    for key in ("command", "cmd", "script", "code", "url", "path", "action", "method"):
+        if key in args and args[key] is not None:
+            blob_parts.append(str(args[key]))
+    # Include tool name + common arg values for API/MCP tools.
+    for key, value in list(args.items())[:12]:
+        blob_parts.append(f"{key}={value}")
+    blob = " ".join(blob_parts).lower()
+
+    if any(m in blob for m in _FINANCIAL_ACTION_MARKERS) or base.side_effect is SideEffectClass.FINANCIAL:
+        if base.side_effect is SideEffectClass.FINANCIAL or any(
+            m in blob for m in _FINANCIAL_ACTION_MARKERS
+        ):
+            return ToolRiskMeta(SideEffectClass.FINANCIAL, "critical")
+
+    if any(m in blob for m in _DESTRUCTIVE_ACTION_MARKERS):
+        return ToolRiskMeta(SideEffectClass.DESTRUCTIVE, "high")
+
+    if tool_name.startswith("browser_") or base.side_effect is SideEffectClass.EXTERNAL:
+        if base.side_effect is SideEffectClass.EXTERNAL:
+            return base
+
+    return base
+
+
 def canonical_action_digest(tool_name: str, args: Mapping[str, Any]) -> str:
     """Stable digest of final normalized tool name + arguments."""
     payload = {"tool": tool_name, "args": _canonicalize(args)}
@@ -257,7 +326,9 @@ def enforce_tool_policy(
 ) -> PolicyDecision:
     """Authoritative pre-dispatch policy check."""
     call_id = tool_call_id or ctx.tool_call_id
-    meta = get_tool_risk_meta(registry, tool_name)
+    meta = normalize_action_risk(
+        tool_name, args, get_tool_risk_meta(registry, tool_name)
+    )
     digest = canonical_action_digest(tool_name, args)
 
     # Denial for this call identity cannot be bypassed (even if digest differs
@@ -361,6 +432,27 @@ def enforce_tool_policy(
         reason_code="SIDE_EFFECT_BLOCKED",
         requires_approval=True,
         action_digest=digest,
+    )
+
+
+def grant_trusted_user_approval(
+    store: ApprovalStore,
+    *,
+    session_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    action_digest: str,
+) -> None:
+    """Host-only approval grant used by the existing approval UX/hooks."""
+    store.approve(
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        action_digest=action_digest,
+        actor="user",
+        trusted=True,
     )
 
 

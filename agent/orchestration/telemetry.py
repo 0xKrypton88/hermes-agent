@@ -27,6 +27,29 @@ def traces_dir() -> Path:
     return get_hermes_home() / _TRACE_DIRNAME
 
 
+_FREE_TEXT_KEYS = frozenset(
+    {"feedback", "error_class", "escalation_reason", "evidence", "raw_error"}
+)
+
+
+def _digest_text(value: str) -> str:
+    import hashlib
+    import re
+
+    text = str(value or "")
+    # Strip path-like / secret-like / SQL-like free text before digesting.
+    text = re.sub(r"(?i)sk-[a-z0-9\-_]{6,}", "[redacted-secret]", text)
+    text = re.sub(r"(/home|/Users|/var|/tmp|/secret)[^\s\"']*", "[redacted-path]", text)
+    text = re.sub(r"(?i)select\s+.+\s+from\s+\w+", "[redacted-sql]", text)
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    # Keep a short allowlisted class token when present (e.g. RuntimeError).
+    cls = ""
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]{0,40})", text.strip())
+    if m and m.group(1) not in {"user", "prior", "SELECT", "select"}:
+        cls = m.group(1)
+    return f"{cls + ':' if cls else ''}digest:{digest}"
+
+
 def _trace_to_redacted_dict(trace: ExecutionTrace) -> Dict[str, Any]:
     data = asdict(trace)
     # Enums → values
@@ -42,6 +65,9 @@ def _trace_to_redacted_dict(trace: ExecutionTrace) -> Dict[str, Any]:
     data.pop("user_text", None)
     data.pop("private_cot", None)
     data.pop("api_key", None)
+    for key in _FREE_TEXT_KEYS:
+        if key in data and data[key] is not None:
+            data[key] = _digest_text(str(data[key]))
     data["persisted_at"] = time.time()
     return data
 
@@ -51,6 +77,7 @@ def persist_trace(
     cfg: OrchestrationConfig,
     *,
     session_db: Any = None,
+    record_usage: bool = True,
 ) -> Optional[Path]:
     """Persist a local redacted trace when telemetry is enabled.
 
@@ -58,7 +85,9 @@ def persist_trace(
     """
     if not cfg.enabled or not cfg.telemetry.enabled:
         return None
-    if cfg.mode == "off" and not cfg.telemetry.enabled:
+    # Mode off must never persist orchestration activity, even if telemetry
+    # is enabled in config.
+    if cfg.mode == "off" or trace.mode == "off":
         return None
 
     directory = traces_dir()
@@ -73,7 +102,11 @@ def persist_trace(
     path = directory / filename
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
-    if session_db is not None and (trace.input_tokens or trace.output_tokens):
+    if (
+        record_usage
+        and session_db is not None
+        and (trace.input_tokens or trace.output_tokens)
+    ):
         try:
             session_db.record_auxiliary_usage(
                 trace.session_id,

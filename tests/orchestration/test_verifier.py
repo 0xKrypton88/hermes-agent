@@ -186,3 +186,33 @@ def test_default_bounded_ladder_transitions_have_stable_reason_codes():
     final = next_ladder_step(ModelFamily.SOL, ReasoningEffort.MAX, allow_sol_max=True)
     assert final[0] is None
     assert final[2] in ("LADDER_EXHAUSTED_ASK_USER", "LADDER_EXHAUSTED_BLOCK")
+
+
+def test_success_cannot_override_approval_denial_or_requirement():
+    """Denial => BLOCK and pending approval => REQUIRE_APPROVAL despite success."""
+    from agent.orchestration.verifier import verify_attempt, AttemptRecord
+
+    success = AttemptRecord(
+        family=ModelFamily.TERRA,
+        reasoning=ReasoningEffort.MEDIUM,
+        success=True,
+        schema_ok=True,
+        failure_signature=None,
+    )
+    denied = verify_attempt(
+        success,
+        history=(),
+        cfg=load_orchestration_config({}),
+        approval_denied=True,
+    )
+    assert denied.outcome is VerificationOutcome.BLOCK
+    assert denied.reason_code == RuleId.R_APPROVAL_DENIED.value
+
+    needs = verify_attempt(
+        success,
+        history=(),
+        cfg=load_orchestration_config({}),
+        require_approval=True,
+    )
+    assert needs.outcome is VerificationOutcome.REQUIRE_APPROVAL
+    assert needs.reason_code == RuleId.R_SIDE_EFFECT_APPROVAL.value

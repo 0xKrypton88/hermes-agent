@@ -1438,10 +1438,12 @@ def run_conversation(
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Adaptive Orchestrator V1 (universal top-level turn boundary) ──
-    # Runs immediately before build_turn_context. Top-level sessions only;
-    # workers/children hit the recursion guard and fall through. ``off`` and
-    # ``shadow`` preserve legacy execution; ``active`` may return an isolated
-    # worker result without mutating parent cached prompt/tools/model.
+    # Decision hook runs immediately before build_turn_context. Top-level
+    # sessions only; workers/children hit the recursion guard and fall through.
+    # ``off`` / ``shadow`` preserve legacy execution. Active workers are deferred
+    # until after the parent turn prologue so persistence/turn IDs/hooks remain
+    # intact; parent cached prompt/tools/model stay immutable.
+    _orch_turn = None
     try:
         from agent.orchestration.service import maybe_orchestrate_turn
 
@@ -1450,11 +1452,17 @@ def run_conversation(
             user_message,
             conversation_history=conversation_history,
             task_id=task_id,
+            defer_worker=True,
         )
+        # Only short-circuit before prologue for non-pending terminal results
+        # that already carry a finalized response (e.g. REQUIRE_APPROVAL with
+        # legacy_continue). Pending workers always continue into prologue.
         if (
             _orch_turn is not None
             and _orch_turn.acted
+            and not getattr(_orch_turn, "pending_worker", False)
             and isinstance(_orch_turn.response, dict)
+            and _orch_turn.legacy_continue is False
         ):
             return _orch_turn.response
     except Exception:
@@ -1501,6 +1509,65 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # Active orchestration: run the deferred worker after prologue so the
+    # parent turn id / user-message persistence / hooks are already in place.
+    # Worker result re-enters through the canonical finalize path.
+    if (
+        _orch_turn is not None
+        and getattr(_orch_turn, "pending_worker", False)
+        and not _orch_turn.legacy_continue
+    ):
+        try:
+            from agent.orchestration.service import complete_active_orchestration
+
+            _orch_turn = complete_active_orchestration(
+                _orch_turn,
+                agent,
+                task_id=effective_task_id,
+                messages=messages,
+            )
+            if (
+                _orch_turn is not None
+                and _orch_turn.acted
+                and isinstance(_orch_turn.response, dict)
+            ):
+                final_response = _orch_turn.response.get("final_response")
+                orch_messages = _orch_turn.response.get("messages") or list(messages)
+                if final_response is not None and (
+                    not orch_messages
+                    or orch_messages[-1].get("role") != "assistant"
+                ):
+                    orch_messages = list(orch_messages) + [
+                        {"role": "assistant", "content": final_response}
+                    ]
+                messages = orch_messages
+                try:
+                    return finalize_turn(
+                        agent,
+                        final_response=final_response,
+                        api_call_count=0,
+                        interrupted=False,
+                        failed=not bool(_orch_turn.response.get("completed", True)),
+                        messages=messages,
+                        conversation_history=conversation_history,
+                        effective_task_id=effective_task_id,
+                        turn_id=turn_id,
+                        user_message=user_message,
+                        original_user_message=original_user_message,
+                        _should_review_memory=_should_review_memory,
+                        _turn_exit_reason="orchestration_active",
+                    )
+                except Exception:
+                    # Fallback: return the orchestration response with merged
+                    # parent messages when finalize_turn is unavailable/mocked.
+                    return {
+                        **_orch_turn.response,
+                        "messages": messages,
+                        "final_response": final_response,
+                    }
+        except Exception:
+            logger.debug("active orchestration completion failed", exc_info=True)
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.

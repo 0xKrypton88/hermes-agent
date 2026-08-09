@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from agent.orchestration.contracts import (
     CapabilityClass,
     ImpactLevel,
+    InferredFact,
     Provenance,
     SideEffectClass,
     TaskSpec,
@@ -180,6 +181,49 @@ def _parse_capabilities(values: Sequence[str]) -> Tuple[CapabilityClass, ...]:
     return tuple(out)
 
 
+def _parse_inferred_facts(
+    classifier_raw: Optional[Mapping[str, Any]],
+    *,
+    user_text: str,
+) -> Tuple[InferredFact, ...]:
+    """Extract inferred facts without duplicating raw prompts/secrets."""
+    if not isinstance(classifier_raw, Mapping):
+        return ()
+    raw_items = classifier_raw.get("inferred_facts") or ()
+    if not isinstance(raw_items, (list, tuple)):
+        return ()
+    out: List[InferredFact] = []
+    prompt = (user_text or "").strip()
+    for item in raw_items:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        value = item.get("value")
+        rationale = str(item.get("rationale") or "").strip()
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        # Never store raw prompt duplication in inferred bags.
+        if prompt and (
+            (isinstance(value, str) and value.strip() == prompt)
+            or rationale.strip() == prompt
+        ):
+            continue
+        out.append(
+            InferredFact(
+                key=key[:128],
+                value=value,
+                rationale=rationale[:500],
+                confidence=confidence,
+            )
+        )
+    return tuple(out)
+
+
 def merge_intake(
     user_text: str,
     classifier_raw: Any,
@@ -269,6 +313,11 @@ def merge_intake(
     elif SideEffectClass.WRITE in side_effects:
         autonomy = "write_with_policy"
 
+    inferred_facts = _parse_inferred_facts(
+        classifier_raw if isinstance(classifier_raw, Mapping) else None,
+        user_text=user_text,
+    )
+
     spec = TaskSpec(
         objective=str(objective)[:2000],
         provenance=provenance,
@@ -286,6 +335,7 @@ def merge_intake(
         complexity=complexity,
         blocker_unknowns=tuple(blocker_unknowns),
         explicit_facts=dict(explicit_facts),
+        inferred_facts=inferred_facts,
     )
 
     return IntakeResult(

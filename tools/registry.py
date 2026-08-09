@@ -588,6 +588,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        risk_metadata: Any = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -596,6 +597,10 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``risk_metadata`` is optional declarative side-effect/risk metadata
+        (Adaptive Orchestrator V1). Callers omitting it remain valid; defaults
+        may be attached later via ``attach_default_risk_metadata``.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -648,6 +653,8 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
+            if risk_metadata is not None:
+                self._risk_metadata[name] = risk_metadata
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which

@@ -115,3 +115,73 @@ def test_structured_classifier_schema_validation():
 
     with pytest.raises(ValueError):
         parse_classifier_output({"complexity": 123, "confidence": "nope"})
+
+
+def test_explicit_inferred_and_unknown_facts_remain_separate_through_merge():
+    """Machine-separated provenance: explicit wins; inferred carries rationale/confidence."""
+    from agent.orchestration.intake import merge_intake
+    from agent.orchestration.compiler import compile_worker_brief
+    from agent.orchestration.router import route_task
+    from agent.orchestration.config import load_orchestration_config
+
+    result = merge_intake(
+        user_text="refactor helper module carefully",
+        classifier_raw={
+            "complexity": "moderate",
+            "impact": "low",
+            "side_effects": ["write"],
+            "confidence": 0.81,
+            "capabilities": ["read", "write"],
+            "unknowns": ["preferred_style"],
+            "inferred_facts": [
+                {
+                    "key": "likely_language",
+                    "value": "python",
+                    "rationale": "path hints suggest python sources",
+                    "confidence": 0.72,
+                }
+            ],
+            # Classifier tries to lower explicit impact — must not win
+            "objective": "classifier objective must not clobber explicit",
+        },
+        explicit_facts={
+            "impact": "high",
+            "objective": "explicit objective wins",
+            "side_effects": ["write"],
+        },
+    )
+    spec = result.task_spec
+    assert spec.explicit_facts["objective"] == "explicit objective wins"
+    assert spec.objective == "explicit objective wins"
+    assert spec.impact is ImpactLevel.HIGH
+    assert "preferred_style" in spec.unknowns
+    assert hasattr(spec, "inferred_facts")
+    inferred = list(spec.inferred_facts)
+    assert inferred, "inferred_facts must remain machine-separated"
+    fact = inferred[0]
+    value = getattr(fact, "value", None) or (fact.get("value") if isinstance(fact, dict) else None)
+    rationale = getattr(fact, "rationale", None) or (
+        fact.get("rationale") if isinstance(fact, dict) else None
+    )
+    confidence = getattr(fact, "confidence", None) or (
+        fact.get("confidence") if isinstance(fact, dict) else None
+    )
+    assert value == "python"
+    assert rationale and (
+        "python" in rationale.lower() or "path" in rationale.lower()
+    )
+    assert isinstance(confidence, float) and 0.0 <= confidence <= 1.0
+    # No secret/raw prompt duplication into inferred bag
+    blob = str(inferred)
+    assert "refactor helper module carefully" not in blob
+
+    cfg = load_orchestration_config(
+        {"orchestration": {"enabled": True, "mode": "shadow"}}
+    )
+    decision = route_task(spec, cfg)
+    compiled = compile_worker_brief(spec, decision, cfg)
+    brief = compiled.brief
+    assert "explicit objective wins" in brief
+    assert "preferred_style" in brief or "Unknowns" in brief
+    # Inferred facts may appear with rationale, but not raw user prompt dump
+    assert "classifier objective must not clobber explicit" not in brief

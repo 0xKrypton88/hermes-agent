@@ -99,6 +99,16 @@ class RuleId(str, Enum):
 
 
 @dataclass(frozen=True)
+class InferredFact:
+    """Machine-separated inferred fact with rationale + confidence."""
+
+    key: str
+    value: Any
+    rationale: str
+    confidence: float
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     """Versioned task specification produced by intake/merge."""
 
@@ -116,6 +126,7 @@ class TaskSpec:
     complexity: str = "low"  # low | moderate | high | critical
     blocker_unknowns: Tuple[str, ...] = ()
     explicit_facts: Mapping[str, Any] = field(default_factory=dict)
+    inferred_facts: Tuple[InferredFact, ...] = ()
     schema_version: str = SCHEMA_VERSION
     policy_version: str = POLICY_VERSION
     prompt_version: str = PROMPT_VERSION

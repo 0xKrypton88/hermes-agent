@@ -61,6 +61,17 @@ def compile_worker_brief(
         if spec.assumptions:
             sections.append("Assumptions: " + "; ".join(spec.assumptions))
 
+    if getattr(spec, "inferred_facts", ()):
+        sections.append("## Inferred facts (non-authoritative)")
+        for fact in spec.inferred_facts:
+            key = getattr(fact, "key", None) or ""
+            value = getattr(fact, "value", None)
+            rationale = getattr(fact, "rationale", "") or ""
+            confidence = getattr(fact, "confidence", 0.0)
+            sections.append(
+                f"- {key}={value!s} (confidence={confidence:.2f}; {rationale})"
+            )
+
     if spec.constraints or spec.non_goals:
         sections.append("## Constraints / Non-goals")
         if spec.constraints:

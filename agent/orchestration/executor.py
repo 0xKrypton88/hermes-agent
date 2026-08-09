@@ -1,28 +1,62 @@
-"""Thin worker executor adapter over ``tools.delegate_tool._build_child_agent``.
+"""Thin worker executor adapter over ``tools.delegate_tool`` lifecycle seams.
 
 No duplicate AIAgent / LLM transport / provider layer. Provider/model intent
 flows through ``resolve_runtime_provider``. Worker toolsets are static for
 the run. Parent prompt/tool schemas remain untouched.
+
+Lifecycle ownership is reused from ``tools.delegate_tool``:
+``_build_child_preserving_parent_tools`` + ``_run_child_lifecycle``.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
+import contextvars
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.orchestration.config import OrchestrationConfig, resolve_family_model
-from agent.orchestration.contracts import ReasoningEffort, WorkerRunRequest
+from agent.orchestration.contracts import ReasoningEffort, SideEffectClass, WorkerRunRequest
 
 logger = logging.getLogger(__name__)
 
 # Import seams used by tests (patch targets).
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
-from tools.delegate_tool import _build_child_agent  # noqa: E402
+from tools.delegate_tool import (  # noqa: E402
+    _build_child_agent as _delegate_build_child_agent,
+    _run_child_lifecycle as _delegate_run_child_lifecycle,
+)
+from tools.daemon_pool import DaemonThreadPoolExecutor  # noqa: E402
 
 _DEFAULT_POLL_S = 0.1
+
+# Module-level aliases so tests can patch ``executor._build_child_agent`` and
+# still exercise the preserving/lifecycle path.
+_build_child_agent = _delegate_build_child_agent
+
+
+def _build_child_preserving_parent_tools(**kwargs):
+    """Preserve parent tool names; route through this module's build seam."""
+    import model_tools
+
+    parent_tool_names = list(model_tools._last_resolved_tool_names)
+    try:
+        child = _build_child_agent(**kwargs)
+    finally:
+        model_tools._last_resolved_tool_names = parent_tool_names
+    try:
+        child._delegate_saved_tool_names = parent_tool_names
+    except Exception:
+        pass
+    return child
+
+
+def _run_child_lifecycle(task_index, goal, child=None, parent_agent=None, **kwargs):
+    """Lifecycle-owned run; patch target for tests."""
+    return _delegate_run_child_lifecycle(
+        task_index, goal, child=child, parent_agent=parent_agent
+    )
 
 
 class WorkerCancelled(Exception):
@@ -47,11 +81,14 @@ class WorkerRunResult:
     timed_out: bool = False
     error_class: Optional[str] = None
     latency_ms: Optional[int] = None
+    used_tools: Tuple[str, ...] = ()
 
 
 def _resolve_overrides(
     req: WorkerRunRequest,
     cfg: OrchestrationConfig,
+    *,
+    parent_agent: Any = None,
 ) -> Dict[str, Any]:
     """Resolve provider/model overrides via runtime provider + family aliases."""
     provider_alias = req.provider_alias
@@ -62,27 +99,195 @@ def _resolve_overrides(
         model_alias = model_alias or fam_model
 
     # Map family model aliases through config (never hard-code concrete names).
-    concrete_model = cfg.model_aliases.get(model_alias, "") or ""
-    target_model = concrete_model or None
+    concrete_model = ""
+    if model_alias:
+        concrete_model = cfg.model_aliases.get(model_alias, "") or ""
+    # Only configured concrete IDs are passed as target_model. Empty/unmapped
+    # family aliases (luna|terra|sol) inherit via parent/delegation defaults.
+    family_alias_keys = {
+        fam.model_alias for fam in cfg.families.values() if fam.model_alias
+    }
+    if concrete_model:
+        target_model: Optional[str] = concrete_model
+    elif model_alias and model_alias not in family_alias_keys and model_alias not in {
+        "luna",
+        "terra",
+        "sol",
+    }:
+        # Non-family alias string that isn't a default family token — treat as
+        # a concrete id only when present in model_aliases with a value (above)
+        # or when it looks like an already-concrete configured id.
+        target_model = None
+    else:
+        target_model = None
 
     # ``delegation`` alias means inherit via empty requested provider.
-    requested = None if provider_alias in ("", "delegation", "inherit") else provider_alias
+    requested = None if provider_alias in ("", "delegation", "inherit", None) else provider_alias
 
     resolved = resolve_runtime_provider(
         requested=requested,
         target_model=target_model,
     )
+
+    # Child model: concrete alias only; otherwise inherit parent model.
+    parent_model = getattr(parent_agent, "model", None) if parent_agent is not None else None
+    child_model = target_model if target_model else (parent_model or None)
+
     return {
         "resolved": resolved,
-        "model": target_model or model_alias,
+        "model": child_model,
         "provider_alias": provider_alias,
         "model_alias": model_alias,
     }
 
 
 def _reasoning_config(effort: ReasoningEffort) -> Dict[str, Any]:
-    # Map orchestrator efforts onto the existing reasoning_config shape.
     return {"effort": effort.value}
+
+
+def _install_worker_policy_context(
+    req: WorkerRunRequest,
+    *,
+    parent_agent: Any,
+    cfg: OrchestrationConfig,
+    child: Any,
+):
+    """Install session/turn-scoped PolicyContext for the worker run."""
+    from agent.orchestration.tool_policy import (
+        ApprovalStore,
+        PolicyContext,
+        set_active_policy_context,
+    )
+
+    store = getattr(parent_agent, "_orch_approval_store", None)
+    if store is None:
+        store = ApprovalStore()
+        try:
+            parent_agent._orch_approval_store = store
+        except Exception:
+            pass
+
+    allowed = {
+        SideEffectClass.NONE,
+        SideEffectClass.READ,
+        SideEffectClass.WRITE,
+    }
+    # Destructive/financial stay approval-gated unless already approved.
+    ctx = PolicyContext(
+        session_id=str(
+            req.parent_session_id or getattr(parent_agent, "session_id", "") or ""
+        ),
+        turn_id=str(
+            req.parent_turn_id or getattr(parent_agent, "_current_turn_id", "") or ""
+        ),
+        tool_call_id=str(req.correlation_id or ""),
+        is_worker=True,
+        allowed_side_effects=frozenset(allowed),
+        approval_store=store,
+        allow_worker_self_approve=False,
+    )
+    token = set_active_policy_context(ctx)
+    try:
+        child._orch_worker = True
+        child._orch_policy_context = ctx
+    except Exception:
+        pass
+    return token
+
+
+def _reset_worker_policy_context(token) -> None:
+    try:
+        from agent.orchestration.tool_policy import reset_active_policy_context
+
+        if token is not None:
+            reset_active_policy_context(token)
+    except Exception:
+        pass
+
+
+def _entry_to_result(
+    entry: Any,
+    *,
+    req: WorkerRunRequest,
+    parent_agent: Any,
+    child: Any,
+    resolved: Dict[str, Any],
+    model: Optional[str],
+    static_toolsets: Tuple[str, ...],
+    started: float,
+    cancelled: bool = False,
+    timed_out: bool = False,
+    error_class: Optional[str] = None,
+) -> WorkerRunResult:
+    final_response = None
+    usage: Dict[str, Any] = {}
+    used_tools: Tuple[str, ...] = ()
+    success = False
+
+    if isinstance(entry, dict):
+        status = str(entry.get("status") or "").lower()
+        final_response = (
+            entry.get("final_response")
+            or entry.get("summary")
+            or entry.get("response")
+        )
+        usage = dict(entry.get("usage") or {})
+        if not usage:
+            # Lifecycle entries may carry token fields directly.
+            in_tok = entry.get("input_tokens")
+            out_tok = entry.get("output_tokens")
+            if in_tok or out_tok:
+                usage = {
+                    "input_tokens": int(in_tok or 0),
+                    "output_tokens": int(out_tok or 0),
+                }
+        trace = entry.get("tool_trace") or entry.get("tool_calls") or ()
+        if isinstance(trace, (list, tuple)):
+            names = []
+            for item in trace:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("tool") or item.get("tool_name")
+                    if name:
+                        names.append(str(name))
+                elif isinstance(item, str):
+                    names.append(item)
+            used_tools = tuple(dict.fromkeys(names))
+        if error_class is None and status in {"error", "failed", "failure", "timeout"}:
+            error_class = status if status != "timeout" else "timeout"
+            if status == "timeout":
+                timed_out = True
+        success = status in {"completed", "success", "ok", ""} and not (
+            cancelled or timed_out or error_class
+        )
+        if final_response and not error_class and not cancelled and not timed_out:
+            success = True
+        if entry.get("error") and not success:
+            error_class = error_class or type(entry.get("error")).__name__
+            if isinstance(entry.get("error"), str):
+                error_class = error_class or "WorkerError"
+    elif entry is not None:
+        final_response = str(entry)
+        success = not (cancelled or timed_out or error_class)
+
+    return WorkerRunResult(
+        success=success,
+        correlation_id=req.correlation_id,
+        session_id=req.parent_session_id or getattr(parent_agent, "session_id", None),
+        task_id=req.task_id,
+        worker_id=getattr(child, "_subagent_id", None),
+        child_session_id=getattr(child, "session_id", None),
+        provider=getattr(child, "provider", None) or resolved.get("provider"),
+        model=getattr(child, "model", None) or model,
+        reasoning=req.reasoning,
+        toolsets=static_toolsets,
+        final_response=final_response,
+        usage=usage,
+        cancelled=cancelled,
+        timed_out=timed_out,
+        error_class=error_class,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        used_tools=used_tools,
+    )
 
 
 def execute_worker_run(
@@ -93,13 +298,14 @@ def execute_worker_run(
     cancel_check: Optional[Callable[[], bool]] = None,
     build_child: Optional[Callable[..., Any]] = None,
 ) -> WorkerRunResult:
-    """Build and run an isolated worker via the delegation child path."""
+    """Build and run an isolated worker via the delegation lifecycle path."""
     started = time.monotonic()
     toolsets: List[str] = list(req.toolsets)
-    build = build_child or _build_child_agent
+    build = build_child or _build_child_preserving_parent_tools
+    policy_token = None
 
     try:
-        overrides = _resolve_overrides(req, cfg)
+        overrides = _resolve_overrides(req, cfg, parent_agent=parent_agent)
     except Exception as exc:
         logger.debug("orchestration provider resolve failed: %s", exc, exc_info=True)
         return WorkerRunResult(
@@ -141,61 +347,70 @@ def execute_worker_run(
         role=req.role or "leaf",
     )
 
-    # Apply reasoning intent without mutating parent.
     try:
         child.reasoning_config = _reasoning_config(req.reasoning)
     except Exception:
         pass
 
-    # Stamp correlation on the child for telemetry (session-scoped, not process-global).
     try:
         child._orch_correlation_id = req.correlation_id
         child._orch_task_id = req.task_id
         child._orch_family = req.family.value
         child._orch_parent_turn_id = req.parent_turn_id
+        child._orch_worker = True
     except Exception:
         pass
 
-    worker_id = getattr(child, "_subagent_id", None)
-    child_session_id = getattr(child, "session_id", None)
     static_toolsets = tuple(getattr(child, "enabled_toolsets", None) or toolsets)
 
     if cancel_check and cancel_check():
-        return WorkerRunResult(
-            success=False,
-            correlation_id=req.correlation_id,
-            session_id=req.parent_session_id or getattr(parent_agent, "session_id", None),
-            task_id=req.task_id,
-            worker_id=worker_id,
-            child_session_id=child_session_id,
-            provider=getattr(child, "provider", None) or resolved.get("provider"),
-            model=getattr(child, "model", None) or model,
-            reasoning=req.reasoning,
-            toolsets=static_toolsets,
+        try:
+            if hasattr(child, "close"):
+                child.close()
+        except Exception:
+            pass
+        return _entry_to_result(
+            None,
+            req=req,
+            parent_agent=parent_agent,
+            child=child,
+            resolved=resolved,
+            model=model,
+            static_toolsets=static_toolsets,
+            started=started,
             cancelled=True,
             error_class="cancelled",
-            latency_ms=int((time.monotonic() - started) * 1000),
         )
 
     timeout = max(1, int(req.timeout_seconds or cfg.budgets.child_timeout_seconds or 1))
-    final_response = None
-    usage: Dict[str, Any] = {}
-    error_class = None
     cancelled = False
     timed_out = False
-    success = False
+    error_class = None
+    entry: Any = None
 
-    def _run():
-        return child.run_conversation(
-            user_message=req.goal,
-            system_message=None,
-            conversation_history=None,
-            task_id=req.task_id,
+    # Install policy context in this thread and copy into the worker thread.
+    try:
+        policy_token = _install_worker_policy_context(
+            req, parent_agent=parent_agent, cfg=cfg, child=child
+        )
+    except Exception:
+        logger.debug("failed to install worker policy context", exc_info=True)
+        policy_token = None
+
+    def _run_lifecycle():
+        return _run_child_lifecycle(
+            0,
+            req.goal,
+            child,
+            parent_agent,
         )
 
+    child_ctx = contextvars.copy_context()
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_run)
+        pool = DaemonThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(child_ctx.run, _run_lifecycle)
             deadline = time.monotonic() + timeout
             while True:
                 if cancel_check and cancel_check():
@@ -220,40 +435,42 @@ def execute_worker_run(
                     future.cancel()
                     break
                 try:
-                    result = future.result(timeout=min(_DEFAULT_POLL_S, remaining))
-                    final_response = None
-                    if isinstance(result, dict):
-                        final_response = result.get("final_response")
-                        usage = dict(result.get("usage") or {})
-                    else:
-                        final_response = str(result)
-                    success = True
+                    entry = future.result(timeout=min(_DEFAULT_POLL_S, remaining))
                     break
-                except concurrent.futures.TimeoutError:
+                except TimeoutError:
                     continue
                 except Exception as exc:
+                    # concurrent.futures.TimeoutError is a TimeoutError subclass
+                    # on 3.10+; already handled above via remaining check loop.
+                    from concurrent.futures import TimeoutError as FuturesTimeout
+
+                    if isinstance(exc, FuturesTimeout):
+                        continue
                     error_class = type(exc).__name__
-                    logger.debug("worker run failed: %s", exc, exc_info=True)
+                    logger.debug("worker lifecycle failed: %s", exc, exc_info=True)
                     break
+        finally:
+            # Daemon pool: do not wait for abandoned workers.
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
     except Exception as exc:
         error_class = type(exc).__name__
         logger.debug("worker executor failed: %s", exc, exc_info=True)
+    finally:
+        _reset_worker_policy_context(policy_token)
 
-    return WorkerRunResult(
-        success=success,
-        correlation_id=req.correlation_id,
-        session_id=req.parent_session_id or getattr(parent_agent, "session_id", None),
-        task_id=req.task_id,
-        worker_id=worker_id,
-        child_session_id=child_session_id,
-        provider=getattr(child, "provider", None) or resolved.get("provider"),
-        model=getattr(child, "model", None) or model,
-        reasoning=req.reasoning,
-        toolsets=static_toolsets,
-        final_response=final_response,
-        usage=usage,
+    return _entry_to_result(
+        entry,
+        req=req,
+        parent_agent=parent_agent,
+        child=child,
+        resolved=resolved,
+        model=model,
+        static_toolsets=static_toolsets,
+        started=started,
         cancelled=cancelled,
         timed_out=timed_out,
         error_class=error_class,
-        latency_ms=int((time.monotonic() - started) * 1000),
     )

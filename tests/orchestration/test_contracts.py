@@ -125,3 +125,37 @@ def test_contracts_have_no_secret_bearing_field_names():
             continue
         field_names = {f.name.lower() for f in dataclasses.fields(cls)}
         assert not (field_names & forbidden), f"{name} has secret-bearing fields"
+
+
+def test_task_spec_separates_explicit_inferred_and_unknown_provenance():
+    from agent.orchestration.contracts import (
+        InferredFact,
+        Provenance,
+        TaskSpec,
+        ImpactLevel,
+        SideEffectClass,
+    )
+
+    spec = TaskSpec(
+        objective="ship the fix",
+        provenance=Provenance.EXPLICIT,
+        impact=ImpactLevel.HIGH,
+        side_effects=(SideEffectClass.WRITE,),
+        unknowns=("deadline",),
+        explicit_facts={"impact": "high", "objective": "ship the fix"},
+        inferred_facts=(
+            InferredFact(
+                key="module",
+                value="orchestration",
+                rationale="path under agent/orchestration",
+                confidence=0.8,
+            ),
+        ),
+    )
+    assert "impact" in spec.explicit_facts
+    assert spec.inferred_facts[0].value == "orchestration"
+    assert 0.0 <= spec.inferred_facts[0].confidence <= 1.0
+    assert "deadline" in spec.unknowns
+    assert "raw_prompt" not in spec.explicit_facts
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.inferred_facts[0].value = "mutated"  # type: ignore[misc]

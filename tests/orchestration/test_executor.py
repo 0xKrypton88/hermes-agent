@@ -108,9 +108,17 @@ def test_executor_builds_child_via_delegate_with_resolved_runtime_and_static_too
             "requested_provider": "openrouter",
         },
     ) as resolve_mock, patch(
-        "agent.orchestration.executor._build_child_agent",
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
         return_value=fake_child,
-    ) as build_mock:
+    ) as build_mock, patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        return_value={
+            "status": "completed",
+            "summary": "ok",
+            "final_response": "ok",
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+        },
+    ):
         result = execute_worker_run(req, parent_agent=parent, cfg=cfg)
 
     assert result.success is True
@@ -185,8 +193,11 @@ def test_executor_honors_timeout_and_cancellation_without_duplicate_transport():
             "requested_provider": "openrouter",
         },
     ), patch(
-        "agent.orchestration.executor._build_child_agent",
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
         return_value=fake_child,
+    ), patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        return_value={"status": "completed", "summary": "late"},
     ), patch(
         "agent.orchestration.executor._DEFAULT_POLL_S",
         0.05,
@@ -243,8 +254,16 @@ def test_executor_correlates_to_session_and_task():
             "requested_provider": "openrouter",
         },
     ), patch(
-        "agent.orchestration.executor._build_child_agent",
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
         return_value=fake_child,
+    ), patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        return_value={
+            "status": "completed",
+            "summary": "done",
+            "final_response": "done",
+            "usage": {},
+        },
     ):
         result = execute_worker_run(
             req, parent_agent=parent, cfg=load_orchestration_config({})
@@ -254,3 +273,307 @@ def test_executor_correlates_to_session_and_task():
     assert result.task_id == "task-42"
     assert result.correlation_id == "corr-42"
     assert result.child_session_id == "child-x"
+
+
+def test_default_family_alias_inherits_parent_model():
+    """Empty/unmapped family aliases must not become literal model IDs."""
+    import agent.orchestration.executor as executor_mod
+    from agent.orchestration.executor import execute_worker_run
+
+    parent = _parent()
+    req = WorkerRunRequest(
+        goal="quick task",
+        context="brief",
+        toolsets=("file",),
+        family=ModelFamily.LUNA,
+        reasoning=ReasoningEffort.LOW,
+        timeout_seconds=30,
+        correlation_id="corr-alias",
+        provider_alias="delegation",
+        model_alias="luna",
+        parent_session_id=parent.session_id,
+    )
+
+    fake_child = MagicMock()
+    fake_child.session_id = "child-alias"
+    fake_child._subagent_id = "sa-alias"
+    fake_child.enabled_toolsets = ["file"]
+    fake_child.model = "parent-model"
+    fake_child.provider = "openrouter"
+    fake_child.platform = "subagent"
+    fake_child._delegate_depth = 1
+    fake_child.run_conversation.return_value = {
+        "final_response": "ok",
+        "usage": {},
+    }
+
+    cfg = load_orchestration_config(
+        {
+            "orchestration": {
+                "enabled": True,
+                "mode": "active",
+                "model_aliases": {"luna": "", "terra": "", "sol": ""},
+            }
+        }
+    )
+
+    build_kwargs = {}
+
+    def capture_build(**kwargs):
+        build_kwargs.update(kwargs)
+        return fake_child
+
+    # Wire patch targets that the repaired executor must expose/use.
+    if not hasattr(executor_mod, "_build_child_preserving_parent_tools"):
+        executor_mod._build_child_preserving_parent_tools = executor_mod._build_child_agent
+    if not hasattr(executor_mod, "_run_child_lifecycle"):
+        def _legacy_lifecycle(task_index, goal, child=None, parent_agent=None, **kw):
+            return child.run_conversation(
+                user_message=goal, system_message=None, conversation_history=None
+            )
+
+        executor_mod._run_child_lifecycle = _legacy_lifecycle
+
+    with patch(
+        "agent.orchestration.executor.resolve_runtime_provider",
+        return_value={
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-resolved",
+            "source": "test",
+            "requested_provider": None,
+        },
+    ) as resolve_mock, patch(
+        "agent.orchestration.executor._build_child_agent",
+        side_effect=capture_build,
+    ), patch(
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
+        side_effect=capture_build,
+    ), patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        side_effect=lambda *a, **kw: {
+            "status": "completed",
+            "summary": "ok",
+            "final_response": "ok",
+            "usage": {},
+        },
+    ):
+        result = execute_worker_run(req, parent_agent=parent, cfg=cfg)
+
+    resolve_kwargs = resolve_mock.call_args.kwargs
+    assert resolve_kwargs.get("target_model") not in {"luna", "terra", "sol"}
+    model_arg = build_kwargs.get("model")
+    assert model_arg not in {"luna", "terra", "sol"}
+    assert model_arg in (None, "", parent.model, "parent-model")
+    assert result.model not in {"luna", "terra", "sol"}
+
+
+def test_executor_owns_complete_child_cleanup_and_parent_tool_preservation():
+    """Executor must reuse delegate lifecycle cleanup on all exit paths."""
+    import agent.orchestration.executor as executor_mod
+    from agent.orchestration.executor import execute_worker_run
+    import model_tools
+
+    parent = _parent()
+    parent._active_children = []
+    parent_tools_before = [{"type": "function", "function": {"name": "read_file"}}]
+    parent.tools = list(parent_tools_before)
+    saved_names = ["read_file", "web_search"]
+    model_tools._last_resolved_tool_names = list(saved_names)
+
+    req = WorkerRunRequest(
+        goal="cleanup contract",
+        context="brief",
+        toolsets=("file",),
+        family=ModelFamily.LUNA,
+        reasoning=ReasoningEffort.LOW,
+        timeout_seconds=30,
+        correlation_id="corr-clean",
+    )
+
+    events = []
+
+    fake_child = MagicMock()
+    fake_child.session_id = "child-clean"
+    fake_child._subagent_id = "sa-clean"
+    fake_child.enabled_toolsets = ["file"]
+    fake_child.model = "parent-model"
+    fake_child.provider = "openrouter"
+    fake_child.platform = "subagent"
+    fake_child._delegate_depth = 1
+    fake_child._delegate_saved_tool_names = list(saved_names)
+
+    def close_side_effect():
+        events.append("close")
+
+    fake_child.close.side_effect = close_side_effect
+
+    def lifecycle(task_index, goal, child=None, parent_agent=None, **kw):
+        events.append("lifecycle")
+        if parent_agent is not None and child in getattr(parent_agent, "_active_children", []):
+            parent_agent._active_children.remove(child)
+        model_tools._last_resolved_tool_names = list(
+            getattr(child, "_delegate_saved_tool_names", saved_names)
+        )
+        if hasattr(child, "close"):
+            child.close()
+        events.append("cleanup_done")
+        return {
+            "status": "completed",
+            "summary": "ok",
+            "final_response": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    cfg = load_orchestration_config({"orchestration": {"enabled": True, "mode": "active"}})
+    if not hasattr(executor_mod, "_build_child_preserving_parent_tools"):
+        executor_mod._build_child_preserving_parent_tools = executor_mod._build_child_agent
+    if not hasattr(executor_mod, "_run_child_lifecycle"):
+        executor_mod._run_child_lifecycle = lifecycle
+
+    with patch(
+        "agent.orchestration.executor.resolve_runtime_provider",
+        return_value={
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://x",
+            "api_key": "sk",
+            "source": "test",
+            "requested_provider": "openrouter",
+        },
+    ), patch(
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
+        return_value=fake_child,
+    ) as build_mock, patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        side_effect=lifecycle,
+    ) as life_mock:
+        result = execute_worker_run(req, parent_agent=parent, cfg=cfg)
+
+    assert build_mock.called, "must build via parent-tool-preserving seam"
+    assert life_mock.called, "must run via lifecycle-owned seam"
+    assert "lifecycle" in events and "cleanup_done" in events
+    assert events.count("close") == 1
+    assert model_tools._last_resolved_tool_names == saved_names
+    assert parent.tools == parent_tools_before
+    assert result.success is True
+
+    events.clear()
+
+    def boom(*a, **kw):
+        events.append("lifecycle")
+        raise RuntimeError("child exploded")
+
+    with patch(
+        "agent.orchestration.executor.resolve_runtime_provider",
+        return_value={
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://x",
+            "api_key": "sk",
+            "source": "test",
+            "requested_provider": "openrouter",
+        },
+    ), patch(
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
+        return_value=fake_child,
+    ), patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        side_effect=boom,
+    ):
+        result2 = execute_worker_run(req, parent_agent=parent, cfg=cfg)
+
+    assert result2.success is False
+    assert model_tools._last_resolved_tool_names == saved_names
+    assert parent.tools == parent_tools_before
+
+
+def test_executor_timeout_returns_within_deadline():
+    """Timeout must return within deadline + small tolerance; no orphan wait."""
+    import time
+    import agent.orchestration.executor as executor_mod
+    from agent.orchestration.executor import execute_worker_run
+
+    parent = _parent()
+    parent._active_children = []
+    req = WorkerRunRequest(
+        goal="hang",
+        context="brief",
+        toolsets=("file",),
+        family=ModelFamily.TERRA,
+        reasoning=ReasoningEffort.MEDIUM,
+        timeout_seconds=1,
+        correlation_id="corr-deadline",
+    )
+
+    fake_child = MagicMock()
+    fake_child.session_id = "child-deadline"
+    fake_child._subagent_id = "sa-deadline"
+    fake_child.enabled_toolsets = ["file"]
+    fake_child.model = "m"
+    fake_child.provider = "p"
+    fake_child.platform = "subagent"
+    fake_child._delegate_depth = 1
+    interrupted = {"count": 0}
+    cleaned = {"count": 0}
+
+    def interrupt():
+        interrupted["count"] += 1
+
+    fake_child.interrupt.side_effect = interrupt
+
+    def hang_run(**_kw):
+        try:
+            time.sleep(5)
+            return {"final_response": "late", "usage": {}}
+        finally:
+            cleaned["count"] += 1
+
+    fake_child.run_conversation.side_effect = hang_run
+
+    def hang_lifecycle(*a, **kw):
+        try:
+            time.sleep(5)
+            return {"status": "completed", "summary": "late"}
+        finally:
+            cleaned["count"] += 1
+
+    if not hasattr(executor_mod, "_build_child_preserving_parent_tools"):
+        executor_mod._build_child_preserving_parent_tools = executor_mod._build_child_agent
+    if not hasattr(executor_mod, "_run_child_lifecycle"):
+        executor_mod._run_child_lifecycle = hang_lifecycle
+
+    started = time.monotonic()
+    with patch(
+        "agent.orchestration.executor.resolve_runtime_provider",
+        return_value={
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://x",
+            "api_key": "sk",
+            "source": "test",
+            "requested_provider": "openrouter",
+        },
+    ), patch(
+        "agent.orchestration.executor._build_child_agent",
+        return_value=fake_child,
+    ), patch(
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
+        return_value=fake_child,
+    ), patch(
+        "agent.orchestration.executor._run_child_lifecycle",
+        side_effect=hang_lifecycle,
+    ), patch(
+        "agent.orchestration.executor._DEFAULT_POLL_S",
+        0.05,
+    ):
+        result = execute_worker_run(
+            req, parent_agent=parent, cfg=load_orchestration_config({})
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.5, f"returned too late: {elapsed:.2f}s"
+    assert result.timed_out is True or result.error_class == "timeout"
+    assert result.success is False
+    assert interrupted["count"] >= 1 or cleaned["count"] >= 1

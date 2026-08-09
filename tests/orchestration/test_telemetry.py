@@ -142,3 +142,93 @@ def test_persist_trace_writes_only_under_hermes_home(tmp_path, monkeypatch):
         __import__("agent.orchestration.telemetry", fromlist=["*"]),
         "emit_outbound",
     )
+
+
+def test_redacts_all_free_text_enforces_mode_off_and_applies_retention(
+    tmp_path, monkeypatch
+):
+    """Mode off never persists; free text is redacted; retention prunes."""
+    from agent.orchestration.telemetry import persist_trace, list_traces, prune_traces, load_trace
+    from hermes_constants import get_hermes_home
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    # Mode off + telemetry enabled must still create no orchestration activity
+    off_cfg = load_orchestration_config(
+        {
+            "orchestration": {
+                "enabled": True,
+                "mode": "off",
+                "telemetry": {"enabled": True, "retain_days": 14},
+            }
+        }
+    )
+    off_trace = ExecutionTrace(
+        correlation_id="c-off",
+        session_id="s",
+        task_id="t",
+        mode="off",
+        family=ModelFamily.LUNA,
+        reasoning=ReasoningEffort.LOW,
+        rule_ids=("R_MODE_OFF",),
+        schema_version="orch.task_spec.v1",
+        policy_version="orch.policy.v1",
+        prompt_version="orch.prompt.v1",
+        feedback="user said: please delete /secret/path and here is key sk-live-SECRET",
+        error_class="RuntimeError: full stack with /home/user/private/file.py",
+        escalation_reason="prior failure evidence: SELECT * FROM users WHERE ssn='123'",
+    )
+    assert persist_trace(off_trace, off_cfg) is None
+    assert list_traces(off_cfg) == []
+    assert not (get_hermes_home() / "orchestration" / "traces").exists() or list_traces(off_cfg) == []
+
+    shadow_cfg = load_orchestration_config(
+        {
+            "orchestration": {
+                "enabled": True,
+                "mode": "shadow",
+                "telemetry": {"enabled": True, "retain_days": 1, "store_raw_prompt": False},
+            }
+        }
+    )
+    path = persist_trace(off_trace, shadow_cfg)
+    # Re-use payload fields but persist under shadow mode for redaction checks
+    redacted_trace = ExecutionTrace(
+        correlation_id="c-redact",
+        session_id="s",
+        task_id="t",
+        mode="shadow",
+        family=ModelFamily.TERRA,
+        reasoning=ReasoningEffort.MEDIUM,
+        rule_ids=("R_MODE_SHADOW",),
+        schema_version="orch.task_spec.v1",
+        policy_version="orch.policy.v1",
+        prompt_version="orch.prompt.v1",
+        feedback="user said: please delete /secret/path and here is key sk-live-SECRET",
+        error_class="RuntimeError: full stack with /home/user/private/file.py",
+        escalation_reason="prior failure evidence: SELECT * FROM users WHERE ssn='123'",
+    )
+    path = persist_trace(redacted_trace, shadow_cfg)
+    assert path is not None
+    loaded = load_trace(path)
+    blob = json.dumps(loaded)
+    assert "sk-live-SECRET" not in blob
+    assert "/secret/path" not in blob
+    assert "SELECT * FROM users" not in blob
+    assert "/home/user/private/file.py" not in blob
+    # Allowlisted structured fields remain
+    assert loaded["correlation_id"] == "c-redact"
+    assert loaded["family"] == "TERRA"
+    # Free-text fields must be redacted/digested, not raw
+    for key in ("feedback", "error_class", "escalation_reason"):
+        val = loaded.get(key)
+        if val is not None:
+            assert isinstance(val, str)
+            assert "SECRET" not in val
+            assert "SELECT" not in val
+
+    removed = prune_traces(shadow_cfg, now_ts=10**12)
+    assert removed >= 1
+    assert list_traces(shadow_cfg) == []
