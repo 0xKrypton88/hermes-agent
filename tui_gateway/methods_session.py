@@ -502,6 +502,7 @@ def _(rid, params: dict) -> dict:
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
+            _restore_pending_async_delegations(sid, record)
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
             child_running = _child_run_active(target)
@@ -602,6 +603,7 @@ def _(rid, params: dict) -> dict:
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
 
+            _restore_pending_async_delegations(sid, record)
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
@@ -819,6 +821,8 @@ def _(rid, params: dict) -> dict:
         if owns_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+    if session:
+        _restore_pending_async_delegations(sid, session)
     auto_continue = (
         _maybe_schedule_auto_continue(sid, session, target) if session else None
     )

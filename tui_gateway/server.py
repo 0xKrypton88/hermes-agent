@@ -658,6 +658,11 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+_NON_CANCELLING_SESSION_END_REASONS = frozenset(
+    {"ws_disconnect", "ws_orphan_reap", "idle_timeout", "lru_evict"}
+)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -760,33 +765,33 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
-    # A session's in-flight async delegations end WITH the session (#55578):
-    # once nobody owns the return address, a still-running background subagent
-    # can only burn tokens and park an orphaned completion on the shared
-    # queue. Always interrupt delegations commissioned by THIS live UI session
-    # (its sid); additionally interrupt by durable session_key, but only when
-    # the TUI owns the lifecycle — closing a viewer tab on a live gateway
-    # session must not kill the gateway's own background work.
-    try:
-        from tools.async_delegation import interrupt_for_session
+    # Explicit user/session boundaries end their in-flight delegations (#55578).
+    # Automatic transport/retention cleanup only releases the runtime wrapper:
+    # durable delegation work and its completion survive for a later reattach.
+    # Explicit boundaries interrupt work commissioned by THIS live UI session
+    # (its sid), plus the durable session_key when the TUI owns the lifecycle;
+    # a viewer tab on a live gateway session never owns that durable lifecycle.
+    if end_reason not in _NON_CANCELLING_SESSION_END_REASONS:
+        try:
+            from tools.async_delegation import interrupt_for_session
 
-        _own_sid = str(session.get("_sid") or "")
-        if not _own_sid:
-            try:
-                with _sessions_lock:
-                    for _cand_sid, _cand in _sessions.items():
-                        if _cand is session:
-                            _own_sid = _cand_sid
-                            break
-            except Exception:
-                _own_sid = ""
-        interrupt_for_session(
-            session_key=str(session_key or "") if _tui_owns_lifecycle else "",
-            origin_ui_session_id=_own_sid,
-            reason=end_reason,
-        )
-    except Exception:
-        pass
+            _own_sid = str(session.get("_sid") or "")
+            if not _own_sid:
+                try:
+                    with _sessions_lock:
+                        for _cand_sid, _cand in _sessions.items():
+                            if _cand is session:
+                                _own_sid = _cand_sid
+                                break
+                except Exception:
+                    _own_sid = ""
+            interrupt_for_session(
+                session_key=str(session_key or "") if _tui_owns_lifecycle else "",
+                origin_ui_session_id=_own_sid,
+                reason=end_reason,
+            )
+        except Exception:
+            pass
 
     # Close the slash-worker subprocess as part of finalize itself, not just
     # in the callers. Defense-in-depth: every session-end path goes through
@@ -941,7 +946,53 @@ def _close_session_by_id(
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
+def _restore_pending_async_delegations(sid: str, session: dict) -> int:
+    """Requeue this reattached session's durable pending completions."""
+    if session.get("_finalized") or _transport_is_dead(session.get("transport")):
+        return 0
+
+    home_token = None
+    try:
+        from tools.async_delegation import restore_undelivered_completions
+        from tools.process_registry import process_registry
+
+        keys = {
+            str(session.get("session_key") or ""),
+            str(_session_lookup_key(session, fallback=sid) or ""),
+        }
+        keys.discard("")
+        profile_home = session.get("profile_home")
+        if profile_home:
+            home_token = set_hermes_home_override(str(profile_home))
+        with _session_db(session) as db:
+
+            def _resolve_key(key: str) -> str:
+                if db is None:
+                    return key
+                try:
+                    return str(db.resolve_resume_session_id(key) or key)
+                except Exception:
+                    return key
+
+            return restore_undelivered_completions(
+                process_registry.completion_queue,
+                origin_ui_session_id=sid,
+                session_keys=keys,
+                key_resolver=_resolve_key,
+            )
+    except Exception:
+        logger.warning(
+            "Could not restore async delegation completions for session %s",
+            sid,
+            exc_info=True,
+        )
+        return 0
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _ws_session_is_orphaned(session: dict | None, sid: str = "") -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
     After ``handle_ws`` detaches a disconnected client it points the session at
@@ -951,6 +1002,14 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    if not sid:
+        with _sessions_lock:
+            sid = next(
+                (key for key, candidate in _sessions.items() if candidate is session),
+                "",
+            )
+    if _session_has_active_delegations(sid, session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -1051,19 +1110,23 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # mutual exclusion against _init_session / _close_session_by_id, which
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        reschedule = False
         session = None
         with _session_resume_lock:
-            current = _sessions.get(sid)
-            if not _ws_session_is_orphaned(current):
+            candidate = _sessions.get(sid)
+            # Detached sessions with live async work stay parked until the
+            # background child settles; reschedule rather than treating the
+            # active-delegation guard as "not orphaned" (which would drop the
+            # reap forever).
+            if (
+                candidate
+                and candidate.get("transport") is _detached_ws_transport
+                and _session_has_active_delegations(sid, candidate)
+            ):
+                _schedule_ws_orphan_reap(sid)
                 return
-            if _session_has_active_delegations(sid, current):
-                reschedule = True
-            else:
-                session = _pop_session_by_id(sid)
-        if reschedule:
-            _schedule_ws_orphan_reap(sid)
-            return
+            if not _ws_session_is_orphaned(candidate, sid):
+                return
+            session = _pop_session_by_id(sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
@@ -8477,6 +8540,8 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+    if transport is not None:
+        _restore_pending_async_delegations(sid, session)
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
@@ -9289,6 +9354,8 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     chat (#55578).
     """
     if session.get("_finalized"):
+        return False
+    if _transport_is_dead(session.get("transport")):
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
