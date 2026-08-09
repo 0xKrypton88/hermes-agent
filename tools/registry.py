@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +424,10 @@ class ToolRegistry:
         self._plugin_override_policy: Dict[str, bool] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Registry-owned risk / side-effect metadata (Adaptive Orchestrator V1).
+        # Kept as a separate map so ToolEntry stays stable for existing callers.
+        # Values are opaque objects owned by agent.orchestration.tool_policy.
+        self._risk_metadata: Dict[str, Any] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -472,6 +476,17 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def set_risk_metadata(self, name: str, meta: Any) -> None:
+        """Attach registry-owned risk/side-effect metadata for *name*."""
+        with self._lock:
+            self._risk_metadata[name] = meta
+            self._generation += 1
+
+    def get_risk_metadata(self, name: str) -> Any:
+        """Return registry-owned risk metadata for *name*, or None."""
+        with self._lock:
+            return self._risk_metadata.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -573,6 +588,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        risk_metadata: Any = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -581,6 +597,10 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``risk_metadata`` is optional declarative side-effect/risk metadata
+        (Adaptive Orchestrator V1). Callers omitting it remain valid; defaults
+        may be attached later via ``attach_default_risk_metadata``.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -633,6 +653,8 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
+            if risk_metadata is not None:
+                self._risk_metadata[name] = risk_metadata
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which

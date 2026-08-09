@@ -213,6 +213,15 @@ def _run_async(coro):
 
 discover_builtin_tools()
 
+# Adaptive Orchestrator V1 — install declarative default risk metadata for
+# production tools so destructive/financial paths reach approval enforcement.
+try:
+    from agent.orchestration.tool_policy import attach_default_risk_metadata
+
+    attach_default_risk_metadata(registry)
+except Exception:
+    logger.debug("orchestration default risk metadata attach skipped", exc_info=True)
+
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
 # internally uses a blocking future.result(timeout=120) wait, and the
@@ -1401,6 +1410,71 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+        # Adaptive Orchestrator V1 — authoritative pre-dispatch policy gate.
+        # Must digest the *final* args that reach registry.dispatch: after
+        # execution middleware replacement and immediately before dispatch.
+        # Evaluation errors fail closed (block dispatch).
+
+        def _orch_policy_block(next_args: Dict[str, Any]):
+            from agent.orchestration.tool_policy import check_active_policy_or_none
+
+            try:
+                decision = check_active_policy_or_none(
+                    registry,
+                    function_name,
+                    next_args,
+                    session_id=session_id or "",
+                    turn_id=turn_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+            except Exception as _orch_err:
+                logger.debug("orchestration policy check error: %s", _orch_err)
+                block_msg = (
+                    f"Orchestration policy blocked '{function_name}': "
+                    "POLICY_EVALUATION_ERROR"
+                )
+                result = tool_error(block_msg)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=next_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="orchestration_policy",
+                    error_message=block_msg,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
+
+            if decision is not None and not decision.allowed:
+                block_msg = (
+                    f"Orchestration policy blocked '{function_name}': "
+                    f"{decision.reason_code}"
+                )
+                if decision.requires_approval:
+                    block_msg += " (approval required)"
+                result = tool_error(block_msg)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=next_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="orchestration_policy",
+                    error_message=block_msg,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
+            return None
+
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
@@ -1427,6 +1501,9 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    blocked = _orch_policy_block(next_args)
+                    if blocked is not None:
+                        return blocked
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1435,6 +1512,9 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    blocked = _orch_policy_block(next_args)
+                    if blocked is not None:
+                        return blocked
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
