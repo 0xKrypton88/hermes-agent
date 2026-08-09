@@ -12,6 +12,7 @@ import {
   $currentModel,
   $currentProvider,
   $currentReasoningEffort,
+  $currentReasoningMode,
   $messages,
   $selectedStoredSessionId
 } from '@/store/session'
@@ -53,6 +54,7 @@ export interface SessionView {
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
+  $reasoningMode: ReadableAtom<'auto' | 'inherit' | 'manual'>
 }
 
 /** The active session's own slice, or `undefined` while it's a draft. */
@@ -88,6 +90,10 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $model: primaryField<string>(state => state.model, $currentModel),
   $provider: primaryField<string>(state => state.provider, $currentProvider),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
+  $reasoningMode: primaryField<'auto' | 'inherit' | 'manual'>(
+    state => state.reasoningMode ?? 'inherit',
+    $currentReasoningMode
+  ),
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId
 }

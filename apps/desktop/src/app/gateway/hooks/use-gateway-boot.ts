@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { createGatewayOpenEpochHandler, reattachLiveGatewaySessions } from '@/lib/live-session-reattach'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import {
   $desktopBoot,
@@ -382,9 +383,15 @@ export function useGatewayBoot({
     callbacksRef.current.onGatewayReady(gateway)
     setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
     // Secondary (background-profile) sockets funnel into the same handler.
-    configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
+    configureGatewayRegistry({
+      onEvent: event => callbacksRef.current.handleGatewayEvent(event),
+      onOpen: profileGateway => reattachLiveGatewaySessions(profileGateway)
+    })
+
+    const handlePrimaryOpenEpoch = createGatewayOpenEpochHandler(() => reattachLiveGatewaySessions(gateway))
 
     const offState = gateway.onState(st => {
+      handlePrimaryOpenEpoch(st)
       // Mirror to the composer only while the primary is the active profile —
       // a background secondary reconnect mustn't flip the foreground state.
       reportPrimaryGatewayState(st)

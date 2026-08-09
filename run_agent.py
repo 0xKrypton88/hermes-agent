@@ -665,6 +665,14 @@ class AIAgent:
                 profile_name=_profile_for_session,
             )
             self._session_db_created = True
+            # Deterministic launch seed (PROJECT/AREA) must persist before any
+            # one-shot process exit — never rely on the async LLM title daemon.
+            try:
+                from agent.session_title_meta import seed_launch_title_from_env
+
+                seed_launch_title_from_env(self._session_db, self.session_id)
+            except Exception:
+                logger.debug("Launch title seed skipped", exc_info=True)
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.

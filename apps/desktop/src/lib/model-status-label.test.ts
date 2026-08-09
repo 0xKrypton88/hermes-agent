@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { currentPickerSelection, displayModelName, formatModelStatusLabel } from './model-status-label'
+import {
+  currentPickerSelection,
+  displayModelName,
+  formatAdaptiveReasoningStatusLabel,
+  formatModelStatusLabel
+} from './model-status-label'
 import { reasoningEffortLabel } from './reasoning-effort'
 
 describe('model-status-label', () => {
@@ -44,6 +49,11 @@ describe('model-status-label', () => {
 
   it('returns just the placeholder name when there is no model', () => {
     expect(formatModelStatusLabel('')).toBe('No model')
+  })
+
+  it('formats adaptive Auto status with route or decided effort', () => {
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', '')).toBe('GPT-5.6 Sol · Auto')
+    expect(formatAdaptiveReasoningStatusLabel('gpt-5.6-sol', 'high')).toBe('High · Auto')
   })
 
   describe('currentPickerSelection', () => {

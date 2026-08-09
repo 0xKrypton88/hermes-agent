@@ -11,11 +11,14 @@ import {
   $busy,
   $messages,
   setActiveSessionStoredIdRotation,
+  setCurrentAdaptivePolicyVersion,
   setCurrentFastMode,
   setCurrentModel,
   setCurrentPersonality,
   setCurrentProvider,
   setCurrentReasoningEffort,
+  setCurrentReasoningMode,
+  setCurrentReasoningReason,
   setCurrentServiceTier,
   setTurnStartedAt,
   setYoloActive
@@ -39,6 +42,9 @@ function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
   setCurrentReasoningEffort(state.reasoningEffort ?? '')
+  setCurrentReasoningMode(state.reasoningMode ?? 'inherit')
+  setCurrentReasoningReason(state.reasoningReason ?? '')
+  setCurrentAdaptivePolicyVersion(state.adaptivePolicyVersion ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')
   setCurrentFastMode(state.fast ?? false)
   setYoloActive(state.yolo ?? false)

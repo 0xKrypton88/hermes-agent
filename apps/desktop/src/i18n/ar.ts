@@ -2045,6 +2045,7 @@ export const ar = defineLocale({
       thinking: 'التفكير',
       fast: 'سريع',
       effort: 'الجهد',
+      auto: 'تلقائي',
       minimal: 'أدنى',
       low: 'منخفض',
       medium: 'متوسط',

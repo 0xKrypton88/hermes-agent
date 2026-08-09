@@ -20,8 +20,14 @@ Covers the "desktop reverts thinking to medium after one turn" report:
 
 from __future__ import annotations
 
+import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
+
+os.environ.setdefault(
+    "HERMES_HOME", os.path.join(tempfile.gettempdir(), "hermes-reasoning-scope-tests")
+)
 
 import tui_gateway.server as server
 from tui_gateway.server import _session_info
@@ -72,8 +78,25 @@ class TestConfigSetReasoningSessionScope:
             )
         assert resp["result"]["value"] == "none"
         assert agent.reasoning_config == {"enabled": False}
+        assert session["reasoning_mode"] == "manual"
+        assert session["reasoning_floor"] == "none"
         write_key.assert_not_called()
 
+    def test_session_scoped_set_updates_create_override_for_lazy_session(self) -> None:
+        session = {"session_key": "k1", "agent": None}
+        with patch.dict(server._sessions, {"s1": session}, clear=False), \
+                patch.object(server, "_write_config_key") as write_key:
+            resp = self._dispatch(
+                {"key": "reasoning", "session_id": "s1", "value": "high"}
+            )
+        assert resp["result"]["value"] == "high"
+        assert session["create_reasoning_override"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+        assert session["reasoning_mode"] == "manual"
+        assert session["reasoning_floor"] == "high"
+        write_key.assert_not_called()
 
     def test_no_session_persists_globally(self) -> None:
         with patch.object(server, "_write_config_key") as write_key:

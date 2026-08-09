@@ -6015,6 +6015,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         title: str,
         *,
         source: str,
+        title_meta: Optional[Dict[str, Any]] = None,
+        clear_meta: bool = False,
+        allow_same_rank: bool = False,
     ) -> bool:
         """Write a title, enforcing provenance precedence.
 
@@ -6024,7 +6027,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         stored title has strictly lower authority, so the instant ``derived``
         title upgrades to ``llm`` exactly once and neither can ever overwrite a
         name the user typed. Re-running the titler on an already-``llm`` row is
-        a no-op, which is what stops a session renaming itself.
+        a no-op by default (``allow_same_rank=False``), which is what stops a
+        session renaming itself. Meta-aware adaptive writers pass
+        ``allow_same_rank=True`` so an ``llm`` title can refresh AREA/suffix
+        while still never beating a ``user`` lock.
 
         The read and the write are one compare-and-swap inside a single
         transaction, so a manual ``/title`` racing an in-flight generation
@@ -6033,17 +6039,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         title = self.sanitize_title(title)
         is_user = source == self.TITLE_SOURCE_USER
         new_rank = self._title_rank(source) if not is_user else None
+        title_source = source if title else None
+        meta_json = None
+        touch_meta = False
+        if title and title_meta is not None:
+            meta_json = json.dumps(title_meta, ensure_ascii=False, separators=(",", ":"))
+            touch_meta = True
+        elif not title or clear_meta:
+            meta_json = None
+            touch_meta = True
+            clear_meta = True
 
         def _do(conn):
             current = conn.execute(
-                "SELECT title, title_source FROM sessions WHERE id = ?",
+                "SELECT title, title_source, title_meta FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if current is None:
                 return 0
             if not is_user and current["title"] is not None:
-                if self._title_rank(current["title_source"]) >= new_rank:
+                current_rank = self._title_rank(current["title_source"])
+                if current_rank > new_rank:
                     return 0
+                if current_rank == new_rank and not allow_same_rank:
+                    return 0
+                if current_rank == new_rank and allow_same_rank:
+                    # Same-rank refresh: no-op when neither title nor meta changes.
+                    if current["title"] == title:
+                        if not touch_meta:
+                            return 0
+                        if meta_json is not None and current["title_meta"] == meta_json:
+                            return 0
+                        if meta_json is None and clear_meta and current["title_meta"] is None:
+                            return 0
 
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
@@ -6069,7 +6097,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         conn, ancestor_id=conflict_id, descendant_id=session_id
                     ):
                         conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
+                            "UPDATE sessions SET title = NULL, title_source = NULL, "
+                            "title_meta = NULL WHERE id = ?",
                             (conflict_id,),
                         )
                     else:
@@ -6079,17 +6108,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Compare-and-swap on the exact values we just read (``IS`` is
             # NULL-safe in SQLite), so a concurrent write between the SELECT
             # and here loses instead of being silently overwritten.
-            cursor = conn.execute(
-                "UPDATE sessions SET title = ?, title_source = ? "
-                "WHERE id = ? AND title IS ? AND title_source IS ?",
-                (
-                    title,
-                    source if title else None,
-                    session_id,
-                    current["title"],
-                    current["title_source"],
-                ),
-            )
+            if touch_meta:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ?, title_meta = ? "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        title,
+                        title_source,
+                        meta_json if title else None,
+                        session_id,
+                        current["title"],
+                        current["title_source"],
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        title,
+                        title_source,
+                        session_id,
+                        current["title"],
+                        current["title_source"],
+                    ),
+                )
             return cursor.rowcount
 
         rowcount = self._execute_write(_do)
@@ -6101,24 +6144,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (clearing the title).
+        Empty/whitespace-only strings are normalized to None (clearing the
+        title, provenance, and title metadata), which deliberately unlocks
+        automatic titling again.
 
         This records ``user`` provenance, so auto-titling will never replace
         the result. Automatic callers must use :meth:`set_auto_title`.
         """
         return self._set_session_title(
-            session_id, title, source=self.TITLE_SOURCE_USER
+            session_id,
+            title,
+            source=self.TITLE_SOURCE_USER,
+            clear_meta=True,
         )
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
         """Set an automatically generated title, honoring provenance precedence.
 
         Returns True when the title was written, False when a higher-authority
-        title already holds the row (nothing is modified in that case).
+        (or same-authority) title already holds the row. Same-rank refreshes
+        that also carry structured metadata must use
+        :meth:`set_auto_title_with_meta`.
         """
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
+
+    def set_auto_title_with_meta(
+        self,
+        session_id: str,
+        title: str,
+        title_meta: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Atomically write an ``llm`` title together with neutral title metadata.
+
+        Same-rank ``llm`` refreshes are allowed when the visible title or the
+        serialized meta actually changes; ``user`` locks and legacy
+        NULL-source titles still fail closed.
+        """
+        return self._set_session_title(
+            session_id,
+            title,
+            source=self.TITLE_SOURCE_LLM,
+            title_meta=title_meta,
+            clear_meta=title_meta is None,
+            allow_same_rank=True,
+        )
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Back-compat shim: set an LLM title only if nothing better exists.
@@ -6130,6 +6201,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self.set_auto_title(
             session_id, title, source=self.TITLE_SOURCE_LLM
         )
+
+    def inherit_session_title(
+        self, source_session_id: str, target_session_id: str
+    ) -> bool:
+        """Move a compression predecessor's exact title/provenance/meta to its child.
+
+        Clears the parent's title fields so the unique alias transfers cleanly.
+        Returns False when the pair is not a compression edge, either side is
+        missing, the parent is untitled, or the child already has a title.
+        """
+        if (
+            not source_session_id
+            or not target_session_id
+            or source_session_id == target_session_id
+        ):
+            return False
+
+        def _do(conn):
+            if not self._is_compression_ancestor(
+                conn,
+                ancestor_id=source_session_id,
+                descendant_id=target_session_id,
+            ):
+                return 0
+            source_row = conn.execute(
+                "SELECT title, title_source, title_meta FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            target_row = conn.execute(
+                "SELECT title FROM sessions WHERE id = ?",
+                (target_session_id,),
+            ).fetchone()
+            if source_row is None or target_row is None or not source_row["title"]:
+                return 0
+            if target_row["title"] is not None:
+                return 0
+            conn.execute(
+                "UPDATE sessions SET title = NULL, title_source = NULL, "
+                "title_meta = NULL WHERE id = ?",
+                (source_session_id,),
+            )
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ?, title_meta = ? "
+                "WHERE id = ?",
+                (
+                    source_row["title"],
+                    source_row["title_source"],
+                    source_row["title_meta"],
+                    target_session_id,
+                ),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -6151,6 +6276,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not row or row["title"] is None:
             return None
         return row["title_source"]
+
+    def get_session_title_meta(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return structured title metadata, or None when unset/invalid."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title_meta FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if not row or row["title_meta"] is None:
+            return None
+        raw = row["title_meta"]
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def set_session_title_meta(
+        self, session_id: str, title_meta: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Overwrite title_meta without changing title/title_source."""
+        meta_json = (
+            json.dumps(title_meta, ensure_ascii=False, separators=(",", ":"))
+            if title_meta is not None
+            else None
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title_meta = ? WHERE id = ?",
+                (meta_json, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def set_session_title_source(self, session_id: str, source: str) -> bool:
         """Overwrite a title's provenance without touching the title text.

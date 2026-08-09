@@ -519,6 +519,32 @@ class PluginContext:
         entry = entries.get(plugin_id) or {}
         return bool(entry.get("allow_tool_override", False))
 
+    # -- session title metadata ---------------------------------------------
+
+    def apply_session_title_metadata(
+        self,
+        session_db,
+        session_id: str,
+        verified: dict,
+        *,
+        requested: dict | None = None,
+    ) -> str | None:
+        """Apply verified executor/model suffix metadata to a session title.
+
+        Narrow generic plugin API for the neutral session-title contract.
+        Only the ``verified`` envelope is written; ``requested`` values are
+        ignored. PROJECT/AREA in either mapping cannot replace launch-owned
+        identity. Returns the persisted title, or ``None`` when locked/invalid.
+        """
+        from agent.session_title_meta import apply_verified_session_title_metadata
+
+        return apply_verified_session_title_metadata(
+            session_db,
+            session_id,
+            verified,
+            requested=requested,
+        )
+
     # -- message injection --------------------------------------------------
 
     def inject_message(self, content: str, role: str = "user") -> bool:

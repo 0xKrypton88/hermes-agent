@@ -455,6 +455,7 @@ class _FolderIndex:
     """
 
     def __init__(self, projects: list[dict]) -> None:
+        self._by_id = {project["id"]: project for project in projects if project.get("id")}
         self._by_path: dict[str, tuple[dict, int]] = {}
         for project in projects:
             for folder in project.get("folders") or []:
@@ -478,12 +479,24 @@ class _FolderIndex:
                 return hit
         return None, -1
 
+    def by_id(self, project_id: str) -> Optional[dict]:
+        return self._by_id.get(project_id)
+
 
 def _project_for_path(index: _FolderIndex, target: str) -> Optional[dict]:
     return index.match(target)[0]
 
 
 def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[Resolve]) -> Optional[dict]:
+    # A persisted assignment is product identity, not workspace identity. It
+    # wins before cwd matching while the project remains active; the repo/lane
+    # builder below still uses the session's real cwd, preserving worktree UI.
+    assignment = session.get("project_assignment") or {}
+    assigned_id = str(assignment.get("project_id") or "").strip()
+    assigned = index.by_id(assigned_id) if assigned_id else None
+    if assigned is not None:
+        return assigned
+
     cwd = (session.get("cwd") or "").strip()
     if not cwd:
         return None
@@ -498,6 +511,14 @@ def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[R
             best_len = length
             best = match
     return best
+
+
+def _is_locked_outside_active_projects(session: dict, index: _FolderIndex) -> bool:
+    assignment = session.get("project_assignment") or {}
+    if not bool(assignment.get("locked")):
+        return False
+    project_id = assignment.get("project_id")
+    return not project_id or index.by_id(str(project_id)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +595,11 @@ def build_tree(
 
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
+    locked_unowned: list[dict] = []
     for session in sessions:
+        if _is_locked_outside_active_projects(session, folder_index):
+            locked_unowned.append(session)
+            continue
         owner = _project_for_session(session, folder_index, resolve)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
@@ -621,7 +646,7 @@ def build_tree(
     # prevents upgrades from flattening those sessions into Recents.
     by_auto_root: dict[str, dict] = {}
     # Every session no tier could place. These are the Home bucket's rows.
-    homeless: list[dict] = []
+    homeless: list[dict] = list(locked_unowned)
 
     def _add_auto(root: str, session: dict) -> None:
         key = _path_key(root)

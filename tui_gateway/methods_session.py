@@ -42,19 +42,37 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
-    # The desktop composer owns its model/effort/fast as plain UI state and ships
-    # it on every session.create. Honor each as a PER-SESSION override (built into
-    # the agent below) — never a global config write, so picking a model/effort
-    # for a new chat can't mutate the profile default. provider is optional
-    # (resolved at build).
+    # The desktop composer owns model/effort/fast as per-session state. Adaptive
+    # reasoning adds an independent source mode; Auto is accepted only when the
+    # opt-in backend policy is enabled and then fixes the runtime identity.
+    raw_reasoning_mode = str(params.get("reasoning_mode") or "").strip().lower()
+    if raw_reasoning_mode and raw_reasoning_mode not in _ADAPTIVE_REASONING_MODES:
+        return _err(rid, 4002, f"unknown reasoning_mode: {raw_reasoning_mode}")
+    effort = str(params.get("reasoning_effort") or "").strip()
+    adaptive_policy = _adaptive_reasoning_config()
+    if raw_reasoning_mode == "auto" and adaptive_policy.get("enabled"):
+        reasoning_mode = "auto"
+    elif raw_reasoning_mode == "manual":
+        reasoning_mode = "manual"
+    elif not raw_reasoning_mode and effort:
+        # Backward compatibility for clients predating reasoning_mode.
+        reasoning_mode = "manual"
+    else:
+        reasoning_mode = "inherit"
+
     create_model = str(params.get("model") or "").strip()
+    if reasoning_mode == "auto":
+        create_model = str(adaptive_policy["model"])
+        create_provider = str(adaptive_policy["provider"])
+    else:
+        create_provider = str(params.get("provider") or "").strip()
     session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+        {"model": create_model, "provider": create_provider or None}
         if create_model
         else None
     )
     create_reasoning_override = None
-    if effort := str(params.get("reasoning_effort") or "").strip():
+    if effort and reasoning_mode != "auto":
         try:
             from hermes_constants import parse_reasoning_effort
 
@@ -94,6 +112,11 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "reasoning_mode": reasoning_mode,
+            "reasoning_floor": (
+                effort.lower() if reasoning_mode == "manual" and effort else None
+            ),
+            "adaptive_reasoning_decision": None,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -146,6 +169,10 @@ def _(rid, params: dict) -> dict:
                     if session_model_override and session_model_override.get("provider")
                     else {}
                 ),
+                "reasoning_mode": reasoning_mode,
+                "reasoning_effort": "" if reasoning_mode == "auto" else effort.lower(),
+                "reasoning_reason": "",
+                "adaptive_policy_version": "",
                 "tools": {},
                 "skills": {},
                 "cwd": _sessions[sid]["cwd"],
@@ -475,6 +502,7 @@ def _(rid, params: dict) -> dict:
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
+            _restore_pending_async_delegations(sid, record)
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
             child_running = _child_run_active(target)
@@ -569,11 +597,13 @@ def _(rid, params: dict) -> dict:
                 display_history_prefix=prefix,
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
+                adaptive_reasoning_state=overrides.get("adaptive_reasoning_state"),
                 resume_runtime_overrides=overrides or None,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
 
+            _restore_pending_async_delegations(sid, record)
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
@@ -590,6 +620,7 @@ def _(rid, params: dict) -> dict:
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
                     profile=profile,
+                    adaptive_reasoning_state=overrides.get("adaptive_reasoning_state"),
                 ),
                 "inflight": None,
                 "running": False,
@@ -748,6 +779,10 @@ def _(rid, params: dict) -> dict:
                         _sessions[sid]["model_override"] = stored_runtime_overrides[
                             "model_override"
                         ]
+                    _apply_adaptive_reasoning_state(
+                        _sessions[sid],
+                        stored_runtime_overrides.get("adaptive_reasoning_state"),
+                    )
                     _sessions[sid]["display_history_prefix"] = display_history_prefix
                     # Remember the profile home so each turn re-binds HERMES_HOME (the
                     # agent persists to its own db, but mid-turn home reads — memory,
@@ -786,6 +821,8 @@ def _(rid, params: dict) -> dict:
         if owns_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+    if session:
+        _restore_pending_async_delegations(sid, session)
     auto_continue = (
         _maybe_schedule_auto_continue(sid, session, target) if session else None
     )
