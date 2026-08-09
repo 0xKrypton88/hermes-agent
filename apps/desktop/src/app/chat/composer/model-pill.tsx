@@ -12,7 +12,12 @@ import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
 import { formatAdaptiveReasoningStatusLabel, formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
-import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
+import {
+  $currentModelSource,
+  $currentReasoningMode,
+  $defaultReasoningEffort,
+  setModelPickerOpen
+} from '@/store/session'
 
 import { onComposerModelMenuRequest } from './focus'
 import { useComposerScope } from './scope'
@@ -50,7 +55,9 @@ export function ModelPill({
   const currentProvider = model.provider || viewProvider
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
-  const reasoningMode = useStore(view.$reasoningMode)
+  // Fall back to the draft atom when a SessionView mock/older tile omits the
+  // field — Auto status must never crash the chat bar.
+  const reasoningMode = useStore(view.$reasoningMode ?? $currentReasoningMode)
   const modelSource = useStore($currentModelSource)
   const defaultEffort = useStore($defaultReasoningEffort)
   const runtimeId = useStore(view.$runtimeId)

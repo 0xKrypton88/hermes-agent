@@ -109,7 +109,7 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
       reasoningMode: 'manual'
     })
 
-    fireEvent.click(screen.getByRole('radio', { name: 'Auto' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Auto' }))
 
     expect(onSetOptions).toHaveBeenCalledWith({ reasoningMode: 'auto' })
   })
