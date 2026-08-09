@@ -2119,12 +2119,23 @@ def compress_context(
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
-                    # Auto-number the title for the continuation session
+                    # Preserve the exact visible title and its provenance on the
+                    # live continuation. The store moves the unique alias off the
+                    # hidden predecessor atomically, so auto titles remain
+                    # adaptive and manual/legacy titles remain locked.
                     if old_title:
                         try:
-                            new_title = agent._session_db.get_next_title_in_lineage(old_title)
-                            agent._session_db.set_session_title(agent.session_id, new_title)
-                        except (ValueError, Exception) as e:
+                            inherit_title = getattr(
+                                agent._session_db, "inherit_session_title", None
+                            )
+                            if callable(inherit_title):
+                                inherit_title(old_session_id, agent.session_id)
+                            else:
+                                # Compatibility for third-party state proxies
+                                # that predate title provenance.
+                                new_title = agent._session_db.get_next_title_in_lineage(old_title)
+                                agent._session_db.set_session_title(agent.session_id, new_title)
+                        except Exception as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
                 # In-place mode still updates/replaces the current row here.

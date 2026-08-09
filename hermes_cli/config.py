@@ -1723,6 +1723,8 @@ DEFAULT_CONFIG = {
         },
         "title_generation": {
             "enabled": True,
+            "style": "descriptive",  # descriptive | project_area
+            "mode": "initial",        # initial | adaptive
             "provider": "auto",
             "model": "",
             "base_url": "",

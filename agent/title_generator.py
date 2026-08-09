@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -40,22 +41,44 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
 )
 
 _PROJECT_AREA_PROMPT = (
-    "Generate a short session title using exactly this format: PROJECT - AREA. "
+    "Generate a short session title using exactly this format: PROJECT - AREA, or "
+    "PROJECT - AREA · EXECUTOR [MODEL] when an external or headless coding executor is "
+    "explicitly supported by the supplied context. "
     "PROJECT is the stable product, system, or repository name; preserve canonical spelling "
-    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase. "
+    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase that "
+    "names the work surface and target, not an implementation action or result. Prefer durable "
+    "labels that make the exact operating context obvious, for example Hermes - Balance Codex "
+    "rather than Hermes - Automatisk failover, and MCC - Agent Sessions rather than Hermes - "
+    "Sessionsarkivering. Add the optional executor suffix when explicitly supported and append "
+    "its model only when that model is also explicit, for example QuantCore - BTC Scalper · "
+    "Cursor or QuantCore - BTC Scalper · Cursor Grok 4.5. Never guess an executor or model. "
+    "When the request concerns the Hermes app or framework itself — including its session "
+    "titles, sidebar, agents, tools, gateway, or desktop client — use Hermes as PROJECT. "
+    "Never promote a task-shape word such as Prompt, Megaprompt, Session, or Workflow to PROJECT. "
     "Use the user's language for ordinary words, but preserve established project names and "
-    "English technical terms. Keep the complete title at 40 characters or fewer. "
+    "English technical terms. Keep the complete title at 56 characters or fewer. "
     "Never use prompt-like prefixes such as Help with, Hjälp med, I want, Jag vill, Review, "
     "Granska, Test of, Test av, Workflows for, or Arbetsflöden för. "
     "Return ONLY the title text, with no quotes or trailing punctuation."
 )
 
 _PROJECT_AREA_PROMPT_PINNED_LANGUAGE = (
-    "Generate a short session title using exactly this format: PROJECT - AREA. "
+    "Generate a short session title using exactly this format: PROJECT - AREA, or "
+    "PROJECT - AREA · EXECUTOR [MODEL] when an external or headless coding executor is "
+    "explicitly supported by the supplied context. "
     "PROJECT is the stable product, system, or repository name; preserve canonical spelling "
-    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase. "
+    "and uppercase acronyms such as MCC or API. AREA is a concrete 1-4 word noun phrase that "
+    "names the work surface and target, not an implementation action or result. Prefer durable "
+    "labels that make the exact operating context obvious, for example Hermes - Balance Codex "
+    "rather than Hermes - Automatisk failover, and MCC - Agent Sessions rather than Hermes - "
+    "Sessionsarkivering. Add the optional executor suffix when explicitly supported and append "
+    "its model only when that model is also explicit, for example QuantCore - BTC Scalper · "
+    "Cursor or QuantCore - BTC Scalper · Cursor Grok 4.5. Never guess an executor or model. "
+    "When the request concerns the Hermes app or framework itself — including its session "
+    "titles, sidebar, agents, tools, gateway, or desktop client — use Hermes as PROJECT. "
+    "Never promote a task-shape word such as Prompt, Megaprompt, Session, or Workflow to PROJECT. "
     "Write ordinary words in {language}, but preserve established project names and English "
-    "technical terms. Keep the complete title at 40 characters or fewer. "
+    "technical terms. Keep the complete title at 56 characters or fewer. "
     "Never use prompt-like prefixes such as Help with, Hjälp med, I want, Jag vill, Review, "
     "Granska, Test of, Test av, Workflows for, or Arbetsflöden för. "
     "Return ONLY the title text, with no quotes or trailing punctuation."
@@ -74,6 +97,40 @@ _PROMPT_LIKE_TITLE_PREFIXES = (
     "arbetsflöden för",
 )
 
+_NON_PROJECT_WORDS = frozenset(
+    {"prompt", "megaprompt", "session", "sessions", "workflow", "workflows"}
+)
+_HERMES_SELF_TOPIC_RE = re.compile(
+    r"\b(?:session(?:en|er|erna|s)?|title|titles|titel|titlar|namngiv|sidebar|agent|agents|"
+    r"tool|tools|gateway|desktop|klient|client)\b",
+    re.IGNORECASE,
+)
+
+
+def _project_is_supported(project: str, context: str) -> bool:
+    """Reject task-shape words while recognizing work on Hermes itself."""
+    normalized = project.strip().casefold()
+    if normalized in _NON_PROJECT_WORDS:
+        return False
+    if normalized in {"hermes", "hermes agent"} and _HERMES_SELF_TOPIC_RE.search(context):
+        return True
+    return re.search(
+        rf"(?<!\w){re.escape(project.strip())}(?!\w)",
+        context,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _executor_is_supported(executor: str, context: str) -> bool:
+    """Require the complete executor/model label to appear in supplied context."""
+    normalized_executor = re.sub(
+        r"[^\w.]+", " ", executor, flags=re.UNICODE
+    ).strip().casefold()
+    normalized_context = re.sub(
+        r"[^\w.]+", " ", context, flags=re.UNICODE
+    ).strip().casefold()
+    return bool(normalized_executor and normalized_executor in normalized_context)
+
 
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
@@ -89,19 +146,29 @@ def _title_language() -> str:
         return ""
 
 
-def _title_style() -> str:
-    """Return the configured title style, failing closed to legacy behavior."""
+def _title_settings() -> tuple[str, str]:
+    """Return validated (style, mode), preserving historical defaults."""
     try:
         from hermes_cli.config import load_config_readonly
 
-        value = str(
+        title_config = (
             ((load_config_readonly() or {}).get("auxiliary") or {})
             .get("title_generation", {})
-            .get("style", "descriptive")
-        ).strip().lower().replace("-", "_")
-        return "project_area" if value == "project_area" else "descriptive"
+        ) or {}
+        style = str(title_config.get("style", "descriptive")).strip().lower().replace("-", "_")
+        mode = str(title_config.get("mode", "initial")).strip().lower()
     except Exception:
-        return "descriptive"
+        return "descriptive", "initial"
+    if style not in {"descriptive", "project_area"}:
+        style = "descriptive"
+    if mode not in {"initial", "adaptive"}:
+        mode = "initial"
+    return style, mode
+
+
+def _title_style() -> str:
+    """Compatibility helper retained for callers that only need the style."""
+    return _title_settings()[0]
 
 
 def _auto_title_enabled() -> bool:
@@ -149,6 +216,8 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    current_title: Optional[str] = None,
+    title_context: str = "",
 ) -> Optional[str]:
     """Generate a session title from the first exchange.
 
@@ -185,7 +254,7 @@ def generate_title(
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 
     language = _title_language()
-    style = _title_style()
+    style, _mode = _title_settings()
     if style == "project_area":
         prompt = (
             _PROJECT_AREA_PROMPT_PINNED_LANGUAGE.format(language=language)
@@ -199,9 +268,27 @@ def generate_title(
             else _TITLE_PROMPT
         )
 
+    if current_title:
+        prompt += (
+            " The current title is authoritative unless the dominant project or area has materially "
+            "changed. If it has not materially changed, return the exact current title."
+        )
+
+    if current_title or title_context:
+        payload_parts = []
+        if current_title:
+            payload_parts.append(f"Current title: {current_title[:100]}")
+        if title_context:
+            payload_parts.append(f"Compact conversation context:\n{title_context[:2000]}")
+        payload_parts.append(f"Latest user: {user_snippet}")
+        payload_parts.append(f"Latest assistant: {assistant_snippet}")
+        title_payload = "\n\n".join(payload_parts)
+    else:
+        title_payload = f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"
+
     messages = [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
+        {"role": "user", "content": title_payload},
     ]
 
     try:
@@ -239,16 +326,33 @@ def generate_title(
             lowered = title.casefold()
             if lowered.startswith(_PROMPT_LIKE_TITLE_PREFIXES):
                 return None
-            if len(title) > 40 or title.count(" - ") != 1:
+            if len(title) > 56 or title.count(" - ") != 1:
                 return None
-            project, area = (part.strip() for part in title.split(" - ", 1))
+            project, area_with_executor = (
+                part.strip() for part in title.split(" - ", 1)
+            )
+            if area_with_executor.count(" · ") > 1:
+                return None
+            if " · " in area_with_executor:
+                area, executor = (
+                    part.strip() for part in area_with_executor.split(" · ", 1)
+                )
+            else:
+                area, executor = area_with_executor, ""
+            context = (
+                f"{current_title or ''}\n{title_context}\n{user_snippet}\n{assistant_snippet}"
+            )
             if (
                 not project
                 or not area
+                or not _project_is_supported(project, context)
                 or area.casefold().startswith(_PROMPT_LIKE_TITLE_PREFIXES)
+                or (executor and not _executor_is_supported(executor, context))
             ):
                 return None
             title = f"{project} - {area}"
+            if executor:
+                title += f" · {executor}"
         elif len(title) > 80:
             # Preserve the legacy descriptive-style limit unchanged.
             title = title[:77] + "..."
@@ -266,22 +370,40 @@ def generate_title(
         return None
 
 
-def _persist_session_title(session_db, session_id, title):
+def _persist_session_title(session_db, session_id, title, *, adaptive: bool = False):
     """Persist a generated title, recovering from duplicate-title collisions.
 
-    The write goes through ``set_auto_title_if_empty`` (predicate + write in
-    one transaction) so a manual ``/title`` set while LLM generation was in
-    flight is never overwritten — a plain ``set_session_title`` fallback keeps
-    older stores working. ``set_session_title`` raises ValueError when the
-    title would collide with another session (the unique-title index). Rather
-    than swallow it and leave the session untitled (#50537), append a #N
-    suffix via get_next_title_in_lineage() when the store supports lineage
-    dedup; otherwise re-raise so the caller can decide.
+    The write goes through the backward-compatible
+    ``set_auto_title_if_empty`` entry point, whose provenance-aware
+    implementation atomically fills an empty title or replaces a prior auto
+    title. A manual ``/title`` (or a legacy title without provenance) is never
+    overwritten. A plain ``set_session_title`` fallback keeps older stores
+    working. Duplicate titles are retried with the lineage suffix helper.
+
+    Adaptive writes retain launch-owned PROJECT from title metadata when
+    present, and may update AREA while preserving verified EXECUTOR/MODEL.
 
     Returns the title actually persisted, or None when a concurrent manual
     title won the race (nothing was written).
     """
-    atomic_fn = getattr(session_db, "set_auto_title_if_empty", None)
+    if adaptive:
+        try:
+            from agent.session_title_meta import apply_adaptive_title_with_meta
+
+            adapted = apply_adaptive_title_with_meta(session_db, session_id, title)
+            if adapted is not None:
+                return adapted
+        except Exception:
+            logger.debug(
+                "Adaptive title meta retention failed; falling back",
+                exc_info=True,
+            )
+
+    atomic_fn = None
+    if adaptive:
+        atomic_fn = getattr(session_db, "set_auto_title", None)
+    if atomic_fn is None:
+        atomic_fn = getattr(session_db, "set_auto_title_if_empty", None)
 
     def _set(t):
         if atomic_fn is not None:
@@ -322,8 +444,10 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    title_context: str = "",
+    adaptive: bool = False,
 ) -> None:
-    """Generate and set a session title if one doesn't already exist.
+    """Generate and conditionally persist an initial or adaptive title.
 
     Called in a background thread after the first exchange completes.
     Silently skips if:
@@ -351,6 +475,8 @@ def auto_title_session(
             main_runtime=main_runtime,
             title_callback=title_callback,
             runtime_validator=runtime_validator,
+            title_context=title_context,
+            adaptive=adaptive,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -377,15 +503,20 @@ def _auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    title_context: str = "",
+    adaptive: bool = False,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
         return
 
-    # Check if title already exists (user may have set one via /title before first response)
+    # Adaptive mode may reconsider only prior auto titles. Manual and legacy
+    # titles fail closed; initial mode preserves the historical one-shot guard.
     try:
         existing = session_db.get_session_title(session_id)
-        if existing:
+        source_fn = getattr(session_db, "get_session_title_source", None)
+        existing_source = source_fn(session_id) if callable(source_fn) else None
+        if existing and (not adaptive or existing_source != "auto"):
             return
     except Exception:
         return
@@ -409,18 +540,24 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
-    title = generate_title(
-        user_message,
-        assistant_response,
-        failure_callback=failure_callback,
-        main_runtime=main_runtime,
-        runtime_validator=runtime_validator,
-    )
+    generate_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "runtime_validator": runtime_validator,
+    }
+    if adaptive:
+        generate_kwargs.update(
+            current_title=existing,
+            title_context=title_context,
+        )
+    title = generate_title(user_message, assistant_response, **generate_kwargs)
     if not title:
         return
 
     try:
-        persisted = _persist_session_title(session_db, session_id, title)
+        persisted = _persist_session_title(
+            session_db, session_id, title, adaptive=adaptive
+        )
         if persisted is None:
             return
         logger.debug("Auto-generated session title: %s", persisted)
@@ -431,6 +568,35 @@ def _auto_title_session(
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)
+
+
+def _adaptive_turn_eligible(user_turn: int) -> bool:
+    """Adaptive cadence: turns 1, 3, then every five turns (8, 13, ...)."""
+    return user_turn == 1 or (user_turn >= 3 and (user_turn - 3) % 5 == 0)
+
+
+def _compact_title_context(conversation_history: list) -> str:
+    """Keep first intent plus at most three recent exchanges, never a transcript."""
+    history = [
+        message
+        for message in (conversation_history or [])
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+    ]
+    user_positions = [
+        index for index, message in enumerate(history) if message.get("role") == "user"
+    ]
+    if not user_positions:
+        return ""
+
+    first_content = str(history[user_positions[0]].get("content") or "")
+    lines = [f"First intent (user): {first_content[:300]}"]
+    recent_start = user_positions[max(0, len(user_positions) - 3)]
+    for message in history[recent_start:][:6]:
+        role = message.get("role")
+        content = " ".join(str(message.get("content") or "").split())[:240]
+        if content:
+            lines.append(f"Recent {role}: {content}")
+    return "\n".join(lines)[:2000]
 
 
 def maybe_auto_title(
@@ -444,12 +610,7 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
-    """Fire-and-forget title generation after the first exchange.
-
-    Only generates a title when:
-    - This appears to be the first user→assistant exchange
-    - No title is already set
-    """
+    """Dispatch title generation on the configured initial/adaptive cadence."""
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
@@ -458,7 +619,11 @@ def maybe_auto_title(
     # so for a first exchange we expect exactly 1 user message
     # (or 2 counting system). Be generous: generate on first 2 exchanges.
     user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
-    if user_msg_count > 2:
+    _style, mode = _title_settings()
+    if mode == "adaptive":
+        if not _adaptive_turn_eligible(user_msg_count):
+            return
+    elif user_msg_count > 2:
         return
 
     # Config read comes after the cheap first-exchange guard so the file
@@ -467,15 +632,22 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
+    worker_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+        "runtime_validator": runtime_validator,
+    }
+    if mode == "adaptive":
+        worker_kwargs.update(
+            title_context=_compact_title_context(conversation_history),
+            adaptive=True,
+        )
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-            "runtime_validator": runtime_validator,
-        },
+        kwargs=worker_kwargs,
         daemon=True,
         name="auto-title",
     )

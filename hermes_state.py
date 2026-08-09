@@ -1085,6 +1085,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
+    title_meta TEXT,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -3467,7 +3469,7 @@ class SessionDB:
             try:
                 cursor.execute(
                     """UPDATE sessions AS older
-                       SET title = NULL
+                       SET title = NULL, title_source = NULL, title_meta = NULL
                        WHERE title IS NOT NULL
                          AND EXISTS (
                              SELECT 1 FROM sessions AS newer
@@ -5347,18 +5349,47 @@ class SessionDB:
         session_id: str,
         title: str,
         *,
-        only_if_empty: bool,
+        source: Optional[str],
+        auto_only: bool,
+        only_if_empty: bool = False,
+        title_meta: Optional[Dict[str, Any]] = None,
+        clear_meta: bool = False,
     ) -> bool:
         title = self.sanitize_title(title)
+        title_source = source if title else None
+        if title_source not in {None, "auto", "manual"}:
+            raise ValueError(f"Invalid title source: {title_source}")
+        meta_json = None
+        if title and title_meta is not None:
+            meta_json = json.dumps(title_meta, ensure_ascii=False, separators=(",", ":"))
+        elif not title or clear_meta:
+            meta_json = None
+            clear_meta = True
 
         def _do(conn):
-            if only_if_empty:
-                current = conn.execute(
-                    "SELECT title FROM sessions WHERE id = ?",
-                    (session_id,),
-                ).fetchone()
-                if current is None or current["title"] is not None:
+            current = conn.execute(
+                "SELECT title, title_source, title_meta FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                return 0
+            if only_if_empty and current["title"] is not None:
+                return 0
+            if auto_only:
+                # Auto titles may fill an empty row or replace a prior auto
+                # title. Manual and legacy (non-NULL title + NULL source) rows
+                # fail closed. An unchanged candidate is not a persisted change.
+                if current["title"] is not None and current["title_source"] != "auto":
                     return 0
+                if current["title"] == title and current["title_source"] == "auto":
+                    if title_meta is None and not clear_meta:
+                        return 0
+                    # Meta-aware write: no-op when title and serialized meta match.
+                    current_meta = current["title_meta"]
+                    if meta_json is not None and current_meta == meta_json:
+                        return 0
+                    if meta_json is None and clear_meta and current_meta is None:
+                        return 0
 
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
@@ -5384,41 +5415,118 @@ class SessionDB:
                         conn, ancestor_id=conflict_id, descendant_id=session_id
                     ):
                         conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
+                            "UPDATE sessions SET title = NULL, title_source = NULL, "
+                            "title_meta = NULL WHERE id = ?",
                             (conflict_id,),
                         )
                     else:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
-            predicate = " AND title IS NULL" if only_if_empty else ""
-            cursor = conn.execute(
-                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
-                (title, session_id),
-            )
+            if title_meta is not None or clear_meta or not title:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ?, title_meta = ? "
+                    "WHERE id = ?",
+                    (title, title_source, meta_json if title else None, session_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? WHERE id = ?",
+                    (title, title_source, session_id),
+                )
             return cursor.rowcount
 
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
     def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+        """Set a user-facing title and lock it against future auto-titling.
 
-        Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (clearing the title).
+        Empty/whitespace-only strings clear both title and provenance, which
+        deliberately unlocks automatic titling. Returns False when the session
+        does not exist; validation and uniqueness errors raise ValueError.
         """
-        return self._set_session_title(session_id, title, only_if_empty=False)
+        return self._set_session_title(
+            session_id, title, source="manual", auto_only=False
+        )
+
+    def set_auto_title(self, session_id: str, title: str) -> bool:
+        """Atomically fill or replace an auto title, never a manual/legacy one.
+
+        Returns True only when the persisted title actually changed.
+        """
+        return self._set_session_title(
+            session_id, title, source="auto", auto_only=True
+        )
+
+    def set_auto_title_with_meta(
+        self,
+        session_id: str,
+        title: str,
+        title_meta: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Atomically write an auto title together with neutral title metadata."""
+        return self._set_session_title(
+            session_id,
+            title,
+            source="auto",
+            auto_only=True,
+            title_meta=title_meta,
+            clear_meta=title_meta is None,
+        )
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
-        """Set an auto-generated title only when the current title is NULL.
+        """Backward-compatible alias for the provenance-aware auto writer."""
+        return self._set_session_title(
+            session_id,
+            title,
+            source="auto",
+            auto_only=True,
+            only_if_empty=True,
+        )
 
-        The predicate and write run in one transaction so a concurrent manual
-        rename cannot be overwritten. Validation and uniqueness behavior match
-        :meth:`set_session_title`.
-        """
-        return self._set_session_title(session_id, title, only_if_empty=True)
+    def inherit_session_title(self, source_session_id: str, target_session_id: str) -> bool:
+        """Move a compression predecessor's exact title/provenance to its child."""
+        if not source_session_id or not target_session_id or source_session_id == target_session_id:
+            return False
+
+        def _do(conn):
+            if not self._is_compression_ancestor(
+                conn,
+                ancestor_id=source_session_id,
+                descendant_id=target_session_id,
+            ):
+                return 0
+            source_row = conn.execute(
+                "SELECT title, title_source, title_meta FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            target_row = conn.execute(
+                "SELECT title FROM sessions WHERE id = ?",
+                (target_session_id,),
+            ).fetchone()
+            if source_row is None or target_row is None or not source_row["title"]:
+                return 0
+            if target_row["title"] is not None:
+                return 0
+            conn.execute(
+                "UPDATE sessions SET title = NULL, title_source = NULL, "
+                "title_meta = NULL WHERE id = ?",
+                (source_session_id,),
+            )
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ?, title_meta = ? "
+                "WHERE id = ?",
+                (
+                    source_row["title"],
+                    source_row["title_source"],
+                    source_row["title_meta"],
+                    target_session_id,
+                ),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -5428,6 +5536,50 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    def get_session_title_source(self, session_id: str) -> Optional[str]:
+        """Return ``auto``, ``manual``, or None for legacy/untitled rows."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title_source FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return row["title_source"] if row else None
+
+    def get_session_title_meta(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return structured title metadata, or None when unset/invalid."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title_meta FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if not row or row["title_meta"] is None:
+            return None
+        raw = row["title_meta"]
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def set_session_title_meta(
+        self, session_id: str, title_meta: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Overwrite title_meta without changing title/title_source."""
+        meta_json = (
+            json.dumps(title_meta, ensure_ascii=False, separators=(",", ":"))
+            if title_meta is not None
+            else None
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title_meta = ? WHERE id = ?",
+                (meta_json, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
@@ -8819,6 +8971,7 @@ class SessionDB:
             "cost_source",
             "pricing_version",
             "title",
+            "title_source",
         )
         message_text_fields = (
             "role",
@@ -8893,6 +9046,9 @@ class SessionDB:
                 clean_session["model_config"] = self._import_json_object_or_none(
                     clean_session.get("model_config"), "model_config"
                 )
+                clean_session["title_meta"] = self._import_json_object_or_none(
+                    clean_session.get("title_meta"), "title_meta"
+                )
                 clean_session["parent_session_id"] = self._import_text_or_none(
                     clean_session.get("parent_session_id"), "parent_session_id"
                 )
@@ -8900,6 +9056,8 @@ class SessionDB:
                     clean_session[field] = self._import_text_or_none(
                         clean_session.get(field), field
                     )
+                if clean_session["title_source"] not in {None, "auto", "manual"}:
+                    clean_session["title_source"] = None
 
                 clean_messages: List[Dict[str, Any]] = []
                 for message_index, message in enumerate(messages):
@@ -8977,7 +9135,8 @@ class SessionDB:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, title_source, title_meta,
+                           api_call_count, archived
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -8987,8 +9146,8 @@ class SessionDB:
                            :reasoning_tokens, :cwd, :git_branch, :git_repo_root,
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
-                           :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :cost_source, :pricing_version, :title, :title_source,
+                           :title_meta, :api_call_count, :archived
                        )""",
                     {
                         "id": session_id,
@@ -9027,6 +9186,8 @@ class SessionDB:
                         "cost_source": raw.get("cost_source"),
                         "pricing_version": raw.get("pricing_version"),
                         "title": raw.get("title"),
+                        "title_source": raw.get("title_source"),
+                        "title_meta": raw.get("title_meta"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
                     },

@@ -2600,6 +2600,18 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # Neutral launch title metadata (PROJECT/AREA). Mirrored into env transport
+    # so one-shot / child processes can seed synchronously at session create.
+    try:
+        from agent.session_title_meta import apply_launch_title_env
+
+        apply_launch_title_env(
+            title_project=getattr(args, "title_project", None),
+            title_area=getattr(args, "title_area", None),
+        )
+    except Exception:
+        pass
+
     _pin_kanban_board_env()
 
     if use_tui:

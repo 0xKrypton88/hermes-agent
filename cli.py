@@ -7550,6 +7550,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         },
                     )
                     self.agent._session_db_created = True
+                    try:
+                        from agent.session_title_meta import seed_launch_title_from_env
+
+                        seed_launch_title_from_env(self._session_db, self.session_id)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 if title and self._session_db:
