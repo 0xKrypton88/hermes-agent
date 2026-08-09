@@ -2043,8 +2043,9 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             issues.append(ConfigIssue(
                 "error",
                 f"orchestration config invalid: {exc}",
-                "Fix orchestration.mode (off|shadow|active) and required family aliases; "
-                "defaults preserve legacy single-model behavior when mode is off/shadow.",
+                "Fix orchestration.mode (off|shadow|active), activation exact-ID rules, "
+                "and required family aliases; defaults preserve legacy single-model "
+                "behavior when mode is off/shadow. See docs/design/adaptive-orchestrator-v1.1-canary.md.",
             ))
 
     # ── Root-level keys that look misplaced ──────────────────────────────

@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.orchestration.activation import resolve_effective_mode
+from agent.orchestration.classifier import classify_for_intake
 from agent.orchestration.compiler import compile_worker_brief
 from agent.orchestration.config import OrchestrationConfig, load_orchestration_config
 from agent.orchestration.contracts import (
@@ -28,6 +30,7 @@ from agent.orchestration.contracts import (
 )
 from agent.orchestration.executor import WorkerRunResult, execute_worker_run
 from agent.orchestration.intake import merge_intake
+from agent.orchestration.origin import TurnOrigin, turn_origin_from_agent
 from agent.orchestration.router import route_task
 from agent.orchestration.telemetry import persist_trace
 from agent.orchestration.verifier import AttemptRecord, verify_attempt
@@ -92,7 +95,11 @@ def _base_trace(
     spec: TaskSpec,
     cfg: OrchestrationConfig,
     rule_ids: List[str],
+    origin: Optional[TurnOrigin] = None,
+    activation_rule_id: Optional[str] = None,
+    legacy_parent_executed: bool = False,
 ) -> ExecutionTrace:
+    dims = origin.redacted_dimensions() if origin is not None else {}
     return ExecutionTrace(
         correlation_id=correlation_id,
         session_id=str(getattr(agent, "session_id", "") or ""),
@@ -107,6 +114,13 @@ def _base_trace(
         concrete_provider=decision.concrete_provider,
         concrete_model=decision.concrete_model_alias,
         allowed_capabilities=tuple(c.value for c in spec.capabilities),
+        origin_platform=dims.get("origin_platform"),
+        origin_workspace_id=dims.get("origin_workspace_id"),
+        origin_channel_id=dims.get("origin_channel_id"),
+        origin_user_id=dims.get("origin_user_id"),
+        effective_mode=mode,
+        activation_rule_id=activation_rule_id,
+        legacy_parent_executed=legacy_parent_executed,
     )
 
 
@@ -529,6 +543,8 @@ def _run_active_worker_loop(
         escalation_reason=";".join(transitions) if transitions else None,
         error_class=last_worker.error_class,
         approval_outcome="not_required",
+        legacy_parent_executed=False,
+        effective_mode="active",
     )
     try:
         persist_trace(
@@ -645,6 +661,7 @@ def maybe_orchestrate_turn(
     task_id: Optional[str] = None,
     explicit_facts: Optional[Dict[str, Any]] = None,
     defer_worker: bool = False,
+    turn_origin: Optional[TurnOrigin] = None,
 ) -> OrchestrationTurnResult:
     """Decide/observe at the top-level turn boundary.
 
@@ -653,6 +670,10 @@ def maybe_orchestrate_turn(
     - ``active``: may spawn an isolated worker via ``WorkerRunRequest`` adapter.
       When ``defer_worker=True``, returns ``pending_worker`` so the conversation
       loop can run ``build_turn_context`` first.
+
+    ``turn_origin`` must be server-stamped trusted identity (never inferred from
+    prompt text or client-supplied trust flags). When omitted, derived from
+    agent attrs with fail-closed trust rules.
     """
     root = load_config()
     try:
@@ -672,7 +693,9 @@ def maybe_orchestrate_turn(
             guard_reason_codes=(RuleId.R_MODE_OFF.value,),
         )
 
-    mode = cfg.mode if cfg.enabled else "off"
+    origin = turn_origin if turn_origin is not None else turn_origin_from_agent(agent)
+    effective = resolve_effective_mode(cfg, origin)
+    mode = effective.mode if cfg.enabled else "off"
 
     if _is_worker_context(agent):
         result = OrchestrationTurnResult(
@@ -713,7 +736,12 @@ def maybe_orchestrate_turn(
         return result
 
     text = _user_text(user_message)
-    intake = merge_intake(text, classifier_raw=None, explicit_facts=explicit_facts or {})
+    # Bounded LUNA-class structured classifier (deterministic shortcuts first).
+    # Never call SOL merely to classify; fail closed via intake merge rules.
+    classifier_raw = classify_for_intake(text, cfg=cfg, allow_model_classifier=False)
+    intake = merge_intake(
+        text, classifier_raw=classifier_raw, explicit_facts=explicit_facts or {}
+    )
     spec = intake.task_spec
     decision = route_task(spec, cfg)
     compiled = compile_worker_brief(spec, decision, cfg)
@@ -725,6 +753,9 @@ def maybe_orchestrate_turn(
     else:
         rule_ids.append(RuleId.R_MODE_ACTIVE.value)
 
+    # Active canary turns must not invoke the legacy parent before worker routing.
+    legacy_parent_executed = mode != "active"
+
     trace = _base_trace(
         correlation_id=correlation_id,
         agent=agent,
@@ -734,6 +765,9 @@ def maybe_orchestrate_turn(
         spec=spec,
         cfg=cfg,
         rule_ids=rule_ids,
+        origin=origin,
+        activation_rule_id=effective.rule_id,
+        legacy_parent_executed=legacy_parent_executed and mode == "shadow",
     )
 
     if mode == "shadow":
@@ -770,7 +804,7 @@ def maybe_orchestrate_turn(
             spec=spec,
             decision=decision,
             compiled=compiled,
-            trace=trace,
+            trace=replace(trace, legacy_parent_executed=False),
             cfg=cfg,
             ask_user=bool(intake.ask_user),
         )
@@ -787,7 +821,7 @@ def maybe_orchestrate_turn(
             spec=spec,
             decision=decision,
             compiled=compiled,
-            trace=trace,
+            trace=replace(trace, legacy_parent_executed=False),
             cfg=cfg,
         )
         try:
@@ -805,7 +839,7 @@ def maybe_orchestrate_turn(
             task_spec=spec,
             decision=decision,
             compiled=compiled,
-            trace=trace,
+            trace=replace(trace, legacy_parent_executed=False),
             worker_result=None,
             response=None,
             guard_reason_codes=(),
@@ -827,7 +861,7 @@ def maybe_orchestrate_turn(
         cfg=cfg,
         correlation_id=correlation_id,
         task_id=task_id,
-        trace=trace,
+        trace=replace(trace, legacy_parent_executed=False),
     )
     try:
         agent._last_orchestration_result = result

@@ -1445,14 +1445,18 @@ def run_conversation(
     # intact; parent cached prompt/tools/model stay immutable.
     _orch_turn = None
     try:
+        from agent.orchestration.origin import turn_origin_from_agent
         from agent.orchestration.service import maybe_orchestrate_turn
 
+        # Trusted TurnOrigin is server-stamped (gateway session source / agent
+        # attrs). Never infer activation from prompt text or client flags.
         _orch_turn = maybe_orchestrate_turn(
             agent,
             user_message,
             conversation_history=conversation_history,
             task_id=task_id,
             defer_worker=True,
+            turn_origin=turn_origin_from_agent(agent),
         )
         # Never short-circuit before prologue. Terminal REQUIRE_APPROVAL /
         # ASK_USER / BLOCKED decisions and deferred active workers both need

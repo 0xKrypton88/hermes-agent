@@ -4948,6 +4948,10 @@ class TurnRunner:
                 chat_name=ctx.source.chat_name,
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
+                scope_id=getattr(ctx.source, "scope_id", None) or getattr(ctx.source, "guild_id", None),
+                # Server-stamped trusted TurnOrigin for Adaptive Orchestrator
+                # V1.1 activation — derived from authenticated SessionSource only.
+                turn_origin_trusted=True,
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
@@ -4969,6 +4973,20 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        # Stamp trusted TurnOrigin from authenticated SessionSource every turn
+        # (cached agents included). Never derived from prompt text / client flags.
+        try:
+            from agent.orchestration.origin import turn_origin_from_session_source
+
+            _origin = turn_origin_from_session_source(
+                ctx.source, session_key=ctx.session_key
+            )
+            agent._scope_id = _origin.workspace_id
+            agent._turn_origin_trusted = bool(_origin.trusted)
+            agent._turn_origin = _origin
+        except Exception:
+            logger.debug("failed to stamp trusted turn origin", exc_info=True)
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -20100,6 +20118,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    scope_id=getattr(source, "scope_id", None) or getattr(source, "guild_id", None),
+                    turn_origin_trusted=True,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),

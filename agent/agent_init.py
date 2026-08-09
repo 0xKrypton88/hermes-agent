@@ -516,7 +516,9 @@ def init_agent(
     chat_name: str = None,
     chat_type: str = None,
     thread_id: str = None,
+    scope_id: str = None,
     gateway_session_key: str = None,
+    turn_origin_trusted: bool = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -602,7 +604,14 @@ def init_agent(
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
+    # Workspace / team / guild scope from authenticated SessionSource (Slack
+    # workspace, Discord guild, …). Used by Adaptive Orchestrator V1.1
+    # TurnOrigin — never inferred from prompt text.
+    agent._scope_id = scope_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    # Explicit server-side trust stamp for orchestration activation. Gateway
+    # sets True from authenticated SessionSource; CLI/desktop leave unset/False.
+    agent._turn_origin_trusted = bool(turn_origin_trusted) if turn_origin_trusted is not None else None
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

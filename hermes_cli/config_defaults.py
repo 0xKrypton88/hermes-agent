@@ -3229,37 +3229,49 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
-    # Adaptive Orchestrator V1 — feature-flagged control plane.
+    # Adaptive Orchestrator V1/V1.1 — feature-flagged control plane.
     # Disabled by default (mode off). Active is never the default.
-    # Family aliases map through config; product code must not hard-code
-    # concrete model names. See docs/design/adaptive-orchestrator-v1.md.
+    # V1.1 adds exact-ID activation rules + openai-codex family model maps.
+    # See docs/design/adaptive-orchestrator-v1.md (canary contract).
     "orchestration": {
         "enabled": False,
         "mode": "off",  # off | shadow | active
+        "activation": {
+            "default_mode": "shadow",
+            # Exact-ID canary rules go here — never broaden without review.
+            # Example (docs only; not enabled by default):
+            # - id: slack-dm-canary-v11
+            #   mode: active
+            #   platform: slack
+            #   workspace_ids: ["T0BP4UYH012"]
+            #   channel_ids: ["D0BNXU62YLD"]
+            #   user_ids: ["U0BNXPWV8N9"]
+            "rules": [],
+        },
         "families": {
             "LUNA": {
-                "provider_alias": "delegation",
+                "provider_alias": "openai-codex",
                 "model_alias": "luna",
                 "reasoning_default": "low",
                 "toolsets": ["file", "web"],
             },
             "TERRA": {
-                "provider_alias": "delegation",
+                "provider_alias": "openai-codex",
                 "model_alias": "terra",
                 "reasoning_default": "medium",
                 "toolsets": ["file", "web", "terminal", "browser"],
             },
             "SOL": {
-                "provider_alias": "delegation",
+                "provider_alias": "openai-codex",
                 "model_alias": "sol",
                 "reasoning_default": "high",
                 "toolsets": ["file", "web", "terminal", "browser"],
             },
         },
         "model_aliases": {
-            "luna": "",
-            "terra": "",
-            "sol": "",
+            "luna": "gpt-5.6-luna",
+            "terra": "gpt-5.6-terra",
+            "sol": "gpt-5.6-sol",
         },
         "reasoning_capabilities": {
             "low": True,
