@@ -2110,6 +2110,12 @@ def _run_single_child(
                 leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     child._swap_credential(leased_entry)
+                    # Credential binding may restore route/session defaults on
+                    # some agent implementations. An explicitly routed child
+                    # model is request intent, not credential metadata.
+                    requested_model = getattr(child, "_delegate_requested_model", None)
+                    if isinstance(requested_model, str) and requested_model:
+                        child.model = requested_model
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 

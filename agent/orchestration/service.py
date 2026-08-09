@@ -10,7 +10,9 @@ Active mode may defer worker execution until after the parent turn prologue
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +38,13 @@ from agent.orchestration.telemetry import persist_trace
 from agent.orchestration.verifier import AttemptRecord, verify_attempt
 
 logger = logging.getLogger(__name__)
+
+_REPLY_CONTEXT_RE = re.compile(
+    r'\A\[Replying to: ".*?"\]\r?\n\r?\n', re.DOTALL
+)
+_SLACK_APP_CONTEXT_RE = re.compile(
+    r"\A\[Slack app context: user is viewing channel [^\]\r\n]+\]\r?\n\r?\n"
+)
 
 
 def load_config() -> Dict[str, Any]:
@@ -77,12 +86,46 @@ def _is_worker_context(agent: Any) -> bool:
 
 def _user_text(user_message: Any) -> str:
     if isinstance(user_message, str):
-        return user_message
-    if isinstance(user_message, dict):
+        text = user_message
+    elif isinstance(user_message, dict):
         content = user_message.get("content")
         if isinstance(content, str):
-            return content
-    return str(user_message or "")
+            text = content
+        else:
+            text = str(user_message or "")
+    else:
+        text = str(user_message or "")
+
+    # Gateway context is useful to the legacy conversation, but it is not the
+    # current user intent. Strip only the two recognized leading wrappers at
+    # this orchestration boundary; the original user_message remains untouched.
+    text = _REPLY_CONTEXT_RE.sub("", text, count=1)
+    text = _SLACK_APP_CONTEXT_RE.sub("", text, count=1)
+    return text
+
+
+def _human_worker_response(value: Any) -> Any:
+    """Return a validated worker envelope's summary; preserve everything else."""
+    payload = value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+    if not isinstance(payload, dict):
+        return value
+    if not {"summary", "evidence", "status"}.issubset(payload):
+        return value
+    summary = payload.get("summary")
+    evidence = payload.get("evidence")
+    status = payload.get("status")
+    if not isinstance(summary, str):
+        return value
+    if not isinstance(evidence, list) or not all(isinstance(item, str) for item in evidence):
+        return value
+    if status not in {"ok", "blocked", "needs_user"}:
+        return value
+    return summary
 
 
 def _base_trace(
@@ -558,7 +601,7 @@ def _run_active_worker_loop(
 
     success = bool(last_worker.success) and outcome == VerificationOutcome.RETURN.value
     response = {
-        "final_response": last_worker.final_response,
+        "final_response": _human_worker_response(last_worker.final_response),
         "messages": [],
         "orchestration": {
             "correlation_id": correlation_id,

@@ -75,7 +75,7 @@ class WorkerRunResult:
     model: Optional[str]
     reasoning: ReasoningEffort
     toolsets: Tuple[str, ...]
-    final_response: Optional[str] = None
+    final_response: Optional[Any] = None
     usage: Dict[str, Any] = field(default_factory=dict)
     cancelled: bool = False
     timed_out: bool = False
@@ -109,6 +109,12 @@ def _resolve_overrides(
     }
     if concrete_model:
         target_model: Optional[str] = concrete_model
+    elif model_alias and model_alias in {
+        value for value in cfg.model_aliases.values() if value
+    }:
+        # resolve_family_model already returns the configured concrete value.
+        # Preserve it rather than treating it as an unmapped family token.
+        target_model = model_alias
     elif model_alias and model_alias not in family_alias_keys and model_alias not in {
         "luna",
         "terra",
@@ -136,6 +142,7 @@ def _resolve_overrides(
     return {
         "resolved": resolved,
         "model": child_model,
+        "explicit_model": target_model,
         "provider_alias": provider_alias,
         "model_alias": model_alias,
     }
@@ -435,6 +442,8 @@ def execute_worker_run(
         child._orch_family = req.family.value
         child._orch_parent_turn_id = req.parent_turn_id
         child._orch_worker = True
+        if overrides.get("explicit_model"):
+            child._delegate_requested_model = overrides["explicit_model"]
     except Exception:
         pass
 

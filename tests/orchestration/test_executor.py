@@ -577,3 +577,93 @@ def test_executor_timeout_returns_within_deadline():
     assert result.timed_out is True or result.error_class == "timeout"
     assert result.success is False
     assert interrupted["count"] >= 1 or cleaned["count"] >= 1
+
+
+def test_explicit_concrete_model_survives_shared_credential_lease_binding():
+    """A shared credential lease must not reset an orchestrated child to SOL."""
+    from agent.orchestration.executor import execute_worker_run
+
+    parent = _parent()
+    parent.model = "gpt-5.6-sol"
+    req = WorkerRunRequest(
+        goal="canary smoke: hej",
+        context="brief",
+        toolsets=("file",),
+        family=ModelFamily.TERRA,
+        reasoning=ReasoningEffort.MEDIUM,
+        timeout_seconds=30,
+        correlation_id="corr-model-intent",
+        provider_alias="openai-codex",
+        model_alias="gpt-5.6-terra",
+    )
+
+    fake_pool = MagicMock()
+    fake_pool.acquire_lease.return_value = "cred-1"
+    fake_pool.current.return_value = SimpleNamespace(id="cred-1")
+    fake_child = MagicMock()
+    fake_child.session_id = "child-model-intent"
+    fake_child._subagent_id = None
+    fake_child._parent_subagent_id = None
+    fake_child._delegate_depth = 1
+    fake_child._delegate_role = "leaf"
+    fake_child._delegate_saved_tool_names = []
+    fake_child._credential_pool = fake_pool
+    fake_child.enabled_toolsets = ["file"]
+    fake_child.model = "gpt-5.6-terra"
+    fake_child.provider = "openai-codex"
+    fake_child.platform = "subagent"
+    fake_child.tool_progress_callback = None
+    fake_child._delegate_output_schema = None
+    seen_models = []
+
+    def swap_credential(_entry):
+        fake_child.model = "gpt-5.6-sol"
+
+    def run_conversation(**_kwargs):
+        seen_models.append(fake_child.model)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "api_calls": 1,
+            "completed": True,
+        }
+
+    fake_child._swap_credential.side_effect = swap_credential
+    fake_child.run_conversation.side_effect = run_conversation
+    fake_child.get_activity_summary.return_value = {"api_call_count": 1}
+    cfg = load_orchestration_config(
+        {
+            "orchestration": {
+                "enabled": True,
+                "mode": "active",
+                "model_aliases": {
+                    "luna": "gpt-5.6-luna",
+                    "terra": "gpt-5.6-terra",
+                    "sol": "gpt-5.6-sol",
+                },
+            }
+        }
+    )
+
+    with patch(
+        "agent.orchestration.executor.resolve_runtime_provider",
+        return_value={
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "token",
+            "source": "test",
+            "requested_provider": "openai-codex",
+        },
+    ) as resolve_mock, patch(
+        "agent.orchestration.executor._build_child_preserving_parent_tools",
+        return_value=fake_child,
+    ) as build_mock, patch("tools.delegate_tool._get_child_timeout", return_value=None):
+        result = execute_worker_run(req, parent_agent=parent, cfg=cfg)
+
+    assert resolve_mock.call_args.kwargs["target_model"] == "gpt-5.6-terra"
+    assert build_mock.call_args.kwargs["model"] == "gpt-5.6-terra"
+    assert seen_models == ["gpt-5.6-terra"]
+    assert result.model == "gpt-5.6-terra"
+    fake_pool.release_lease.assert_called_once_with("cred-1")

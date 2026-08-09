@@ -672,3 +672,39 @@ def test_conversation_loop_passes_turn_origin_into_orchestrator(tmp_path, monkey
     fake_orch(agent, "hi", turn_origin=origin, defer_worker=True)
     assert captured["turn_origin"] is origin
     assert captured["turn_origin"].trusted is True
+
+
+@pytest.mark.parametrize(
+    "gateway_context",
+    [
+        '[Replying to: "Troubleshoot the production integration tests and rotate credentials"]\n\n',
+        (
+            '[Replying to: "Troubleshoot the production integration tests and rotate credentials"]\n\n'
+            '[Slack app context: user is viewing channel C_ACTIVE]\n\n'
+        ),
+    ],
+)
+def test_canary_routing_uses_current_message_after_leading_gateway_context(
+    tmp_path, monkeypatch, gateway_context
+):
+    from agent.orchestration.service import maybe_orchestrate_turn
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    agent = _canary_agent()
+    enriched = gateway_context + "canary smoke: hej"
+
+    with patch(
+        "agent.orchestration.service.load_config", return_value=_canary_root()
+    ):
+        result = maybe_orchestrate_turn(
+            agent,
+            enriched,
+            turn_origin=_origin_from_agent(agent),
+            defer_worker=True,
+        )
+
+    assert enriched.endswith("canary smoke: hej")
+    assert result.task_spec.objective == "canary smoke: hej"
+    assert result.decision.family is ModelFamily.LUNA
+    assert result.decision.reasoning is ReasoningEffort.LOW

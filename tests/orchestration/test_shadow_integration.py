@@ -569,3 +569,84 @@ def test_active_service_escalates_terra_failures_to_sol_and_records_trace(
     final = load_trace(max(traces, key=lambda p: p.stat().st_mtime))
     assert final.get("worker_id")
     assert (final.get("input_tokens") or 0) + (final.get("output_tokens") or 0) > 0
+
+
+@pytest.mark.parametrize(
+    "worker_output",
+    [
+        {"summary": "Human-ready answer", "evidence": ["tests passed"], "status": "ok"},
+        '{"summary":"Human-ready answer","evidence":["tests passed"],"status":"ok"}',
+    ],
+)
+def test_active_mode_normalizes_valid_worker_envelope_to_summary(
+    tmp_path, monkeypatch, worker_output
+):
+    from agent.orchestration.service import maybe_orchestrate_turn
+    from agent.orchestration.executor import WorkerRunResult
+    from agent.orchestration.contracts import ReasoningEffort
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    agent = _fake_agent()
+    fake_result = WorkerRunResult(
+        success=True,
+        correlation_id="c-envelope",
+        session_id=agent.session_id,
+        task_id="t-envelope",
+        worker_id="sa-envelope",
+        child_session_id="child-envelope",
+        provider="openrouter",
+        model="resolved",
+        reasoning=ReasoningEffort.LOW,
+        toolsets=("file",),
+        final_response=worker_output,
+    )
+    root = {"orchestration": {"enabled": True, "mode": "active"}}
+
+    with patch("agent.orchestration.service.load_config", return_value=root), patch(
+        "agent.orchestration.service.execute_worker_run", return_value=fake_result
+    ):
+        result = maybe_orchestrate_turn(agent, "Summarize this note")
+
+    assert result.response["final_response"] == "Human-ready answer"
+
+
+@pytest.mark.parametrize(
+    "worker_output",
+    [
+        "ordinary worker prose",
+        '{"unrelated":"json"}',
+        '{"summary":"missing required envelope fields"}',
+    ],
+)
+def test_active_mode_leaves_prose_and_invalid_json_unchanged(
+    tmp_path, monkeypatch, worker_output
+):
+    from agent.orchestration.service import maybe_orchestrate_turn
+    from agent.orchestration.executor import WorkerRunResult
+    from agent.orchestration.contracts import ReasoningEffort
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    agent = _fake_agent()
+    fake_result = WorkerRunResult(
+        success=True,
+        correlation_id="c-plain",
+        session_id=agent.session_id,
+        task_id="t-plain",
+        worker_id="sa-plain",
+        child_session_id="child-plain",
+        provider="openrouter",
+        model="resolved",
+        reasoning=ReasoningEffort.LOW,
+        toolsets=("file",),
+        final_response=worker_output,
+    )
+
+    with patch(
+        "agent.orchestration.service.load_config",
+        return_value={"orchestration": {"enabled": True, "mode": "active"}},
+    ), patch("agent.orchestration.service.execute_worker_run", return_value=fake_result):
+        result = maybe_orchestrate_turn(agent, "Summarize this note")
+
+    assert result.response["final_response"] == worker_output
