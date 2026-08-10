@@ -202,6 +202,118 @@ def _persist_pending_completion(event):
     })
 
 
+def test_watcher_discovers_cross_process_pending_after_startup(
+    monkeypatch, isolated_registry,
+):
+    """A durable pending row written after watcher start must be delivered.
+
+    Reproduces the cross-process Cursor Cloud completion gap: producer
+    process A persists ``state=completed, delivery_state=pending`` into the
+    shared state.db and only enqueues its own in-memory queue. The gateway
+    watcher starts with an empty queue and must still discover that row once
+    and pass it to ``_deliver_completion_notification`` without a restart.
+    """
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    assert isolated.empty()
+
+    event = _async_event("deleg_cross_process")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    delivered_ids = []
+    original_deliver = GatewayRunner._deliver_completion_notification
+
+    async def _tracking_deliver(self, synth_text, evt):
+        delivered_ids.append(str(evt.get("delegation_id") or ""))
+        return await original_deliver(self, synth_text, evt)
+
+    monkeypatch.setattr(
+        GatewayRunner, "_deliver_completion_notification", _tracking_deliver,
+    )
+
+    sleep_calls = 0
+
+    async def _bounded_sleep(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        # After the watcher's settle sleep, inject a durable row as if another
+        # process completed — the in-memory queue stays empty until discovery.
+        if sleep_calls == 1:
+            assert isolated.empty()
+            _persist_pending_completion(event)
+        if sleep_calls >= 4:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
+
+    asyncio.run(
+        runner._async_delegation_watcher(interval=0, durable_scan_interval=0)
+    )
+
+    assert delivered_ids == ["deleg_cross_process"]
+    adapter.handle_message.assert_awaited_once()
+    from tools import async_delegation
+
+    row = async_delegation.get_durable_delegation("deleg_cross_process")
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+
+
+def test_watcher_does_not_duplicate_already_queued_or_terminal_rows(
+    monkeypatch, isolated_registry,
+):
+    """Already-queued, delivered, and actively-claimed rows are not re-fired."""
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+
+    queued = _async_event("deleg_already_queued")
+    delivered = _async_event("deleg_already_delivered")
+    claimed = _async_event("deleg_already_claimed")
+    fresh = _async_event("deleg_fresh_pending")
+
+    _persist_pending_completion(queued)
+    _persist_pending_completion(delivered)
+    _persist_pending_completion(claimed)
+    _persist_pending_completion(fresh)
+
+    assert async_delegation.mark_completion_delivered("deleg_already_delivered")
+    assert async_delegation.claim_completion_delivery(
+        "deleg_already_claimed", "other-process-claim",
+    )
+
+    # Simulate the local queue already holding the in-process copy.
+    isolated.put(dict(queued))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    delivered_ids = []
+    original_deliver = GatewayRunner._deliver_completion_notification
+
+    async def _tracking_deliver(self, synth_text, evt):
+        did = str(evt.get("delegation_id") or "")
+        delivered_ids.append(did)
+        return await original_deliver(self, synth_text, evt)
+
+    monkeypatch.setattr(
+        GatewayRunner, "_deliver_completion_notification", _tracking_deliver,
+    )
+    _stop_after_sleeps(monkeypatch, runner, count=5)
+
+    asyncio.run(
+        runner._async_delegation_watcher(interval=0, durable_scan_interval=0)
+    )
+
+    assert delivered_ids.count("deleg_already_queued") == 1
+    assert "deleg_already_delivered" not in delivered_ids
+    assert "deleg_already_claimed" not in delivered_ids
+    assert delivered_ids.count("deleg_fresh_pending") == 1
+    assert adapter.handle_message.await_count == 2
+
+
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
     import tools.process_registry as pr_module
 

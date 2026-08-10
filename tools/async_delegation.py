@@ -44,7 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -83,6 +83,15 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+# Active delivery claims expire after this TTL so a crashed consumer cannot
+# pin a row forever. Shared by claim_completion_delivery and the periodic
+# cross-process discover path.
+_DELIVERY_CLAIM_TTL_SECONDS = 300.0
+# How often a long-lived gateway watcher should scan state.db for durable
+# pending completions published by another process. Bounded to avoid busy
+# SQLite polling; the in-memory exclude-id guard prevents duplicate queueing
+# between scans.
+DURABLE_PENDING_SCAN_INTERVAL = 5.0
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -341,18 +350,24 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
-def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+def restore_undelivered_completions(
+    target_queue,
+    *,
+    origin_ui_session_id: str = "",
+    session_keys: Optional[set[str]] = None,
+    key_resolver: Optional[Callable[[str], str]] = None,
+) -> int:
+    """Enqueue durable pending completions as fresh turns.
 
-    Every restored event is stamped ``restored=True`` (in-memory only — the
-    stamp is added after the durable payload is deserialized and is never
-    persisted). Restored events originate from a *previous* process, so no
-    consumer in THIS process implicitly owns them: drain paths that run
-    without an ownership filter (the legacy single-session behavior) must
-    leave them queued for a consumer that can positively prove ownership,
-    otherwise a brand-new session adopts a dead session's delegation
-    results seconds after boot (#64484).
+    With owner selectors, only completions belonging to that reattached
+    runtime/durable lineage are restored. Without selectors, startup behavior
+    remains unchanged and all pending completions are rehydrated.
     """
+    owner_ui = str(origin_ui_session_id or "")
+    owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
+    targeted = bool(owner_ui or owner_keys)
+    restored = 0
+
     recover_abandoned_delegations()
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
@@ -362,10 +377,96 @@ def restore_undelivered_completions(target_queue) -> int:
         ).fetchall()
         for _delegation_id, payload in rows:
             evt = json.loads(payload)
+            if targeted:
+                event_ui = str(evt.get("origin_ui_session_id") or "")
+                event_keys = {
+                    str(evt.get("session_key") or ""),
+                    str(evt.get("parent_session_id") or ""),
+                }
+                event_keys.discard("")
+                owned = bool(owner_ui and event_ui == owner_ui)
+                if not owned:
+                    owned = bool(owner_keys.intersection(event_keys))
+                if not owned and key_resolver is not None:
+                    for key in event_keys:
+                        try:
+                            if str(key_resolver(key) or key) in owner_keys:
+                                owned = True
+                                break
+                        except Exception:
+                            continue
+                if not owned:
+                    continue
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
+
+
+def discover_pending_completions(
+    target_queue,
+    *,
+    exclude_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    """Enqueue durable pending completions that another process may have written.
+
+    Startup ``restore_undelivered_completions`` only runs once per process.
+    When a producer (dashboard, API server, etc.) persists a completed row into
+    the shared state.db and only puts the event on *its* in-memory
+    ``completion_queue``, a long-lived gateway never sees it until restart.
+    This helper is safe to call periodically from the idle watcher:
+
+    - skips rows that are already ``delivered`` / non-pending (SQL filter)
+    - skips rows with an *active* delivery claim (TTL-aware)
+    - skips ``exclude_ids`` already sitting on this process's queue / in flight
+    - stamps ``restored=True`` in-memory only (same ownership semantics as
+      startup restore; never persisted)
+
+    Returns the list of newly-enqueued ``delegation_id`` values so the caller
+    can extend its in-memory queued-id guard.
+    """
+    skip = {str(x) for x in (exclude_ids or set()) if str(x)}
+    enqueued: List[str] = []
+    now = time.time()
+    claim_floor = now - _DELIVERY_CLAIM_TTL_SECONDS
+
+    # Abandoned running rows become pending terminal events with event_json;
+    # pick those up on the same periodic cadence as cross-process completions.
+    try:
+        recover_abandoned_delegations()
+    except Exception:
+        logger.debug("discover_pending_completions: recover failed", exc_info=True)
+
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json, delivery_claim, delivery_claimed_at
+               FROM async_delegations
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+        for delegation_id, payload, claim, claimed_at in rows:
+            did = str(delegation_id or "")
+            if not did or did in skip:
+                continue
+            if claim and claimed_at is not None and float(claimed_at) >= claim_floor:
+                # Another consumer holds a live claim — do not duplicate.
+                continue
+            try:
+                evt = json.loads(payload)
+            except Exception:
+                logger.warning(
+                    "discover_pending_completions: bad event_json for %s", did,
+                )
+                continue
+            if not isinstance(evt, dict):
+                continue
+            evt["restored"] = True
+            target_queue.put(evt)
+            enqueued.append(did)
+            skip.add(did)
+    return enqueued
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -395,7 +496,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id, now, now, delegation_id,
+                now - _DELIVERY_CLAIM_TTL_SECONDS,
+            ),
         )
         return cur.rowcount == 1
 

@@ -3483,6 +3483,30 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+def _async_delegation_ids_in_queue(completion_queue) -> "set[str]":
+    """Snapshot async-delegation ids currently sitting on ``completion_queue``.
+
+    Detaches the current batch, records ids, then puts every event back so
+    other drains keep their order. Used by the durable pending scan to avoid
+    double-enqueueing an event the local producer already queued.
+    """
+    batch: list[dict] = []
+    ids: set[str] = set()
+    while not completion_queue.empty():
+        try:
+            evt = completion_queue.get_nowait()
+        except Exception:
+            break
+        batch.append(evt)
+        if isinstance(evt, dict) and evt.get("type") == "async_delegation":
+            did = str(evt.get("delegation_id") or "")
+            if did:
+                ids.add(did)
+    for evt in batch:
+        completion_queue.put(evt)
+    return ids
+
+
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """Drain gateway-owned watch events without spinning on requeued events.
 
@@ -22837,7 +22861,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
-    async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
+    async def _async_delegation_watcher(
+        self,
+        interval: float = 2.0,
+        durable_scan_interval: Optional[float] = None,
+    ) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
@@ -22850,11 +22878,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
         handled by ``_run_process_watcher`` / the post-turn drain).
+
+        Cross-process durability: producers in other Hermes processes (e.g.
+        the dashboard) persist completed rows into the shared state.db and
+        only enqueue their own in-memory ``completion_queue``. Startup
+        ``restore_undelivered_completions`` cannot see rows written *after*
+        this process booted, so we periodically re-scan durable pending
+        completions and requeue them here — claim semantics + an in-memory
+        queued-id guard keep delivery non-duplicative.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.async_delegation import (
+            DURABLE_PENDING_SCAN_INTERVAL,
+            discover_pending_completions,
+        )
         from tools.process_registry import process_registry as _pr
+
+        if durable_scan_interval is None:
+            durable_scan_interval = DURABLE_PENDING_SCAN_INTERVAL
+        queued_ids: set[str] = set()
+        last_durable_scan = 0.0
+
         while self._running:
             try:
+                now = time.monotonic()
+                if now - last_durable_scan >= float(durable_scan_interval):
+                    # Snapshot ids already on the local queue so a concurrent
+                    # in-process finalize cannot be double-enqueued by the scan.
+                    for did in _async_delegation_ids_in_queue(_pr.completion_queue):
+                        queued_ids.add(did)
+                    try:
+                        for did in discover_pending_completions(
+                            _pr.completion_queue, exclude_ids=queued_ids,
+                        ):
+                            queued_ids.add(did)
+                    except Exception as scan_exc:
+                        logger.debug(
+                            "Durable pending completion scan failed: %s", scan_exc,
+                        )
+                    last_durable_scan = now
+
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
@@ -22867,6 +22930,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     if evt.get("type") == "async_delegation":
                         async_events.append(evt)
+                        did = str(evt.get("delegation_id") or "")
+                        if did:
+                            queued_ids.add(did)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
@@ -22875,11 +22941,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
+                        did = str(evt.get("delegation_id") or "")
+                        if did:
+                            queued_ids.discard(did)
                         continue
+                    did = str(evt.get("delegation_id") or "")
                     try:
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
                             _pr.completion_queue.put(evt)
+                            # Keep did in queued_ids so rediscovery does not
+                            # duplicate while the retry sits on the queue.
+                        else:
+                            # Success or non-retryable (None): allow rediscovery
+                            # only if the durable row is still pending (e.g.
+                            # claim released after an unroutable drop).
+                            if did:
+                                queued_ids.discard(did)
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)

@@ -555,6 +555,138 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_targeted_restore_replays_only_owner_and_exactly_once():
+    import queue as queue_mod
+
+    def _persist_pending(delegation_id, session_key, origin_ui_session_id):
+        dispatched_at = time.time()
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "parent_session_id": f"{session_key}-parent",
+            "origin_session_id": "",
+            "dispatched_at": dispatched_at,
+        }
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "parent_session_id": record["parent_session_id"],
+            "status": "completed",
+            "summary": f"result for {session_key}",
+            "dispatched_at": dispatched_at,
+            "completed_at": dispatched_at + 1,
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
+
+    _persist_pending("deleg_owner_a", "owner-a", "detached-ui-a")
+    _persist_pending("deleg_owner_b", "owner-b", "live-ui-b")
+    target = queue_mod.Queue()
+
+    try:
+        restored = ad.restore_undelivered_completions(
+            target,
+            session_keys={"owner-a"},
+            origin_ui_session_id="resumed-ui-a",
+        )
+    except TypeError:
+        restored = 0
+    assert restored == 1
+    event = target.get_nowait()
+    assert event["delegation_id"] == "deleg_owner_a"
+    assert target.empty()
+
+    claim = ad.claim_event_delivery(event, "resume-test")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+
+    assert ad.restore_undelivered_completions(
+        target,
+        session_keys={"owner-a"},
+        origin_ui_session_id="resumed-ui-a",
+    ) == 0
+    assert target.empty()
+    assert ad.get_durable_delegation("deleg_owner_b")["delivery_state"] == "pending"
+
+
+def test_discover_pending_completions_skips_queued_claimed_and_delivered():
+    """Periodic rediscovery must not duplicate local/claimed/terminal rows."""
+    import queue as queue_mod
+
+    def _persist(delegation_id, summary):
+        dispatched_at = time.time()
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": f"session-{delegation_id}",
+            "origin_ui_session_id": "",
+            "parent_session_id": f"parent-{delegation_id}",
+            "origin_session_id": "",
+            "dispatched_at": dispatched_at,
+        }
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": record["session_key"],
+            "origin_ui_session_id": "",
+            "parent_session_id": record["parent_session_id"],
+            "status": "completed",
+            "summary": summary,
+            "dispatched_at": dispatched_at,
+            "completed_at": dispatched_at + 1,
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(event, {"status": "completed", "summary": summary})
+        return event
+
+    pending = _persist("deleg_discover_pending", "pending result")
+    queued = _persist("deleg_discover_queued", "queued result")
+    claimed = _persist("deleg_discover_claimed", "claimed result")
+    delivered = _persist("deleg_discover_delivered", "delivered result")
+
+    assert ad.mark_completion_delivered("deleg_discover_delivered")
+    assert ad.claim_completion_delivery(
+        "deleg_discover_claimed", "foreign-claim",
+    )
+
+    target = queue_mod.Queue()
+    enqueued = ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_queued"},
+    )
+    assert enqueued == ["deleg_discover_pending"]
+    evt = target.get_nowait()
+    assert evt["delegation_id"] == "deleg_discover_pending"
+    assert evt.get("restored") is True
+    assert target.empty()
+
+    # Already-enqueued id stays excluded; claimed/delivered stay out.
+    assert ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_pending", "deleg_discover_queued"},
+    ) == []
+    assert target.empty()
+
+    # After the foreign claim expires, the row becomes eligible again.
+    # Exclude the still-pending first row so this pass isolates claim expiry.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET delivery_claimed_at=?
+               WHERE delegation_id='deleg_discover_claimed'""",
+            (time.time() - ad._DELIVERY_CLAIM_TTL_SECONDS - 1,),
+        )
+    enqueued = ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_pending"},
+    )
+    assert set(enqueued) == {"deleg_discover_claimed", "deleg_discover_queued"}
+    found = {target.get_nowait()["delegation_id"] for _ in enqueued}
+    assert found == {"deleg_discover_claimed", "deleg_discover_queued"}
+    assert delivered["delegation_id"] not in found
+    assert pending["delegation_id"] not in found
+    assert queued["delegation_id"] in found
+    assert claimed["delegation_id"] in found
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
