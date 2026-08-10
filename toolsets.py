@@ -306,6 +306,18 @@ TOOLSETS = {
         "includes": []
     },
 
+    "cursor_cloud": {
+        "description": (
+            "Cursor Cloud Agents bridge — start a new visible Cursor Cloud "
+            "agent per job (optional named environment) or continue via an "
+            "existing Cursor agent ID. Durable dispatch rows correlate Hermes "
+            "job/session/thread to cursor_agent_id/run/url for same-job resume. "
+            "Requires CURSOR_API_KEY."
+        ),
+        "tools": ["cursor_cloud_dispatch", "cursor_cloud_status"],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "

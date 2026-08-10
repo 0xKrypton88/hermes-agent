@@ -116,6 +116,7 @@ CONFIGURABLE_TOOLSETS = [
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
+    ("cursor_cloud",     "☁️  Cursor Cloud Bridge",     "cursor_cloud_dispatch/status (requires CURSOR_API_KEY)"),
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
@@ -153,7 +154,17 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+_DEFAULT_OFF_TOOLSETS = {
+    "homeassistant",
+    "cursor_cloud",
+    "spotify",
+    "discord",
+    "discord_admin",
+    "video",
+    "video_gen",
+    "x_search",
+    "a2a",
+}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
@@ -195,6 +206,26 @@ def _xai_credentials_present() -> bool:
     except ImportError:  # pragma: no cover — secret_scope is in-repo
         return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
     return bool(str(get_secret("XAI_API_KEY") or "").strip())
+
+
+def _cursor_cloud_credentials_present() -> bool:
+    """Cheap check for CURSOR_API_KEY (auto-enable cursor_cloud toolset)."""
+    try:
+        from agent.secret_scope import get_secret
+
+        if str(get_secret("CURSOR_API_KEY", "") or "").strip():
+            return True
+    except Exception:
+        pass
+    try:
+        if str(os.environ.get("CURSOR_API_KEY") or "").strip():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(str(get_env_value("CURSOR_API_KEY") or "").strip())
+    except Exception:
+        return False
 
 
 def _homeassistant_credentials_present() -> bool:
@@ -667,6 +698,23 @@ TOOL_CATEGORIES = {
                 "env_vars": [
                     {"key": "HASS_TOKEN", "prompt": "Home Assistant Long-Lived Access Token"},
                     {"key": "HASS_URL", "prompt": "Home Assistant URL", "default": "http://homeassistant.local:8123"},
+                ],
+            },
+        ],
+    },
+    "cursor_cloud": {
+        "name": "Cursor Cloud Bridge",
+        "icon": "☁️",
+        "providers": [
+            {
+                "name": "Cursor Cloud Agents API",
+                "tag": "Create/continue Cursor Cloud agents via API",
+                "env_vars": [
+                    {
+                        "key": "CURSOR_API_KEY",
+                        "prompt": "Cursor API key",
+                        "url": "https://cursor.com/dashboard/api",
+                    },
                 ],
             },
         ],
@@ -2318,6 +2366,8 @@ def _get_platform_tools(
                 default_off.remove(platform)
             if "homeassistant" in default_off and _homeassistant_credentials_present():
                 default_off.remove("homeassistant")
+            if "cursor_cloud" in default_off and _cursor_cloud_credentials_present():
+                default_off.remove("cursor_cloud")
             _exempt_explicit_platform_native(
                 default_off, platform, explicitly_configured=explicitly_configured
             )
@@ -2362,6 +2412,12 @@ def _get_platform_tools(
         )
         if x_search_auto_enabled:
             enabled_toolsets.add("x_search")
+        cursor_cloud_auto_enabled = (
+            _toolset_allowed_for_platform("cursor_cloud", platform)
+            and _cursor_cloud_credentials_present()
+        )
+        if cursor_cloud_auto_enabled:
+            enabled_toolsets.add("cursor_cloud")
 
         default_off = set(_DEFAULT_OFF_TOOLSETS)
         # Legacy safety: if the platform's own name matches a default-off
@@ -2380,11 +2436,15 @@ def _get_platform_tools(
         # regressed after #14798 made cron honor per-platform tool config.
         if "homeassistant" in default_off and _homeassistant_credentials_present():
             default_off.remove("homeassistant")
+        if "cursor_cloud" in default_off and _cursor_cloud_credentials_present():
+            default_off.remove("cursor_cloud")
         # Symmetric carve-out for x_search auto-enable (see the inject
         # block above). Without this, the default_off subtraction would
         # strip the entry we just added.
         if x_search_auto_enabled and "x_search" in default_off:
             default_off.remove("x_search")
+        if cursor_cloud_auto_enabled and "cursor_cloud" in default_off:
+            default_off.remove("cursor_cloud")
         _exempt_explicit_platform_native(
             default_off, platform, explicitly_configured=explicitly_configured
         )

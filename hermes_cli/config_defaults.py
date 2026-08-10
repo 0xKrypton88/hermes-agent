@@ -3851,6 +3851,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "CURSOR_API_KEY": {
+        "description": "Cursor API key for the Cursor Cloud Agents bridge (create/continue cloud agents)",
+        "prompt": "Cursor API key",
+        "url": "https://cursor.com/dashboard/api",
+        "tools": ["cursor_cloud_dispatch", "cursor_cloud_status"],
+        "password": True,
+        "category": "tool",
+    },
 
     # ── Bundled skills (opt-in: only needed if the user uses that skill) ──
     # These use category="skill" (distinct from "tool") so the sandbox

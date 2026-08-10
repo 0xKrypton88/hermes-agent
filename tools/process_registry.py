@@ -2812,6 +2812,19 @@ def format_process_notification(evt: dict) -> "str | None":
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
 
+    if evt_type == "cursor_cloud":
+        try:
+            from tools.cursor_cloud_bridge import format_cursor_cloud_completion
+
+            return format_cursor_cloud_completion(evt)
+        except Exception:
+            return (
+                "[CURSOR CLOUD JOB COMPLETE]\n"
+                "Resume the same Hermes job (not a fresh chat). "
+                f"dispatch_id={evt.get('dispatch_id')} "
+                f"cursor_agent_url={evt.get('cursor_agent_url')}"
+            )
+
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
     _reason = evt.get("completion_reason") or "exited"
