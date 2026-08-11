@@ -44,7 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -83,6 +83,15 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+# Active delivery claims expire after this TTL so a crashed consumer cannot
+# pin a row forever. Shared by claim_completion_delivery and the periodic
+# cross-process discover path.
+_DELIVERY_CLAIM_TTL_SECONDS = 300.0
+# How often a long-lived gateway watcher should scan state.db for durable
+# pending completions published by another process. Bounded to avoid busy
+# SQLite polling; the in-memory exclude-id guard prevents duplicate queueing
+# between scans.
+DURABLE_PENDING_SCAN_INTERVAL = 5.0
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -404,6 +413,225 @@ def restore_undelivered_completions(
     return restored
 
 
+def discover_pending_completions(
+    target_queue,
+    *,
+    exclude_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    """Enqueue durable pending completions that another process may have written.
+
+    Startup ``restore_undelivered_completions`` only runs once per process.
+    When a producer (dashboard, API server, etc.) persists a completed row into
+    the shared state.db and only puts the event on *its* in-memory
+    ``completion_queue``, a long-lived gateway never sees it until restart.
+    This helper is safe to call periodically from the idle watcher:
+
+    - skips rows that are already ``delivered`` / non-pending (SQL filter)
+    - skips rows with an *active* delivery claim (TTL-aware)
+    - skips ``exclude_ids`` already sitting on this process's queue / in flight
+    - stamps ``restored=True`` in-memory only (same ownership semantics as
+      startup restore; never persisted)
+
+    Returns the list of newly-enqueued ``delegation_id`` values so the caller
+    can extend its in-memory queued-id guard.
+    """
+    skip = {str(x) for x in (exclude_ids or set()) if str(x)}
+    enqueued: List[str] = []
+    now = time.time()
+    claim_floor = now - _DELIVERY_CLAIM_TTL_SECONDS
+
+    # Abandoned running rows become pending terminal events with event_json;
+    # pick those up on the same periodic cadence as cross-process completions.
+    try:
+        recover_abandoned_delegations()
+    except Exception:
+        logger.debug("discover_pending_completions: recover failed", exc_info=True)
+
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json, delivery_claim, delivery_claimed_at
+               FROM async_delegations
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+        for delegation_id, payload, claim, claimed_at in rows:
+            did = str(delegation_id or "")
+            if not did or did in skip:
+                continue
+            if claim and claimed_at is not None and float(claimed_at) >= claim_floor:
+                # Another consumer holds a live claim — do not duplicate.
+                continue
+            try:
+                evt = json.loads(payload)
+            except Exception:
+                logger.warning(
+                    "discover_pending_completions: bad event_json for %s", did,
+                )
+                continue
+            if not isinstance(evt, dict):
+                continue
+            evt["restored"] = True
+            target_queue.put(evt)
+            enqueued.append(did)
+            skip.add(did)
+    return enqueued
+
+
+def handoff_completion_to_outbox(
+    *,
+    delegation_id: str,
+    session_key: str,
+    summary: str,
+    status: str = "completed",
+    goal: str = "",
+    parent_session_id: Optional[str] = None,
+    origin_ui_session_id: str = "",
+    origin_session_id: str = "",
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    model: Optional[str] = None,
+    enqueue_wakeup: bool = True,
+    extra_event_fields: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Handoff a terminal completion into the durable origin-delivery outbox.
+
+    This is the bridge/plugin contract for external producers (e.g. Cursor
+    Cloud run finishers). It deliberately separates two states:
+
+    - ``handoff_state`` — local accept of the durable row (+ optional
+      in-memory queue wakeup). Values: ``accepted`` (persisted) or
+      ``queued`` (persisted and local wakeup enqueued).
+    - ``delivery_state`` — origin delivery ack from the gateway rail.
+      This call ALWAYS returns ``pending``. Origin ``delivered`` is set
+      only by ``complete_completion_delivery`` after a successful Slack/
+      gateway send.
+
+    Callers MUST NOT treat a successful handoff as origin delivery. The
+    historical bug was plugins labeling ``delivery_state=delivered`` at
+    queue-put time while core ``async_delegations`` stayed ``pending``.
+    """
+    did = str(delegation_id or "").strip()
+    if not did:
+        raise ValueError("delegation_id is required")
+    sk = str(session_key or "")
+    now = time.time()
+    result_payload = dict(result or {})
+    result_payload.setdefault("status", status)
+    result_payload.setdefault("summary", summary)
+    if error is not None:
+        result_payload.setdefault("error", error)
+
+    record = {
+        "delegation_id": did,
+        "session_key": sk,
+        "origin_ui_session_id": str(origin_ui_session_id or ""),
+        "origin_session_id": str(origin_session_id or ""),
+        "parent_session_id": parent_session_id,
+        "goal": goal,
+        "model": model,
+        "dispatched_at": now,
+    }
+    event: Dict[str, Any] = {
+        "type": "async_delegation",
+        "delegation_id": did,
+        "session_key": sk,
+        "origin_ui_session_id": record["origin_ui_session_id"],
+        "origin_session_id": record["origin_session_id"],
+        "parent_session_id": parent_session_id,
+        "goal": goal,
+        "model": model,
+        "status": status,
+        "summary": summary,
+        "error": error,
+        "api_calls": result_payload.get("api_calls", 0),
+        "duration_seconds": result_payload.get("duration_seconds"),
+        "dispatched_at": now,
+        "completed_at": now,
+    }
+    if extra_event_fields:
+        for key, value in extra_event_fields.items():
+            if key in ("type", "delegation_id"):
+                continue
+            event[key] = value
+
+    _persist_dispatch(record)
+    _persist_completion(event, result_payload)
+
+    handoff_state = "accepted"
+    if enqueue_wakeup:
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put(dict(event))
+            handoff_state = "queued"
+        except Exception as exc:
+            # Durable row remains pending; gateway rediscovery is authoritative.
+            logger.warning(
+                "Completion %s persisted to durable outbox but local queue "
+                "wakeup failed (%s); gateway rediscovery will deliver.",
+                did, exc,
+            )
+
+    durable = get_durable_delegation(did) or {}
+    return {
+        "delegation_id": did,
+        "handoff_state": handoff_state,
+        # Never claim origin delivery here — mirror the authoritative core row.
+        "delivery_state": durable.get("delivery_state") or "pending",
+        "delivery_attempts": durable.get("delivery_attempts") or 0,
+        "session_key": sk,
+        "status": status,
+    }
+
+
+def handoff_cursor_run_completion(
+    *,
+    run_id: str,
+    session_key: str,
+    summary: str,
+    status: str = "completed",
+    parent_session_id: Optional[str] = None,
+    origin_ui_session_id: str = "",
+    origin_session_id: str = "",
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    enqueue_wakeup: bool = True,
+    cursor_agent_id: str = "",
+    cursor_agent_url: str = "",
+) -> Dict[str, Any]:
+    """Handoff a Cursor Cloud run finish into the core durable outbox.
+
+    Uses ``delegation_id=cursor_<run_id>`` so core ``async_delegations`` is the
+    single source of truth for origin Slack delivery. Plugin registries must
+    mirror ``delivery_state`` from the returned payload (always ``pending``
+    until gateway ack) and must not invent a local ``delivered``.
+    """
+    raw = str(run_id or "").strip()
+    if not raw:
+        raise ValueError("run_id is required")
+    did = raw if raw.startswith("cursor_") else f"cursor_{raw}"
+    return handoff_completion_to_outbox(
+        delegation_id=did,
+        session_key=session_key,
+        summary=summary,
+        status=status,
+        goal=f"cursor cloud run {raw}",
+        parent_session_id=parent_session_id,
+        origin_ui_session_id=origin_ui_session_id,
+        origin_session_id=origin_session_id,
+        result=result,
+        error=error,
+        enqueue_wakeup=enqueue_wakeup,
+        extra_event_fields={
+            "cursor_run_id": raw[len("cursor_"):] if raw.startswith("cursor_") else raw,
+            "cursor_agent_id": cursor_agent_id or "",
+            "cursor_agent_url": cursor_agent_url or "",
+            "producer": "cursor_cloud",
+        },
+    )
+
+
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
@@ -431,7 +659,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id, now, now, delegation_id,
+                now - _DELIVERY_CLAIM_TTL_SECONDS,
+            ),
         )
         return cur.rowcount == 1
 
@@ -1003,9 +1234,11 @@ def _push_completion_event(
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        # Durable outbox already holds the row as delivery_state=pending;
+        # gateway rediscovery (startup restore + periodic scan) will deliver.
         logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "Async delegation %s: failed to enqueue local completion wakeup "
+            "(%s); durable outbox remains pending for gateway rediscovery.",
             record.get("delegation_id"), exc,
         )
 
