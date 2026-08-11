@@ -1638,6 +1638,7 @@ daytona = [
     { name = "daytona" },
 ]
 dev = [
+    { name = "aiohttp" },
     { name = "debugpy" },
     { name = "mcp" },
     { name = "pytest" },
