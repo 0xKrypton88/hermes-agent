@@ -11,3 +11,6 @@ docker/entrypoint.sh text eol=lf
 
 # Keep the cross-platform session-title contract diff-clean on Windows.
 agent/session_title_meta.py text eol=lf
+
+# Contributor identity mappings are parsed as one-line text records.
+contributors/emails/* text eol=lf
