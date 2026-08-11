@@ -11656,6 +11656,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        try:
+            from gateway.job_threads import get_default_store
+
+            await asyncio.to_thread(
+                get_default_store().reconcile_incomplete_creates
+            )
+        except Exception:
+            logger.debug("job_threads restart reconciliation failed", exc_info=True)
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -14789,6 +14797,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Durable Slack job-thread control (status / fortsätt / pausa / hjälp).
+        # Resolved via persisted (platform, chat_id, root_thread_ts) ↔ job_id
+        # mapping — never transcript heuristics. Unmapped legacy threads fall
+        # through unchanged.
+        if not is_internal:
+            try:
+                _job_reply = await self._maybe_handle_job_thread_command(event)
+            except Exception:
+                logger.debug("job_threads inbound routing failed", exc_info=True)
+                _job_reply = None
+            if _job_reply is not None:
+                return _job_reply
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events

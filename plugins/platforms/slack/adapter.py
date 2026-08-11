@@ -2243,15 +2243,50 @@ class SlackAdapter(BasePlatformAdapter):
 
         Returns the seed message ts as a string, or ``None`` on failure.
         """
+        return await self._post_thread_root(
+            parent_chat_id,
+            seed_text=(
+                f":thread: Hermes handoff — *{(name or 'session').strip()[:80]}*"
+            ),
+            purpose="Handoff thread",
+        )
+
+    async def create_job_root_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+        *,
+        job_id: str = "",
+    ) -> Optional[str]:
+        """Create a Slack root message for a durable job thread.
+
+        Restricted to the already-authorized ``parent_chat_id`` (the current
+        DM/channel). Does not create channels, invite members, or redirect to
+        arbitrary destinations. Returns the seed message ``ts`` used as
+        ``root_thread_ts`` for subsequent status replies.
+        """
+        label = (name or "job").strip()[:80]
+        job_tag = f" `{job_id}`" if job_id else ""
+        return await self._post_thread_root(
+            parent_chat_id,
+            seed_text=f":thread: Hermes job{job_tag} — *{label}*",
+            purpose="Job root thread",
+        )
+
+    async def _post_thread_root(
+        self,
+        parent_chat_id: str,
+        *,
+        seed_text: str,
+        purpose: str,
+    ) -> Optional[str]:
+        """Post a channel/DM seed message and return its ``ts`` as thread root."""
         if not self._app:
             return None
         try:
             client = self._get_client(parent_chat_id)
             if client is None:
                 return None
-            seed_text = (
-                f":thread: Hermes handoff — *{(name or 'session').strip()[:80]}*"
-            )
             result = await client.chat_postMessage(
                 channel=parent_chat_id,
                 text=seed_text,
@@ -2265,8 +2300,9 @@ class SlackAdapter(BasePlatformAdapter):
                 return str(ts)
         except Exception as exc:
             logger.warning(
-                "[%s] Handoff thread: seed-post failed for channel %s: %s",
+                "[%s] %s: seed-post failed for channel %s: %s",
                 self.name,
+                purpose,
                 parent_chat_id,
                 exc,
             )

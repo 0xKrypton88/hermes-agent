@@ -103,6 +103,86 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    async def _maybe_handle_job_thread_command(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Route job-control text via durable Slack job-thread mapping.
+
+        Returns a reply string when handled (delivered in-thread by the
+        platform adapter's normal response path), or ``None`` so legacy /
+        unmapped threads continue through normal gateway dispatch.
+        """
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        platform = getattr(source, "platform", None)
+        platform_name = getattr(platform, "value", None) or str(platform or "")
+        if str(platform_name).lower() != "slack":
+            return None
+        thread_ts = getattr(source, "thread_id", None)
+        chat_id = getattr(source, "chat_id", None)
+        if not thread_ts or not chat_id:
+            return None
+
+        from gateway.job_threads import (
+            ACTION_COMPLETION,
+            ACTION_CONTINUE,
+            ACTION_HELP,
+            ACTION_PAUSE,
+            ACTION_STATUS,
+            PHASE_ACTIVE,
+            PHASE_COMPLETED,
+            PHASE_PAUSED,
+            get_default_store,
+            route_inbound_job_command,
+        )
+
+        route = route_inbound_job_command(
+            platform="slack",
+            chat_id=str(chat_id),
+            thread_ts=str(thread_ts),
+            text=event.text or "",
+        )
+        if route is None:
+            return None
+
+        store = get_default_store()
+        job = store.get_job(route.job_id) or route.job
+        action = route.action
+        if action == ACTION_STATUS:
+            return (
+                f"Job `{job['job_id']}` — phase={job.get('phase')} "
+                f"next_action={job.get('next_action')}\n"
+                f"Objective: {job.get('objective')}"
+            )
+        if action == ACTION_PAUSE:
+            job = store.update_job(
+                route.job_id,
+                phase=PHASE_PAUSED,
+                next_action="await_continue",
+            )
+            return f"Job `{job['job_id']}` paused."
+        if action == ACTION_CONTINUE:
+            job = store.update_job(
+                route.job_id,
+                phase=PHASE_ACTIVE,
+                next_action="await_work",
+            )
+            return f"Job `{job['job_id']}` continuing."
+        if action == ACTION_HELP:
+            return (
+                f"Job `{job['job_id']}` help — commands: status, "
+                f"fortsätt/continue, pausa/pause, hjälp agenten/help, klar/done."
+            )
+        if action == ACTION_COMPLETION:
+            job = store.update_job(
+                route.job_id,
+                phase=PHASE_COMPLETED,
+                next_action="done",
+            )
+            return f"Job `{job['job_id']}` completed."
+        return None
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
