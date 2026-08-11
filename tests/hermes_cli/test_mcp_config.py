@@ -840,3 +840,112 @@ class TestMcpReauth:
         cmd_mcp_reauth(_make_args(name="ghost", all=False))
         out = capsys.readouterr().out
         assert "not found" in out
+
+    def test_reauth_single_authorization_lifecycle(self, tmp_path, capsys, monkeypatch):
+        """``hermes mcp reauth <server>`` has exactly one PKCE/callback lifecycle.
+
+        Simulates a probe that (1) starts one browser authorization, (2) is
+        hit by a competing 401/rebuild that tries a second state, which must
+        be refused, then (3) completes the matching callback / token write
+        without opening another prompt.
+        """
+        import asyncio
+        import threading
+
+        _seed_config(tmp_path, {
+            "linear": {
+                "url": "https://mcp.linear.app/mcp",
+                "auth": "oauth",
+            },
+        })
+        token_dir = tmp_path / "mcp-tokens"
+        opens: list[str] = []
+        seen = {"second_rejected": False}
+
+        def mock_probe(name, cfg, connect_timeout=30):
+            # Runs inside force_interactive_oauth() from _reauth_oauth_server.
+            import tools.mcp_oauth as mod
+
+            monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+            monkeypatch.setattr(
+                mod.webbrowser, "open", lambda url: opens.append(url) or True
+            )
+            monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+            monkeypatch.setattr(
+                mod, "_raise_if_non_interactive", lambda *_a, **_k: None
+            )
+
+            port = mod._configure_callback_port({})
+            # Competing configure (second provider build) must reuse the port.
+            assert mod._configure_callback_port({}) == port
+
+            redirect = mod._make_redirect_handler(port)
+            waiter = mod._make_callback_waiter(port)
+
+            url_a = (
+                f"https://linear.app/oauth/authorize?state=reauthState1"
+                f"&redirect_uri=http://127.0.0.1:{port}/callback"
+            )
+            asyncio.run(redirect(url_a))
+
+            url_b = (
+                f"https://linear.app/oauth/authorize?state=reauthState2"
+                f"&redirect_uri=http://127.0.0.1:{port}/callback"
+            )
+            try:
+                asyncio.run(redirect(url_b))
+            except RuntimeError as exc:
+                assert "second browser prompt" in str(exc)
+                seen["second_rejected"] = True
+
+            async def complete_first():
+                task = asyncio.create_task(waiter())
+                threading.Thread(
+                    target=_hit_callback,
+                    args=(
+                        f"http://127.0.0.1:{port}/callback"
+                        f"?code=linear-code&state=reauthState1",
+                    ),
+                    daemon=True,
+                ).start()
+                return await asyncio.wait_for(task, timeout=20)
+
+            code, state = asyncio.run(complete_first())
+            assert code == "linear-code"
+            assert state == "reauthState1"
+
+            # Token exchange succeeded for the first (only) authorization.
+            token_dir.mkdir(exist_ok=True)
+            (token_dir / f"{name}.json").write_text(
+                '{"access_token":"linear-atok","token_type":"Bearer"}'
+            )
+            return [("list_issues", "List Linear issues")]
+
+        def _hit_callback(url: str, timeout: float = 15.0) -> None:
+            import time
+            import urllib.request
+
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    urllib.request.urlopen(url, timeout=5)
+                    return
+                except OSError:
+                    time.sleep(0.05)
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        from tools.mcp_oauth_manager import reset_manager_for_tests
+
+        reset_manager_for_tests()
+        from hermes_cli.mcp_config import cmd_mcp_reauth
+
+        cmd_mcp_reauth(_make_args(name="linear", all=False))
+        out = capsys.readouterr().out
+
+        assert seen["second_rejected"] is True
+        assert len(opens) == 1
+        assert "reauthState1" in opens[0]
+        assert "Authenticated — 1 tool(s) available" in out
+        assert (token_dir / "linear.json").exists()

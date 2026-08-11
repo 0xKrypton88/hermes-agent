@@ -572,8 +572,14 @@ class MCPOAuthManager:
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
+        # Close over this build's resolved port (and optional proxy
+        # redirect_uri) so a later _configure_callback_port during the same
+        # reauth cannot redirect/wait on a competing port. force_interactive
+        # reauth also pins the port in a ContextVar for rebuild reuse.
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(resolved_port)
+        redirect_handler = _make_redirect_handler(
+            resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        )
         callback_handler = _make_callback_waiter(resolved_port)
 
         return _HERMES_PROVIDER_CLS(

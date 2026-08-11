@@ -384,6 +384,135 @@ class TestCallbackPortReservation:
 
 
 # ---------------------------------------------------------------------------
+# Exclusive reauth: one PKCE state / callback lifecycle per invocation
+# ---------------------------------------------------------------------------
+
+class TestReauthSingleAuthorizationLifecycle:
+    """``hermes mcp reauth`` / ``force_interactive_oauth`` single-flight.
+
+    A competing 401/probe rebuild must not open a second browser prompt or
+    replace the first flow's callback port/state mid-invocation.
+    """
+
+    def test_reauth_pins_callback_port_across_configure_calls(self, monkeypatch):
+        import tools.mcp_oauth as mod
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+
+        with mod.force_interactive_oauth():
+            port_a = mod._configure_callback_port({})
+            # Simulate a competing provider rebuild during the same reauth.
+            port_b = mod._configure_callback_port({})
+            assert port_a == port_b
+            flow = mod._get_reauth_flow()
+            assert flow is not None and flow["port"] == port_a
+            assert mod._oauth_port == port_a
+            leftover = mod._reserved_sockets.pop(port_a, None)
+            if leftover is not None:
+                leftover.close()
+
+    def test_reauth_refuses_second_browser_state_and_completes_first_callback(
+        self, monkeypatch
+    ):
+        """One authorization URL/state; matching callback finishes exchange
+        without a second prompt."""
+        import threading
+        import tools.mcp_oauth as mod
+
+        opens: list[str] = []
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        monkeypatch.setattr(
+            mod.webbrowser, "open", lambda url: opens.append(url) or True
+        )
+        # No paste thread — drive the HTTP callback explicitly.
+        monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda *_a, **_k: None)
+
+        with mod.force_interactive_oauth():
+            port = mod._configure_callback_port({})
+            # Competing configure during the same reauth must keep the port.
+            assert mod._configure_callback_port({}) == port
+            flow = mod._get_reauth_flow()
+            assert flow is not None
+
+            redirect = mod._make_redirect_handler(port)
+            waiter = mod._make_callback_waiter(port)
+
+            url_a = (
+                "https://idp.example/authorize?state=stateAAAA"
+                "&code_challenge=challengeA&redirect_uri="
+                f"http://127.0.0.1:{port}/callback"
+            )
+            asyncio.run(redirect(url_a))
+            assert opens == [url_a]
+            assert flow["state"] == "stateAAAA"
+
+            url_b = (
+                "https://idp.example/authorize?state=stateBBBB"
+                "&code_challenge=challengeB&redirect_uri="
+                f"http://127.0.0.1:{port}/callback"
+            )
+            with pytest.raises(RuntimeError, match="second browser prompt"):
+                asyncio.run(redirect(url_b))
+            # Still exactly one authorization attempt.
+            assert opens == [url_a]
+            assert flow["state"] == "stateAAAA"
+
+            async def drive_callback():
+                task = asyncio.create_task(waiter())
+                threading.Thread(
+                    target=_hit_callback_when_ready,
+                    args=(
+                        f"http://127.0.0.1:{port}/callback"
+                        f"?code=authcode1&state=stateAAAA",
+                    ),
+                    daemon=True,
+                ).start()
+                return await asyncio.wait_for(task, timeout=20)
+
+            code, state = asyncio.run(drive_callback())
+            assert code == "authcode1"
+            assert state == "stateAAAA"
+            # Completing the matching callback must not open another prompt.
+            assert opens == [url_a]
+
+    def test_reauth_second_callback_waiter_joins_first_lifecycle(self, monkeypatch):
+        """A second callback_handler during exclusive reauth must not bind
+        another listener on the pinned port — it joins the first lifecycle."""
+        import threading
+        import tools.mcp_oauth as mod
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda *_a, **_k: None)
+
+        with mod.force_interactive_oauth():
+            port = mod._configure_callback_port({})
+            waiter_a = mod._make_callback_waiter(port)
+            waiter_b = mod._make_callback_waiter(port)
+
+            async def drive():
+                task_a = asyncio.create_task(waiter_a())
+                # Let the owner claim the exclusive slot and bind.
+                await asyncio.sleep(0.2)
+                task_b = asyncio.create_task(waiter_b())
+                threading.Thread(
+                    target=_hit_callback_when_ready,
+                    args=(
+                        f"http://127.0.0.1:{port}/callback"
+                        f"?code=shared&state=s1",
+                    ),
+                    daemon=True,
+                ).start()
+                return await asyncio.wait_for(
+                    asyncio.gather(task_a, task_b), timeout=20
+                )
+
+            (code_a, state_a), (code_b, state_b) = asyncio.run(drive())
+            assert (code_a, state_a) == ("shared", "s1")
+            assert (code_b, state_b) == ("shared", "s1")
+
+
+# ---------------------------------------------------------------------------
 # remove_oauth_tokens
 # ---------------------------------------------------------------------------
 

@@ -165,6 +165,21 @@ _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextV
     "_oauth_interactive_forced", default=False
 )
 
+# Exclusive reauth/login guard (`force_interactive_oauth`). One mutable flow
+# dict is installed in the ContextVar for the duration of `hermes mcp reauth`
+# / `login`. The dict is shared by reference across asyncio.run / MCP-loop
+# context copies, so port/state/callback mutations remain visible to competing
+# 401/probe paths and cannot open a second browser prompt mid-invocation.
+# Keys: lock, port, state, result, owner_claimed, done (threading.Event).
+_oauth_reauth_flow: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "_oauth_reauth_flow", default=None
+)
+
+
+def _get_reauth_flow() -> dict | None:
+    """Return the active exclusive-reauth flow dict, or None outside reauth."""
+    return _oauth_reauth_flow.get()
+
 
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
 _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
@@ -330,11 +345,26 @@ def force_interactive_oauth():
     — just not on stdin. Opens the browser + localhost callback flow that the
     TTY heuristic would otherwise refuse. Same ContextVar propagation story as
     suppress_interactive_oauth() (#35927).
+
+    Also opens an *exclusive* reauth/login single-flight scope: one callback
+    port and one PKCE authorization state for the whole ``hermes mcp reauth``
+    / ``login`` invocation. Competing 401/probe rebuilds reuse that port and
+    cannot open a second browser prompt with a different state.
     """
     token = _oauth_interactive_forced.set(True)
+    flow = {
+        "lock": threading.Lock(),
+        "port": None,
+        "state": None,
+        "result": {"auth_code": None, "state": None, "error": None},
+        "owner_claimed": False,
+        "done": threading.Event(),
+    }
+    flow_tok = _oauth_reauth_flow.set(flow)
     try:
         yield
     finally:
+        _oauth_reauth_flow.reset(flow_tok)
         _oauth_interactive_forced.reset(token)
 
 
@@ -734,6 +764,29 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
             "session is available (non-interactive/background context)."
         )
 
+        # Exclusive reauth/login: exactly one browser/PKCE state per invocation.
+        # A competing 401/probe path that generates a second authorization URL
+        # must not open another prompt or stale the first callback's state.
+        reauth_flow = _get_reauth_flow()
+        if reauth_flow is not None:
+            state = parse_qs(urlparse(authorization_url).query).get("state", [None])[0]
+            if not state:
+                raise ValueError(
+                    "OAuth authorization URL did not include state"
+                )
+            with reauth_flow["lock"]:
+                existing = reauth_flow["state"]
+                if existing is not None:
+                    if existing != state:
+                        raise RuntimeError(
+                            "OAuth reauth already has an in-flight authorization; "
+                            "refusing a second browser prompt from a competing "
+                            "401/probe path."
+                        )
+                    # Idempotent re-publish of the same state — do not reopen.
+                    return
+                reauth_flow["state"] = state
+
         msg = (
             f"\n  MCP OAuth: authorization required.\n"
             f"  Open this URL in your browser:\n\n"
@@ -855,7 +908,46 @@ def _make_callback_waiter(port: int):
             "authorization without binding a callback listener."
         )
 
+        # Exclusive reauth/login: join the single shared callback lifecycle
+        # instead of binding a second listener that would steal/close the
+        # first flow's port (and stale its PKCE state).
+        reauth_flow = _get_reauth_flow()
+        join_existing = False
+        if reauth_flow is not None:
+            with reauth_flow["lock"]:
+                if reauth_flow["owner_claimed"]:
+                    join_existing = True
+                else:
+                    reauth_flow["owner_claimed"] = True
+
+        if join_existing and reauth_flow is not None:
+            timeout = 300.0
+            poll_interval = 0.5
+            elapsed = 0.0
+            result = reauth_flow["result"]
+            while elapsed < timeout:
+                if reauth_flow["done"].is_set():
+                    break
+                if result["auth_code"] is not None or result["error"] is not None:
+                    break
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+            if result["error"] == _USER_SKIPPED_SENTINEL:
+                raise OAuthNonInteractiveError("user_skipped")
+            if result["error"]:
+                raise RuntimeError(f"OAuth authorization failed: {result['error']}")
+            if result["auth_code"] is None:
+                raise OAuthNonInteractiveError(
+                    "OAuth callback timed out — no authorization code received. "
+                    "Ensure you completed the browser authorization flow."
+                )
+            return result["auth_code"], result["state"]
+
+        # Own the listener. Under exclusive reauth, publish the result dict
+        # into the shared flow so any joiner sees the same code/state.
         handler_cls, result = _make_callback_handler()
+        if reauth_flow is not None:
+            reauth_flow["result"] = result
 
         # Start a temporary server on this flow's port, adopting the socket
         # reserved at port-selection time when one exists. Holding the bound
@@ -886,6 +978,8 @@ def _make_callback_waiter(port: int):
             # collided. build_oauth_auth does not start its own callback server,
             # so there is nothing to poll here; surface a clear, actionable error
             # instead of a misleading "timed out".
+            if reauth_flow is not None:
+                reauth_flow["done"].set()
             raise OAuthNonInteractiveError(
                 f"OAuth callback port {port} is already in use ({exc}). "
                 "Close any other in-progress login, or set a free `oauth.redirect_port` "
@@ -924,6 +1018,8 @@ def _make_callback_waiter(port: int):
                 elapsed += poll_interval
         finally:
             server.server_close()
+            if reauth_flow is not None:
+                reauth_flow["done"].set()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -1065,10 +1161,12 @@ def _configure_callback_port(
     3. newly allocated free port
 
     NOTE: also sets the legacy module-level ``_oauth_port`` so existing
-    calls to ``_wait_for_callback`` keep working. The legacy global is
-    the root cause of issue #5344 (port collision on concurrent OAuth
-    flows); replacing it with a ContextVar is out of scope for this
-    consolidation PR.
+    calls to ``_wait_for_callback`` keep working. During
+    ``force_interactive_oauth`` (``hermes mcp reauth`` / ``login``) the
+    first resolved port is pinned in a ContextVar and reused for any
+    subsequent configure calls in that scope, so a competing 401/probe
+    rebuild cannot leak a second callback port/state into the same
+    invocation.
     """
     global _oauth_port
     from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
@@ -1083,6 +1181,20 @@ def _configure_callback_port(
         cfg["redirect_uri"] = cached_redirect_uri
         cfg["_resolved_port"] = 0
         return 0
+
+    # Exclusive reauth/login: reuse the port pinned by the first configure
+    # in this force_interactive_oauth scope. Prevents a second provider
+    # build from reserving a new ephemeral port while the first browser
+    # auth is still in flight.
+    reauth_flow = _get_reauth_flow()
+    if reauth_flow is not None:
+        with reauth_flow["lock"]:
+            pinned = reauth_flow["port"]
+        if pinned:
+            cfg["_resolved_port"] = pinned
+            _oauth_port = pinned
+            return pinned
+
     requested = int(cfg.get("redirect_port", 0))
     # Precedence: explicit config port → cached client-registration port →
     # fresh ephemeral port. The cached port keeps re-auth consistent with the
@@ -1095,6 +1207,15 @@ def _configure_callback_port(
     port = requested or _cached_redirect_port(storage) or _reserve_callback_port()
     cfg["_resolved_port"] = port
     _oauth_port = port  # legacy consumer: _wait_for_callback reads this
+    if reauth_flow is not None and port:
+        with reauth_flow["lock"]:
+            if reauth_flow["port"] is None:
+                reauth_flow["port"] = port
+            else:
+                # Another configure won the race — prefer the pinned port.
+                port = reauth_flow["port"]
+                cfg["_resolved_port"] = port
+                _oauth_port = port
     return port
 
 
