@@ -9,34 +9,73 @@ Design invariants
 -----------------
 1. A durable job row is written *before* any Slack root is created, with phase
    ``CREATING_THREAD`` and a caller-supplied idempotency key.
-2. Root creation is limited to the already-authorized ``chat_id`` (DM / channel
+2. A durable ``create_operation_id`` (create-intent token) is persisted *before*
+   the first Slack API call so the exact attempt is identifiable after restart.
+3. Root creation is limited to the already-authorized ``chat_id`` (DM / channel
    the caller passed). No channel or membership mutations, no arbitrary
    destinations.
-3. Double create / retry / restart with the same idempotency key never opens a
-   second root. A root that exists without a completed mapping is kept as
-   ``pending`` / ``PENDING_RECOVERY`` — never silently orphaned.
-4. Inbound job-control text is resolved via the durable mapping, not transcript
+4. Double create / retry / restart with the same idempotency key never opens a
+   second root. Unknown outcomes after a claimed create are fail-closed
+   (``PENDING_RECOVERY``) unless the same operation can be reconciled.
+5. Initial status is posted only after ``root_thread_ts`` is durably bound, and
+   at most once (status-post claim).
+6. Inbound job-control text is resolved via the durable mapping, not transcript
    heuristics. Unmapped (legacy) threads fall through unchanged.
+
+Crash-window recovery path (documented)
+---------------------------------------
+Primary: Slack ``client_msg_id`` = ``create_operation_id`` makes the root post
+idempotent for the same attempt; the seed text also embeds
+``hermes_job_op=<create_operation_id>``.
+
+On unknown outcome (Slack may have accepted the message but the client lost
+the ``ts``):
+
+1. Scan the authorized chat via ``find_job_root_by_operation_id`` for the
+   exact operation marker (no new post).
+2. If still unknown, one idempotent Slack retry with the *same*
+   ``client_msg_id`` / operation id (not a new claim).
+3. If still unknown → ``PENDING_RECOVERY`` with ``next_action=reconcile_root``
+   and **no additional post**.
+
+Cross-process safety: every store mutation takes a thread RLock plus an
+advisory ``fcntl.flock`` on ``job_threads.json.lock``, and reloads from disk
+under that lock before mutating (CAS-style against concurrent gateway
+processes).
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import re
 import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from hermes_constants import get_hermes_home
 from utils import atomic_write_text
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None
+
 logger = logging.getLogger(__name__)
 
 STORE_FILENAME = "job_threads.json"
+STORE_LOCK_SUFFIX = ".lock"
+_STORE_LOCK_TIMEOUT_SECONDS = 10.0
 
 # Explicit lifecycle phases. CREATING_THREAD is required before any Slack call.
 PHASE_CREATING_THREAD = "CREATING_THREAD"
@@ -58,6 +97,9 @@ ACTION_COMPLETION = "completion"
 
 _SUPPORTED_PLATFORMS = frozenset({"slack"})
 
+# Exact marker embedded in Slack root seed text for recovery scans.
+OPERATION_MARKER_PREFIX = "hermes_job_op="
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -65,6 +107,10 @@ def _utc_now_iso() -> str:
 
 def _thread_index_key(platform: str, chat_id: str, thread_ts: str) -> str:
     return f"{platform}:{chat_id}:{thread_ts}"
+
+
+def format_operation_marker(operation_id: str) -> str:
+    return f"{OPERATION_MARKER_PREFIX}{operation_id}"
 
 
 def resolve_job_threads_store_path(path: str | Path | None = None) -> Path:
@@ -90,60 +136,143 @@ class JobThreadStore:
     def __init__(self, path: str | Path | None = None):
         self.path = resolve_job_threads_store_path(path)
         self._lock = threading.RLock()
+        self._lock_state = threading.local()
         self._state: Dict[str, Any] = {
             "jobs": {},
             "by_idempotency": {},
             "by_thread": {},
             "pending_roots": {},
         }
-        self._load()
+        with self._store_lock():
+            self._load_unlocked()
 
-    def _load(self) -> None:
-        with self._lock:
-            if not self.path.exists():
-                return
+    def _lock_file_path(self) -> Path:
+        return Path(str(self.path) + STORE_LOCK_SUFFIX)
+
+    @contextlib.contextmanager
+    def _store_lock(self) -> Iterator[None]:
+        """Thread RLock + cross-process advisory flock; reload-safe nesting."""
+        depth = getattr(self._lock_state, "depth", 0)
+        if depth:
+            self._lock_state.depth = depth + 1
             try:
-                import json
+                yield
+            finally:
+                self._lock_state.depth -= 1
+            return
 
-                data = json.loads(self.path.read_text(encoding="utf-8") or "{}")
-            except Exception:
-                logger.warning(
-                    "job_threads: failed to load store at %s; starting empty",
-                    self.path,
-                    exc_info=True,
-                )
-                return
-            if not isinstance(data, dict):
-                return
-            self._state["jobs"] = dict(data.get("jobs") or {})
-            self._state["by_idempotency"] = dict(data.get("by_idempotency") or {})
-            self._state["by_thread"] = dict(data.get("by_thread") or {})
-            self._state["pending_roots"] = dict(data.get("pending_roots") or {})
+        with self._lock:
+            self._lock_state.depth = 1
+            lock_fd = None
+            try:
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_fd = open(self._lock_file_path(), "a+", encoding="utf-8")
+                    lock_fd.seek(0)
+                    if fcntl is not None:
+                        deadline = time.monotonic() + _STORE_LOCK_TIMEOUT_SECONDS
+                        while True:
+                            try:
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except (OSError, IOError):
+                                if time.monotonic() >= deadline:
+                                    logger.error(
+                                        "Timed out after %.0fs waiting for job_threads "
+                                        "lock (%s); proceeding with in-process lock only",
+                                        _STORE_LOCK_TIMEOUT_SECONDS,
+                                        self._lock_file_path(),
+                                    )
+                                    try:
+                                        lock_fd.close()
+                                    except OSError:
+                                        pass
+                                    lock_fd = None
+                                    break
+                                time.sleep(0.05)
+                    elif msvcrt is not None:
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1
+                        )
+                except (OSError, IOError) as exc:
+                    logger.warning(
+                        "job_threads cross-process lock unavailable (%s); "
+                        "proceeding with in-process lock only",
+                        exc,
+                    )
+                    if lock_fd is not None:
+                        try:
+                            lock_fd.close()
+                        except OSError:
+                            pass
+                        lock_fd = None
+                try:
+                    yield
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            if fcntl is not None:
+                                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                            elif msvcrt is not None:
+                                getattr(msvcrt, "locking")(
+                                    lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                                )
+                        except (OSError, IOError):
+                            pass
+                        finally:
+                            lock_fd.close()
+            finally:
+                self._lock_state.depth = 0
 
-    def _persist(self) -> None:
-        import json
+    def _load_unlocked(self) -> None:
+        if not self.path.exists():
+            self._state = {
+                "jobs": {},
+                "by_idempotency": {},
+                "by_thread": {},
+                "pending_roots": {},
+            }
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            logger.warning(
+                "job_threads: failed to load store at %s; starting empty",
+                self.path,
+                exc_info=True,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        self._state["jobs"] = dict(data.get("jobs") or {})
+        self._state["by_idempotency"] = dict(data.get("by_idempotency") or {})
+        self._state["by_thread"] = dict(data.get("by_thread") or {})
+        self._state["pending_roots"] = dict(data.get("pending_roots") or {})
 
+    def _persist_unlocked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self._state, indent=2, sort_keys=True)
         atomic_write_text(self.path, payload + "\n", create_mode=0o600)
 
-    def _snapshot_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def _snapshot_job_unlocked(self, job_id: str) -> Optional[Dict[str, Any]]:
         record = self._state["jobs"].get(job_id)
         return deepcopy(record) if isinstance(record, dict) else None
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._snapshot_job(job_id)
+        with self._store_lock():
+            self._load_unlocked()
+            return self._snapshot_job_unlocked(job_id)
 
     def get_by_idempotency(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         key = str(idempotency_key or "").strip()
         if not key:
             return None
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job_id = self._state["by_idempotency"].get(key)
             if not job_id:
                 return None
-            return self._snapshot_job(str(job_id))
+            return self._snapshot_job_unlocked(str(job_id))
 
     def find_by_thread(
         self,
@@ -157,7 +286,8 @@ class JobThreadStore:
         if not (platform_n and chat_n and ts_n):
             return None
         key = _thread_index_key(platform_n, chat_n, ts_n)
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job_id = self._state["by_thread"].get(key)
             if not job_id:
                 pending = self._state["pending_roots"].get(key)
@@ -165,7 +295,7 @@ class JobThreadStore:
                     job_id = pending.get("job_id")
             if not job_id:
                 return None
-            return self._snapshot_job(str(job_id))
+            return self._snapshot_job_unlocked(str(job_id))
 
     def create_job_creating_thread(
         self,
@@ -180,7 +310,7 @@ class JobThreadStore:
         """Create or return the durable job row in ``CREATING_THREAD``.
 
         Idempotent on ``idempotency_key``: a retry returns the existing row
-        without mutating a bound root.
+        without mutating a bound root. Serialized across processes via flock.
         """
         key = str(idempotency_key or "").strip()
         if not key:
@@ -195,10 +325,11 @@ class JobThreadStore:
         if not objective_n:
             raise ValueError("objective is required")
 
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             existing_id = self._state["by_idempotency"].get(key)
             if existing_id:
-                existing = self._snapshot_job(str(existing_id))
+                existing = self._snapshot_job_unlocked(str(existing_id))
                 if existing is not None:
                     return existing
 
@@ -214,31 +345,53 @@ class JobThreadStore:
                 "phase": PHASE_CREATING_THREAD,
                 "next_action": str(next_action or "create_slack_root"),
                 "create_attempts": 0,
+                "create_operation_id": None,
                 "initial_status_posted": False,
+                "status_post_claimed": False,
                 "created_at": now,
                 "updated_at": now,
             }
             self._state["jobs"][new_id] = record
             self._state["by_idempotency"][key] = new_id
-            self._persist()
+            self._persist_unlocked()
             return deepcopy(record)
 
-    def mark_create_attempt(self, job_id: str) -> Dict[str, Any]:
-        """Increment create_attempts while still in CREATING_THREAD."""
-        with self._lock:
+    def claim_create_operation(self, job_id: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Persist a durable create-intent token *before* any Slack API call.
+
+        Returns ``(job, operation_id)`` when the caller may perform the Slack
+        root post for this fresh claim.
+
+        Returns ``(job, None)`` when a prior claim already exists, a root is
+        already bound, or the job is in ``PENDING_RECOVERY`` — the caller must
+        **not** open a new root (reconcile the existing operation instead).
+        """
+        with self._store_lock():
+            self._load_unlocked()
             job = self._state["jobs"].get(job_id)
             if not isinstance(job, dict):
                 raise KeyError(f"unknown job_id: {job_id}")
             if job.get("root_thread_ts"):
-                return deepcopy(job)
+                return deepcopy(job), None
             if job.get("phase") == PHASE_PENDING_RECOVERY:
-                return deepcopy(job)
+                return deepcopy(job), None
+            existing_op = str(job.get("create_operation_id") or "").strip()
+            if existing_op:
+                # Prior durable claim — do not mint a second operation id.
+                return deepcopy(job), None
+            operation_id = uuid.uuid4().hex
+            job["create_operation_id"] = operation_id
             job["create_attempts"] = int(job.get("create_attempts") or 0) + 1
             job["phase"] = PHASE_CREATING_THREAD
             job["next_action"] = "await_slack_root"
             job["updated_at"] = _utc_now_iso()
-            self._persist()
-            return deepcopy(job)
+            self._persist_unlocked()
+            return deepcopy(job), operation_id
+
+    def mark_create_attempt(self, job_id: str) -> Dict[str, Any]:
+        """Backward-compatible alias: claim a create operation if needed."""
+        job, _op = self.claim_create_operation(job_id)
+        return job
 
     def bind_root_thread(
         self,
@@ -252,7 +405,8 @@ class JobThreadStore:
         ts = str(root_thread_ts or "").strip()
         if not ts:
             raise ValueError("root_thread_ts is required")
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job = self._state["jobs"].get(job_id)
             if not isinstance(job, dict):
                 raise KeyError(f"unknown job_id: {job_id}")
@@ -273,11 +427,11 @@ class JobThreadStore:
             job["root_thread_ts"] = ts
             job["phase"] = phase
             job["next_action"] = next_action
+            job["pending_root_thread_ts"] = None
             job["updated_at"] = _utc_now_iso()
             self._state["by_thread"][key] = job_id
-            # Clear any pending-root placeholder for this ts.
             self._state["pending_roots"].pop(key, None)
-            self._persist()
+            self._persist_unlocked()
             return deepcopy(job)
 
     def register_pending_root(
@@ -286,16 +440,12 @@ class JobThreadStore:
         *,
         root_thread_ts: str,
     ) -> Dict[str, Any]:
-        """Record a root ts that must not be silently orphaned.
-
-        Called immediately when Slack returns a ts, before the full job bind
-        is confirmed. Restart reconciliation can promote this into a durable
-        mapping via :meth:`bind_root_thread` / :meth:`recover_pending_roots`.
-        """
+        """Record a root ts that must not be silently orphaned."""
         ts = str(root_thread_ts or "").strip()
         if not ts:
             raise ValueError("root_thread_ts is required")
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job = self._state["jobs"].get(job_id)
             if not isinstance(job, dict):
                 raise KeyError(f"unknown job_id: {job_id}")
@@ -307,19 +457,20 @@ class JobThreadStore:
                 "platform": platform,
                 "chat_id": chat_id,
                 "root_thread_ts": ts,
+                "create_operation_id": job.get("create_operation_id"),
                 "status": "pending",
                 "updated_at": _utc_now_iso(),
             }
-            # Also stash on the job so restart without the index still sees it.
             job["pending_root_thread_ts"] = ts
             job["updated_at"] = _utc_now_iso()
-            self._persist()
+            self._persist_unlocked()
             return deepcopy(job)
 
     def recover_pending_roots(self) -> List[Dict[str, Any]]:
         """Promote pending roots into durable mappings (restart reconciliation)."""
         recovered: List[Dict[str, Any]] = []
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             pending_items = list(self._state["pending_roots"].items())
         for _key, pending in pending_items:
             if not isinstance(pending, dict):
@@ -332,10 +483,10 @@ class JobThreadStore:
             if job is None:
                 continue
             if job.get("root_thread_ts"):
-                # Already bound — drop the pending stub.
-                with self._lock:
+                with self._store_lock():
+                    self._load_unlocked()
                     self._state["pending_roots"].pop(_key, None)
-                    self._persist()
+                    self._persist_unlocked()
                 continue
             try:
                 bound = self.bind_root_thread(
@@ -353,34 +504,38 @@ class JobThreadStore:
                 )
         return recovered
 
-    def mark_pending_recovery(self, job_id: str) -> Dict[str, Any]:
+    def mark_pending_recovery(
+        self,
+        job_id: str,
+        *,
+        reason: str = "unknown_create_outcome",
+    ) -> Dict[str, Any]:
         """Mark a create-attempted job without a root as recoverable, not retriable."""
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job = self._state["jobs"].get(job_id)
             if not isinstance(job, dict):
                 raise KeyError(f"unknown job_id: {job_id}")
             if job.get("root_thread_ts"):
                 return deepcopy(job)
-            pending_ts = str(job.get("pending_root_thread_ts") or "").strip()
-            if pending_ts:
-                # Prefer promoting the pending root over PENDING_RECOVERY.
-                pass
             job["phase"] = PHASE_PENDING_RECOVERY
             job["next_action"] = "reconcile_root"
+            job["recovery_reason"] = str(reason)
             job["updated_at"] = _utc_now_iso()
-            self._persist()
+            self._persist_unlocked()
             return deepcopy(job)
 
     def reconcile_incomplete_creates(self) -> List[Dict[str, Any]]:
         """Restart reconciliation for jobs stuck in CREATING_THREAD.
 
         - Pending roots are promoted into durable mappings.
-        - Jobs that already attempted a Slack create but have no root are moved
-          to ``PENDING_RECOVERY`` so a retry cannot open a second root.
+        - Jobs with a durable create-operation claim but no root are moved to
+          ``PENDING_RECOVERY`` so a retry cannot open a second root.
         """
         recovered = self.recover_pending_roots()
         touched: List[Dict[str, Any]] = list(recovered)
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job_ids = list(self._state["jobs"].keys())
         for job_id in job_ids:
             job = self.get_job(job_id)
@@ -405,12 +560,42 @@ class JobThreadStore:
                         job_id,
                         exc_info=True,
                     )
+            has_claim = bool(str(job.get("create_operation_id") or "").strip())
             if (
                 job.get("phase") == PHASE_CREATING_THREAD
-                and int(job.get("create_attempts") or 0) > 0
+                and (has_claim or int(job.get("create_attempts") or 0) > 0)
             ):
-                touched.append(self.mark_pending_recovery(job_id))
+                touched.append(
+                    self.mark_pending_recovery(
+                        job_id, reason="restart_with_unresolved_create_claim"
+                    )
+                )
         return touched
+
+    def claim_initial_status_post(self, job_id: str) -> Tuple[Dict[str, Any], bool]:
+        """Claim the right to post the initial status after a durable bind.
+
+        Returns ``(job, True)`` only when ``root_thread_ts`` is bound and no
+        prior status claim/post exists. A prior claim with no completion is
+        fail-closed (``False``) to avoid duplicate status after crash.
+        """
+        with self._store_lock():
+            self._load_unlocked()
+            job = self._state["jobs"].get(job_id)
+            if not isinstance(job, dict):
+                raise KeyError(f"unknown job_id: {job_id}")
+            if not str(job.get("root_thread_ts") or "").strip():
+                return deepcopy(job), False
+            if job.get("initial_status_posted"):
+                return deepcopy(job), False
+            if job.get("status_post_claimed"):
+                # Prior claim — outcome unknown; do not post again.
+                return deepcopy(job), False
+            job["status_post_claimed"] = True
+            job["next_action"] = "posting_initial_status"
+            job["updated_at"] = _utc_now_iso()
+            self._persist_unlocked()
+            return deepcopy(job), True
 
     def update_job(
         self,
@@ -421,7 +606,8 @@ class JobThreadStore:
         initial_status_posted: Optional[bool] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        with self._lock:
+        with self._store_lock():
+            self._load_unlocked()
             job = self._state["jobs"].get(job_id)
             if not isinstance(job, dict):
                 raise KeyError(f"unknown job_id: {job_id}")
@@ -431,6 +617,8 @@ class JobThreadStore:
                 job["next_action"] = str(next_action)
             if initial_status_posted is not None:
                 job["initial_status_posted"] = bool(initial_status_posted)
+                if initial_status_posted:
+                    job["status_post_claimed"] = True
             if extra:
                 for k, v in extra.items():
                     if k in {
@@ -439,16 +627,20 @@ class JobThreadStore:
                         "platform",
                         "chat_id",
                         "root_thread_ts",
+                        "create_operation_id",
                     }:
                         continue
                     job[k] = v
             job["updated_at"] = _utc_now_iso()
-            self._persist()
+            self._persist_unlocked()
             return deepcopy(job)
 
     def list_jobs(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [deepcopy(j) for j in self._state["jobs"].values() if isinstance(j, dict)]
+        with self._store_lock():
+            self._load_unlocked()
+            return [
+                deepcopy(j) for j in self._state["jobs"].values() if isinstance(j, dict)
+            ]
 
 
 # Process-wide default store (tests inject via ``reset_default_store``).
@@ -545,14 +737,20 @@ async def _call_create_root(
     name: str,
     *,
     job_id: str = "",
+    operation_id: str = "",
 ) -> Optional[str]:
     """Create a Slack root using the job/handoff primitive when present."""
     create = getattr(adapter, "create_job_root_thread", None)
     if callable(create):
         try:
-            result = create(chat_id, name, job_id=job_id)
+            result = create(
+                chat_id, name, job_id=job_id, operation_id=operation_id
+            )
         except TypeError:
-            result = create(chat_id, name)
+            try:
+                result = create(chat_id, name, job_id=job_id)
+            except TypeError:
+                result = create(chat_id, name)
         if hasattr(result, "__await__"):
             return await result  # type: ignore[misc]
         return result
@@ -563,6 +761,55 @@ async def _call_create_root(
     if hasattr(result, "__await__"):
         return await result  # type: ignore[misc]
     return result
+
+
+async def _find_root_by_operation(
+    adapter: Any,
+    chat_id: str,
+    operation_id: str,
+) -> Optional[str]:
+    find = getattr(adapter, "find_job_root_by_operation_id", None)
+    if not callable(find):
+        return None
+    try:
+        result = find(chat_id, operation_id)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore[misc]
+        ts = str(result or "").strip()
+        return ts or None
+    except Exception:
+        logger.debug(
+            "job_threads: find_job_root_by_operation_id failed for %s",
+            operation_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _invoke_create_root(
+    *,
+    adapter: Any,
+    chat_id: str,
+    name: str,
+    job_id: str,
+    operation_id: str,
+    create_root: Optional[Callable[..., Awaitable[Optional[str]]]],
+) -> Optional[str]:
+    if create_root is not None:
+        try:
+            result = create_root(chat_id, name, operation_id=operation_id)
+        except TypeError:
+            result = create_root(chat_id, name)
+        if hasattr(result, "__await__"):
+            return await result  # type: ignore[misc]
+        return result
+    return await _call_create_root(
+        adapter,
+        chat_id,
+        name,
+        job_id=job_id,
+        operation_id=operation_id,
+    )
 
 
 async def _send_thread_reply(
@@ -582,6 +829,36 @@ async def _send_thread_reply(
     return result
 
 
+async def _resolve_root_for_operation(
+    *,
+    adapter: Any,
+    chat_id: str,
+    name: str,
+    job_id: str,
+    operation_id: str,
+    create_root: Optional[Callable[..., Awaitable[Optional[str]]]],
+    allow_slack_call: bool,
+) -> Optional[str]:
+    """Resolve a root ts for an existing create-operation without minting a new one.
+
+    Order: history scan for operation marker → optional idempotent Slack call
+    with the same ``client_msg_id`` / operation id.
+    """
+    found = await _find_root_by_operation(adapter, chat_id, operation_id)
+    if found:
+        return found
+    if not allow_slack_call:
+        return None
+    return await _invoke_create_root(
+        adapter=adapter,
+        chat_id=chat_id,
+        name=name,
+        job_id=job_id,
+        operation_id=operation_id,
+        create_root=create_root,
+    )
+
+
 async def ensure_slack_job_thread(
     adapter: Any,
     *,
@@ -591,15 +868,16 @@ async def ensure_slack_job_thread(
     platform: str = "slack",
     initial_status: Optional[str] = None,
     store: Optional[JobThreadStore] = None,
-    create_root: Optional[Callable[[str, str], Awaitable[Optional[str]]]] = None,
+    create_root: Optional[Callable[..., Awaitable[Optional[str]]]] = None,
 ) -> Dict[str, Any]:
     """Create (or reuse) a durable Slack job thread.
 
     Steps:
       1. Persist job in ``CREATING_THREAD`` under *idempotency_key*.
-      2. Create the Slack root **once** in the authorized *chat_id*.
-      3. Atomically save the ``job_id ↔ (platform, chat_id, root_thread_ts)`` map.
-      4. Post the first status as a reply with the same ``thread_ts``.
+      2. Persist durable ``create_operation_id`` *before* any Slack call.
+      3. Create the Slack root **once** (idempotent via ``client_msg_id``).
+      4. Durably save ``job_id ↔ (platform, chat_id, root_thread_ts)``.
+      5. Only then post the first status (once) as a reply on that thread.
     """
     store = store or get_default_store()
     platform_n = str(platform or "slack").strip().lower()
@@ -642,42 +920,140 @@ async def ensure_slack_job_thread(
 
     if not root_ts:
         if job.get("phase") == PHASE_PENDING_RECOVERY:
-            # A prior create attempt may have opened a remote root we do not
-            # have locally. Refuse to open a second root; caller must bind an
-            # observed root or inspect PENDING_RECOVERY.
-            return job
-        if int(job.get("create_attempts") or 0) > 0 and not job.get(
-            "pending_root_thread_ts"
-        ):
-            job = store.mark_pending_recovery(job_id)
-            return job
-
-        store.mark_create_attempt(job_id)
-        name = f"Job {job_id} — {(objective or '')[:60]}"
-        if create_root is not None:
-            created = await create_root(chat_n, name)
-        else:
-            created = await _call_create_root(
-                adapter, chat_n, name, job_id=job_id
+            # Fail-closed for *new* roots: reuse the durable create_operation_id
+            # only (marker scan + optional same-client_msg_id retry). Never mint
+            # a second operation id.
+            op_id = str(job.get("create_operation_id") or "").strip()
+            if not op_id:
+                return job
+            name = f"Job {job_id} — {(objective or '')[:60]}"
+            recovered = await _resolve_root_for_operation(
+                adapter=adapter,
+                chat_id=chat_n,
+                name=name,
+                job_id=job_id,
+                operation_id=op_id,
+                create_root=create_root,
+                allow_slack_call=True,
             )
-        created_ts = str(created or "").strip()
-        if not created_ts:
-            job = store.mark_pending_recovery(job_id)
-            return job
+            if recovered:
+                store.register_pending_root(job_id, root_thread_ts=recovered)
+                job = store.bind_root_thread(
+                    job_id,
+                    root_thread_ts=recovered,
+                    phase=PHASE_THREAD_READY,
+                    next_action="post_initial_status",
+                )
+                root_ts = recovered
+            else:
+                return job
 
-        # Persist as pending immediately so a crash before full bind cannot
-        # silently orphan the Slack root.
-        store.register_pending_root(job_id, root_thread_ts=created_ts)
-        job = store.bind_root_thread(
-            job_id,
-            root_thread_ts=created_ts,
-            phase=PHASE_THREAD_READY,
-            next_action="post_initial_status",
-        )
-        root_ts = created_ts
+    if not root_ts:
+        existing_op = str(job.get("create_operation_id") or "").strip()
+        name = f"Job {job_id} — {(objective or '')[:60]}"
 
-    # First status reply (idempotent).
-    if not job.get("initial_status_posted"):
+        if existing_op:
+            # Durable claim already exists; outcome unknown. Reconcile the
+            # same operation — never mint a second create_operation_id.
+            created_ts = await _resolve_root_for_operation(
+                adapter=adapter,
+                chat_id=chat_n,
+                name=name,
+                job_id=job_id,
+                operation_id=existing_op,
+                create_root=create_root,
+                allow_slack_call=True,
+            )
+            if not created_ts:
+                return store.mark_pending_recovery(
+                    job_id, reason="unresolved_create_operation"
+                )
+            store.register_pending_root(job_id, root_thread_ts=created_ts)
+            job = store.bind_root_thread(
+                job_id,
+                root_thread_ts=created_ts,
+                phase=PHASE_THREAD_READY,
+                next_action="post_initial_status",
+            )
+            root_ts = created_ts
+        else:
+            job, operation_id = store.claim_create_operation(job_id)
+            if not operation_id:
+                # Lost the race to another process, or entered recovery.
+                job = store.get_job(job_id) or job
+                root_ts = str(job.get("root_thread_ts") or "").strip()
+                if not root_ts:
+                    op = str(job.get("create_operation_id") or "").strip()
+                    if op:
+                        created_ts = await _resolve_root_for_operation(
+                            adapter=adapter,
+                            chat_id=chat_n,
+                            name=name,
+                            job_id=job_id,
+                            operation_id=op,
+                            create_root=create_root,
+                            allow_slack_call=True,
+                        )
+                        if created_ts:
+                            store.register_pending_root(
+                                job_id, root_thread_ts=created_ts
+                            )
+                            job = store.bind_root_thread(
+                                job_id,
+                                root_thread_ts=created_ts,
+                                phase=PHASE_THREAD_READY,
+                                next_action="post_initial_status",
+                            )
+                            root_ts = created_ts
+                        else:
+                            return store.mark_pending_recovery(
+                                job_id, reason="lost_claim_race_unresolved"
+                            )
+                    else:
+                        return store.mark_pending_recovery(
+                            job_id, reason="claim_denied"
+                        )
+            else:
+                created = await _invoke_create_root(
+                    adapter=adapter,
+                    chat_id=chat_n,
+                    name=name,
+                    job_id=job_id,
+                    operation_id=operation_id,
+                    create_root=create_root,
+                )
+                created_ts = str(created or "").strip()
+                if not created_ts:
+                    # Slack may have accepted the message but ts was lost.
+                    created_ts = (
+                        await _find_root_by_operation(
+                            adapter, chat_n, operation_id
+                        )
+                        or ""
+                    )
+                if not created_ts:
+                    return store.mark_pending_recovery(
+                        job_id, reason="slack_create_ts_unknown"
+                    )
+                # Persist pending then bind *before* any status post.
+                store.register_pending_root(job_id, root_thread_ts=created_ts)
+                job = store.bind_root_thread(
+                    job_id,
+                    root_thread_ts=created_ts,
+                    phase=PHASE_THREAD_READY,
+                    next_action="post_initial_status",
+                )
+                root_ts = created_ts
+
+    # Refresh after possible concurrent bind.
+    job = store.get_job(job_id) or job
+    root_ts = str(job.get("root_thread_ts") or "").strip()
+    if not root_ts:
+        return store.mark_pending_recovery(job_id, reason="missing_root_after_create")
+
+    # First status reply — only after durable bind; claimed once.
+    job, may_post = store.claim_initial_status_post(job_id)
+    if may_post:
         status_text = (
             initial_status
             if initial_status is not None
@@ -695,11 +1071,22 @@ async def ensure_slack_job_thread(
             next_action="await_work",
             initial_status_posted=True,
         )
-    elif job.get("phase") in {PHASE_THREAD_READY, PHASE_CREATING_THREAD}:
+    elif job.get("initial_status_posted"):
+        if job.get("phase") in {PHASE_THREAD_READY, PHASE_CREATING_THREAD}:
+            job = store.update_job(
+                job_id,
+                phase=PHASE_ACTIVE,
+                next_action="await_work",
+            )
+    else:
+        # Status was claimed previously but never marked posted — fail-closed
+        # to avoid a duplicate; advance phase so the job is usable.
         job = store.update_job(
             job_id,
             phase=PHASE_ACTIVE,
             next_action="await_work",
+            initial_status_posted=True,
+            extra={"status_post_assumed_done": True},
         )
 
     return job

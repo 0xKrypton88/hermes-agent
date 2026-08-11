@@ -2257,6 +2257,7 @@ class SlackAdapter(BasePlatformAdapter):
         name: str,
         *,
         job_id: str = "",
+        operation_id: str = "",
     ) -> Optional[str]:
         """Create a Slack root message for a durable job thread.
 
@@ -2264,14 +2265,73 @@ class SlackAdapter(BasePlatformAdapter):
         DM/channel). Does not create channels, invite members, or redirect to
         arbitrary destinations. Returns the seed message ``ts`` used as
         ``root_thread_ts`` for subsequent status replies.
+
+        When *operation_id* is provided it is sent as Slack ``client_msg_id``
+        (idempotent retry of the same create attempt) and embedded in the seed
+        text as ``hermes_job_op=<operation_id>`` for history-based recovery.
         """
+        from gateway.job_threads import format_operation_marker
+
         label = (name or "job").strip()[:80]
         job_tag = f" `{job_id}`" if job_id else ""
+        marker = (
+            f"\n`{format_operation_marker(operation_id)}`"
+            if operation_id
+            else ""
+        )
         return await self._post_thread_root(
             parent_chat_id,
-            seed_text=f":thread: Hermes job{job_tag} — *{label}*",
+            seed_text=f":thread: Hermes job{job_tag} — *{label}*{marker}",
             purpose="Job root thread",
+            client_msg_id=operation_id or None,
         )
+
+    async def find_job_root_by_operation_id(
+        self,
+        parent_chat_id: str,
+        operation_id: str,
+    ) -> Optional[str]:
+        """Locate a previously posted job root by durable operation marker.
+
+        Scans recent history in the authorized *parent_chat_id* only for
+        ``hermes_job_op=<operation_id>``. Does not post or mutate channels.
+        """
+        from gateway.job_threads import format_operation_marker
+
+        op = str(operation_id or "").strip()
+        if not op or not self._app:
+            return None
+        marker = format_operation_marker(op)
+        try:
+            client = self._get_client(parent_chat_id)
+            if client is None:
+                return None
+            history = await client.conversations_history(
+                channel=parent_chat_id,
+                limit=50,
+            )
+            messages = (
+                history.get("messages")
+                if isinstance(history, dict)
+                else getattr(history, "get", lambda _k, _d=None: None)("messages")
+            ) or []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                text = str(msg.get("text") or "")
+                if marker in text:
+                    ts = msg.get("ts")
+                    if ts:
+                        return str(ts)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Job root lookup failed for channel %s op %s: %s",
+                self.name,
+                parent_chat_id,
+                op,
+                exc,
+            )
+        return None
 
     async def _post_thread_root(
         self,
@@ -2279,6 +2339,7 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         seed_text: str,
         purpose: str,
+        client_msg_id: Optional[str] = None,
     ) -> Optional[str]:
         """Post a channel/DM seed message and return its ``ts`` as thread root."""
         if not self._app:
@@ -2287,10 +2348,14 @@ class SlackAdapter(BasePlatformAdapter):
             client = self._get_client(parent_chat_id)
             if client is None:
                 return None
-            result = await client.chat_postMessage(
-                channel=parent_chat_id,
-                text=seed_text,
-            )
+            kwargs: Dict[str, Any] = {
+                "channel": parent_chat_id,
+                "text": seed_text,
+            }
+            if client_msg_id:
+                # Slack deduplicates chat.postMessage for the same client_msg_id.
+                kwargs["client_msg_id"] = str(client_msg_id)
+            result = await client.chat_postMessage(**kwargs)
             ts = (
                 result.get("ts")
                 if isinstance(result, dict)
