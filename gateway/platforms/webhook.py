@@ -240,6 +240,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
+        # Lazily constructed profile-local receipt store for receipt_only routes.
+        self._receipt_store = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -732,6 +734,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # ── Receipt-only Linear Issue→Go intake ──────────────────
+        # Declarative route mode: persist one durable receipt and stop.
+        # No agent dispatch, job creation, or provider mutation.
+        if route_config.get("receipt_only") == "linear_issue_go":
+            return await self._handle_linear_issue_go_receipt(
+                request=request,
+                route_name=route_name,
+                route_config=route_config,
+                payload=payload,
+                raw_body=raw_body,
+            )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
@@ -929,6 +943,119 @@ class WebhookAdapter(BasePlatformAdapter):
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
+            },
+            status=202,
+        )
+
+    def _get_receipt_store(self):
+        """Return the profile-local webhook receipt store (lazy singleton)."""
+        store = getattr(self, "_receipt_store", None)
+        if store is None:
+            from gateway.webhook_receipts import WebhookReceiptStore
+
+            store = WebhookReceiptStore()
+            self._receipt_store = store
+        return store
+
+    async def _handle_linear_issue_go_receipt(
+        self,
+        *,
+        request: "web.Request",
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        raw_body: bytes,
+    ) -> "web.Response":
+        """Validate + durably record a Linear Issue→Go transition receipt.
+
+        Insert happens before any further work. On storage failure we fail
+        closed without calling ``handle_message``.
+        """
+        from gateway.webhook_receipts import (
+            parse_allowed_state_ids,
+            payload_sha256,
+            validate_linear_issue_go_payload,
+        )
+
+        def _header(name: str) -> str:
+            return (
+                request.headers.get(name, "")
+                or request.headers.get(name.lower(), "")
+                or request.headers.get(name.upper(), "")
+            )
+
+        delivery_id = _header("svix-id").strip()
+        if not delivery_id:
+            logger.warning(
+                "[webhook] receipt_only linear_issue_go missing svix-id route=%s",
+                route_name,
+            )
+            return web.json_response(
+                {"error": "Missing provider delivery id"},
+                status=400,
+            )
+
+        validation = validate_linear_issue_go_payload(
+            payload,
+            allowed_state_ids=parse_allowed_state_ids(route_config),
+        )
+        if not validation.ok:
+            logger.info(
+                "[webhook] receipt_only linear_issue_go rejected route=%s reason=%s",
+                route_name,
+                validation.error,
+            )
+            return web.json_response(
+                {"error": validation.error or "Invalid payload"},
+                status=400,
+            )
+
+        try:
+            result = self._get_receipt_store().record_linear_issue_go(
+                delivery_id=delivery_id,
+                issue_id=validation.issue_id or "",
+                issue_identifier=validation.issue_identifier or "",
+                state_id=validation.state_id or "",
+                job_key=validation.job_key or "",
+                payload_hash=payload_sha256(raw_body),
+            )
+        except Exception:
+            logger.exception(
+                "[webhook] receipt_only linear_issue_go storage failed route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {"error": "Receipt storage failed"},
+                status=503,
+            )
+
+        if result.status == "duplicate":
+            logger.info(
+                "[webhook] receipt_only linear_issue_go duplicate route=%s delivery=%s receipt=%s",
+                route_name,
+                delivery_id,
+                result.receipt.receipt_id,
+            )
+            return web.json_response(
+                {
+                    "status": "duplicate",
+                    "receipt_id": result.receipt.receipt_id,
+                },
+                status=200,
+            )
+
+        logger.info(
+            "[webhook] receipt_only linear_issue_go received route=%s delivery=%s receipt=%s issue=%s",
+            route_name,
+            delivery_id,
+            result.receipt.receipt_id,
+            validation.issue_identifier,
+        )
+        return web.json_response(
+            {
+                "status": "received",
+                "receipt_id": result.receipt.receipt_id,
             },
             status=202,
         )

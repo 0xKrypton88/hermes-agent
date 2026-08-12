@@ -660,6 +660,192 @@ def test_targeted_restore_replays_only_owner_and_exactly_once():
     assert ad.get_durable_delegation("deleg_owner_b")["delivery_state"] == "pending"
 
 
+def test_handoff_completion_never_reports_origin_delivered_at_queue_put():
+    """Plugin/bridge handoff must stay pending until gateway origin ack."""
+    import queue as queue_mod
+
+    # Isolate the shared queue so this unit only observes its own wakeup.
+    target = queue_mod.Queue()
+    monkey_pr = type("PR", (), {"completion_queue": target})()
+    import tools.process_registry as pr_mod
+
+    original = pr_mod.process_registry
+    pr_mod.process_registry = monkey_pr
+    try:
+        handoff = ad.handoff_cursor_run_completion(
+            run_id="hrun-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            session_key="agent:main:slack:thread:C1:1718000000.000200",
+            summary="done",
+            enqueue_wakeup=True,
+        )
+        assert handoff["delegation_id"] == (
+            "cursor_hrun-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        assert handoff["handoff_state"] == "queued"
+        assert handoff["delivery_state"] == "pending"
+        assert handoff["delivery_attempts"] == 0
+
+        durable = ad.get_durable_delegation(handoff["delegation_id"])
+        assert durable["delivery_state"] == "pending"
+        assert durable["state"] == "completed"
+
+        evt = target.get_nowait()
+        assert evt["delegation_id"] == handoff["delegation_id"]
+        assert evt["session_key"] == (
+            "agent:main:slack:thread:C1:1718000000.000200"
+        )
+
+        # Local wakeup dropped after durable persist still leaves pending outbox.
+        while not target.empty():
+            target.get_nowait()
+        discovered = ad.discover_pending_completions(target)
+        assert discovered == [handoff["delegation_id"]]
+    finally:
+        pr_mod.process_registry = original
+
+
+def test_process_boundary_handoff_rediscovered_exactly_once(tmp_path):
+    """Fresh process rediscovers a handoff whose local wakeup was never sent."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    producer = r'''
+from tools import async_delegation as ad
+h = ad.handoff_cursor_run_completion(
+    run_id="hrun-boundary-1111-2222-3333-444444444444",
+    session_key="agent:main:slack:thread:C09ORIGIN:1718000000.000300",
+    summary="boundary done",
+    parent_session_id="sess-origin",
+    enqueue_wakeup=False,
+)
+assert h["handoff_state"] == "accepted"
+assert h["delivery_state"] == "pending"
+print(h["delegation_id"])
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", producer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    delegation_id = first.stdout.strip().splitlines()[-1]
+    assert delegation_id.startswith("cursor_hrun-")
+
+    consumer = r'''
+import json
+from tools import async_delegation as ad
+from tools.process_registry import process_registry
+# Registry startup restore should already have rehydrated the pending row.
+# Drain only our id, then claim+complete exactly once.
+found = None
+while not process_registry.completion_queue.empty():
+    evt = process_registry.completion_queue.get_nowait()
+    if evt.get("delegation_id") == %r:
+        found = evt
+        break
+if found is None:
+    # Periodic rediscovery path (same SQL outbox) if startup restore missed.
+    q = __import__("queue").Queue()
+    ad.discover_pending_completions(q)
+    while not q.empty():
+        evt = q.get_nowait()
+        if evt.get("delegation_id") == %r:
+            found = evt
+            break
+assert found is not None, "pending outbox row was not rediscovered"
+assert found["session_key"] == "agent:main:slack:thread:C09ORIGIN:1718000000.000300"
+claim = ad.claim_event_delivery(found, "boundary-consumer")
+assert claim
+ad.complete_event_delivery(found, claim)
+row = ad.get_durable_delegation(%r)
+assert row["delivery_state"] == "delivered"
+# Second discover must not re-fire.
+q2 = __import__("queue").Queue()
+assert ad.discover_pending_completions(q2) == []
+print(json.dumps({"ok": True, "session_key": found["session_key"]}))
+''' % (delegation_id, delegation_id, delegation_id)
+    second = subprocess.run(
+        [sys.executable, "-c", consumer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    payload = json.loads(second.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is True
+    assert payload["session_key"].endswith("1718000000.000300")
+
+
+def test_discover_pending_completions_skips_queued_claimed_and_delivered():
+    """Periodic rediscovery must not duplicate local/claimed/terminal rows."""
+    import queue as queue_mod
+
+    def _persist(delegation_id, summary):
+        dispatched_at = time.time()
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": f"session-{delegation_id}",
+            "origin_ui_session_id": "",
+            "parent_session_id": f"parent-{delegation_id}",
+            "origin_session_id": "",
+            "dispatched_at": dispatched_at,
+        }
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": record["session_key"],
+            "origin_ui_session_id": "",
+            "parent_session_id": record["parent_session_id"],
+            "status": "completed",
+            "summary": summary,
+            "dispatched_at": dispatched_at,
+            "completed_at": dispatched_at + 1,
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(event, {"status": "completed", "summary": summary})
+        return event
+
+    pending = _persist("deleg_discover_pending", "pending result")
+    queued = _persist("deleg_discover_queued", "queued result")
+    claimed = _persist("deleg_discover_claimed", "claimed result")
+    delivered = _persist("deleg_discover_delivered", "delivered result")
+
+    assert ad.mark_completion_delivered("deleg_discover_delivered")
+    assert ad.claim_completion_delivery(
+        "deleg_discover_claimed", "foreign-claim",
+    )
+
+    target = queue_mod.Queue()
+    enqueued = ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_queued"},
+    )
+    assert enqueued == ["deleg_discover_pending"]
+    evt = target.get_nowait()
+    assert evt["delegation_id"] == "deleg_discover_pending"
+    assert evt.get("restored") is True
+    assert target.empty()
+
+    # Already-enqueued id stays excluded; claimed/delivered stay out.
+    assert ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_pending", "deleg_discover_queued"},
+    ) == []
+    assert target.empty()
+
+    # After the foreign claim expires, the row becomes eligible again.
+    # Exclude the still-pending first row so this pass isolates claim expiry.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET delivery_claimed_at=?
+               WHERE delegation_id='deleg_discover_claimed'""",
+            (time.time() - ad._DELIVERY_CLAIM_TTL_SECONDS - 1,),
+        )
+    enqueued = ad.discover_pending_completions(
+        target, exclude_ids={"deleg_discover_pending"},
+    )
+    assert set(enqueued) == {"deleg_discover_claimed", "deleg_discover_queued"}
+    found = {target.get_nowait()["delegation_id"] for _ in enqueued}
+    assert found == {"deleg_discover_claimed", "deleg_discover_queued"}
+    assert delivered["delegation_id"] not in found
+    assert pending["delegation_id"] not in found
+    assert queued["delegation_id"] in found
+    assert claimed["delegation_id"] in found
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
