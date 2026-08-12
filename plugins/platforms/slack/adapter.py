@@ -6643,12 +6643,16 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            team_id = self._metadata_team_id(metadata)
+            result = await self._get_client(
+                chat_id, team_id=team_id or None
+            ).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                # Mark unresolved so the action handler's atomic-pop guard can
-                # reject double-clicks (mirrors _approval_resolved).
-                self._clarify_resolved[msg_ts] = False
+                # Scope the guard to the workspace too: Slack message timestamps
+                # are workspace-local and may collide across installations.
+                marker = self._workspace_message_marker(team_id, msg_ts)
+                self._clarify_resolved[marker] = False
                 self._trim_oldest_dict_entries(
                     self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
                 )
@@ -7005,6 +7009,7 @@ class SlackAdapter(BasePlatformAdapter):
         msg_ts: str,
         question_text: str,
         decision_text: str,
+        team_id: str = "",
     ) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
         updated_blocks = [
@@ -7018,7 +7023,9 @@ class SlackAdapter(BasePlatformAdapter):
             },
         ]
         try:
-            await self._get_client(channel_id).chat_update(
+            await self._get_client(
+                channel_id, team_id=team_id or None
+            ).chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
@@ -7031,6 +7038,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
         await ack()
 
+        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
@@ -7058,7 +7066,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).
-        if self._clarify_resolved.pop(msg_ts, True):
+        # Use the workspace-scoped marker when possible; retain a bare-timestamp
+        # fallback for prompts sent before workspace metadata was available.
+        clarify_key = self._workspace_message_marker(team_id, msg_ts)
+        if clarify_key not in self._clarify_resolved and msg_ts in self._clarify_resolved:
+            clarify_key = msg_ts
+        if self._clarify_resolved.pop(clarify_key, True):
             return
 
         # Preserve the original question so the resolved message keeps context.
@@ -7081,11 +7094,13 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._update_clarify_message(
                     channel_id, msg_ts, original_text,
                     f"⏳ This prompt expired — please send a new request. (by {user_name})",
+                    team_id=team_id,
                 )
                 return
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"✏️ Awaiting typed answer from {user_name}…",
+                team_id=team_id,
             )
             return
 
@@ -7113,6 +7128,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"✅ {user_name}: {resolved_text}",
+                team_id=team_id,
             )
             # Privacy: keep the chosen option text out of INFO-level logs
             # (clarify choices can carry user/session context). Metadata at
@@ -7131,7 +7147,8 @@ class SlackAdapter(BasePlatformAdapter):
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"⏳ This prompt expired — please send a new request. (by {user_name})",
-            )
+                team_id=team_id,
+                )
             logger.warning(
                 "[Slack] clarify resolve returned False (id=%s) — expired/reset",
                 clarify_id,

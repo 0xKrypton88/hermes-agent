@@ -133,6 +133,52 @@ class TestSlackSendClarify:
                 action_ids = [element["action_id"] for element in block["elements"]]
                 assert len(action_ids) == len(set(action_ids))
 
+    @pytest.mark.asyncio
+    async def test_workspace_scoped_prompt_uses_matching_client_and_guard(self):
+        adapter = _make_adapter()
+        adapter._team_clients["T2"] = AsyncMock()
+        t2_client = adapter._team_clients["T2"]
+        t2_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Choose safely",
+            choices=["continue"],
+            clarify_id="cid-workspace",
+            session_key="sk-workspace",
+            metadata={"team_id": "T2"},
+        )
+
+        assert adapter._clarify_resolved[("T2", "1234.5678")] is False
+        t2_client.chat_postMessage.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_scoped_click_resolves_and_updates_matching_client(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._team_clients["T2"] = AsyncMock()
+        t2_client = adapter._team_clients["T2"]
+        t2_client.chat_update = AsyncMock()
+        cm.register("cid-click", "sk-click", "Pick", ["continue"])
+        adapter._clarify_resolved[("T2", "same-ts")] = False
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T2"},
+            "message": {"ts": "same-ts", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "operator", "id": "U_OK"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "cid-click|0"}
+
+        await adapter._handle_clarify_action(ack, body, action)
+
+        t2_client.chat_update.assert_awaited_once()
+        with cm._lock:
+            assert cm._entries["cid-click"].response == "continue"
+
 
     @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):
