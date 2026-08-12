@@ -3,6 +3,9 @@
 This runbook covers the **ENG-13 receipt-only** boundary. It is a configuration
 preflight, not a launch procedure.
 
+For the separate **Ready review** gate (source-package adequacy before Go, no
+dispatch), see [`docs/linear-ready-review-gate.md`](./linear-ready-review-gate.md).
+
 ## Safety contract
 
 - The route may only persist an idempotent receipt keyed by `(provider,
