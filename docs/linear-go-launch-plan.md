@@ -30,10 +30,10 @@ dispatch decision are out of scope for this module.
 | Field | Rule |
 | --- | --- |
 | `issue_id` | non-blank |
-| `issue_identifier` | carried into the intent |
+| `issue_identifier` | non-blank string identity (missing/empty/whitespace/non-string fail closed) |
 | `target_state` | must normalize to exactly `Go` |
 | `previous_state` | non-blank and must not already be `Go` (no duplicate/no-op) |
-| `go_event_key` | Go event/delivery key used for delivery idempotency |
+| `go_event_key` | canonical delivery/idempotency identity: non-empty string matching `[A-Za-z0-9._-]+` with no surrounding/internal whitespace; missing/empty/whitespace/non-string/noncanonical fail closed |
 
 ### Ready-review provenance
 
@@ -51,6 +51,8 @@ Stable codes returned in `LaunchPlanResult.reason_codes`:
 
 - `missing_go_target_state` / `non_go_target_state`
 - `blank_issue_id`
+- `blank_issue_identifier`
+- `blank_go_event_key` / `noncanonical_go_event_key`
 - `missing_state_transition` / `noop_duplicate_go_transition`
 - `missing_ready_provenance`
 - `ready_provenance_issue_mismatch`

@@ -193,6 +193,121 @@ def test_provenance_mismatch_fail_closed(prov_overrides, expected_code):
     assert expected_code in result.reason_codes
 
 
+@pytest.mark.parametrize(
+    ("transition_overrides", "expected_code"),
+    [
+        ({"go_event_key": ""}, "blank_go_event_key"),
+        ({"go_event_key": "   "}, "blank_go_event_key"),
+        ({"go_event_key": None}, "blank_go_event_key"),
+        ({"go_event_key": 12345}, "blank_go_event_key"),
+        ({"go_event_key": ["svix_msg"]}, "blank_go_event_key"),
+        ({"go_event_key": f"  {GO_EVENT_KEY}  "}, "noncanonical_go_event_key"),
+        ({"go_event_key": "svix msg with spaces"}, "noncanonical_go_event_key"),
+        ({"go_event_key": "bad:colon:key"}, "noncanonical_go_event_key"),
+        ({"issue_identifier": ""}, "blank_issue_identifier"),
+        ({"issue_identifier": "   "}, "blank_issue_identifier"),
+        ({"issue_identifier": None}, "blank_issue_identifier"),
+        ({"issue_identifier": 14}, "blank_issue_identifier"),
+        ({"issue_identifier": ["ENG-14"]}, "blank_issue_identifier"),
+    ],
+    ids=[
+        "empty_go_event_key",
+        "whitespace_go_event_key",
+        "none_go_event_key",
+        "int_go_event_key",
+        "list_go_event_key",
+        "padded_go_event_key",
+        "internal_space_go_event_key",
+        "colon_go_event_key",
+        "empty_issue_identifier",
+        "whitespace_issue_identifier",
+        "none_issue_identifier",
+        "int_issue_identifier",
+        "list_issue_identifier",
+    ],
+)
+def test_identity_fields_fail_closed(transition_overrides, expected_code):
+    result = plan_explicit_go_launch(
+        _valid_transition(**transition_overrides),
+        _valid_provenance(),
+    )
+    assert result.ok is False
+    assert result.intent is None
+    assert expected_code in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_code"),
+    [
+        (lambda m: m.__setitem__("go_event_key", ""), "blank_go_event_key"),
+        (lambda m: m.__setitem__("go_event_key", "   "), "blank_go_event_key"),
+        (lambda m: m.__setitem__("go_event_key", None), "blank_go_event_key"),
+        (lambda m: m.__setitem__("go_event_key", 99), "blank_go_event_key"),
+        (lambda m: m.pop("go_event_key"), "blank_go_event_key"),
+        (
+            lambda m: m.__setitem__("go_event_key", f"\t{GO_EVENT_KEY}"),
+            "noncanonical_go_event_key",
+        ),
+        (lambda m: m.__setitem__("issue_identifier", ""), "blank_issue_identifier"),
+        (lambda m: m.__setitem__("issue_identifier", "   "), "blank_issue_identifier"),
+        (lambda m: m.__setitem__("issue_identifier", None), "blank_issue_identifier"),
+        (lambda m: m.__setitem__("issue_identifier", 14), "blank_issue_identifier"),
+        (lambda m: m.pop("issue_identifier"), "blank_issue_identifier"),
+    ],
+    ids=[
+        "map_empty_go_event_key",
+        "map_whitespace_go_event_key",
+        "map_none_go_event_key",
+        "map_int_go_event_key",
+        "map_missing_go_event_key",
+        "map_padded_go_event_key",
+        "map_empty_issue_identifier",
+        "map_whitespace_issue_identifier",
+        "map_none_issue_identifier",
+        "map_int_issue_identifier",
+        "map_missing_issue_identifier",
+    ],
+)
+def test_mapping_coercion_identity_fields_fail_closed(mutate, expected_code):
+    mapping = {
+        "issue_id": ISSUE_ID,
+        "issue_identifier": ISSUE_IDENTIFIER,
+        "target_state": "Go",
+        "previous_state": "Ready",
+        "go_event_key": GO_EVENT_KEY,
+    }
+    mutate(mapping)
+
+    result = plan_explicit_go_launch(mapping, _valid_provenance())
+    assert result.ok is False
+    assert result.intent is None
+    assert expected_code in result.reason_codes
+
+
+def test_mapping_success_still_non_dispatched():
+    result = plan_explicit_go_launch(
+        {
+            "issue_id": ISSUE_ID,
+            "issue_identifier": ISSUE_IDENTIFIER,
+            "target_state": "Go",
+            "previous_state": "Ready",
+            "go_event_key": GO_EVENT_KEY,
+        },
+        {
+            "issue_id": ISSUE_ID,
+            "review_key": REVIEW_KEY,
+            "source_digest": SOURCE_DIGEST,
+            "decision": "READY_FOR_GO",
+            "starts_agent_work": False,
+        },
+    )
+    assert result.ok is True
+    assert result.intent is not None
+    assert result.intent.dispatched is False
+    assert result.intent.issue_identifier == ISSUE_IDENTIFIER
+    assert result.intent.go_event_key == GO_EVENT_KEY
+
+
 def test_duplicate_delivery_key_returns_no_intent():
     intent_key = f"go_launch:{ISSUE_ID}:{REVIEW_KEY}:{SOURCE_DIGEST}:{GO_EVENT_KEY}"
     result = plan_explicit_go_launch(

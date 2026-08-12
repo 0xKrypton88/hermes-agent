@@ -20,6 +20,9 @@ from typing import AbstractSet, Any, Mapping, Optional, Union
 GO_TARGET_STATE = "Go"
 READY_DECISION = "READY_FOR_GO"
 _SHA256_LOWER = re.compile(r"^[0-9a-f]{64}$")
+# Delivery/idempotency identities must be unambiguous in the composite intent key
+# (colon-delimited) and must not silently normalize padded or spaced values.
+_GO_EVENT_KEY_CANONICAL = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,24 @@ def _as_optional_str(value: Any) -> Optional[str]:
         return None
     text = value.strip()
     return text or None
+
+
+def _as_required_identity(value: Any) -> Optional[str]:
+    """Non-blank string identity; rejects non-strings and whitespace-only."""
+    return _as_optional_str(value)
+
+
+def _as_canonical_go_event_key(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return (key, reason_code). reason_code is set when the key is unusable."""
+    if not isinstance(value, str):
+        return None, "blank_go_event_key"
+    if not value or not value.strip():
+        return None, "blank_go_event_key"
+    if value != value.strip() or any(ch.isspace() for ch in value):
+        return None, "noncanonical_go_event_key"
+    if not _GO_EVENT_KEY_CANONICAL.fullmatch(value):
+        return None, "noncanonical_go_event_key"
+    return value, None
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -161,8 +182,13 @@ def plan_explicit_go_launch(
     elif target == GO_TARGET_STATE and previous == GO_TARGET_STATE:
         reasons.append("noop_duplicate_go_transition")
 
-    issue_identifier = _as_optional_str(coerced.issue_identifier) or ""
-    go_event_key = _as_optional_str(coerced.go_event_key) or ""
+    issue_identifier = _as_required_identity(coerced.issue_identifier)
+    if issue_identifier is None:
+        reasons.append("blank_issue_identifier")
+
+    go_event_key, go_event_reason = _as_canonical_go_event_key(coerced.go_event_key)
+    if go_event_reason is not None:
+        reasons.append(go_event_reason)
 
     ready = _coerce_provenance(provenance)
     if ready is None:
@@ -191,12 +217,14 @@ def plan_explicit_go_launch(
         )
 
     assert issue_id is not None
+    assert issue_identifier is not None
+    assert go_event_key is not None
     assert ready is not None
     review_key = _as_optional_str(ready.review_key)
     assert review_key is not None
     digest = ready.source_digest
 
-    if go_event_key and go_event_key in seen_delivery_keys:
+    if go_event_key in seen_delivery_keys:
         return LaunchPlanResult(
             ok=False,
             intent=None,
