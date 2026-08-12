@@ -1,0 +1,57 @@
+# ENG-3 LangGraph Durable-Job Pilot (Package 1)
+
+Isolated, **disabled-by-default** durable-job pilot. Not wired into the gateway,
+Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
+
+## What this package does
+
+- Durable application job records with opaque `job_id` (never a Slack timestamp)
+- Correlation fields: origin platform/chat/root thread, objective, repository
+  identity, frozen baseline SHA, phase/`next_action`, idempotency key, timestamps
+- Deterministic phase flow via LangGraph: `INTAKE → FREEZE_BASELINE → AWAIT_DISPATCH`
+- Append-only `durable_job_events` outbox for idempotent intent recording
+- Crash-safe reopen/recovery by `job_id` on the same disposable SQLite path
+- Safe rejection of dispatch while `enabled` / `dispatch_enabled` are false
+
+## Explicit non-goals (Package 1)
+
+- No production integration / gateway wiring / Slack action wiring
+- No Cursor or cloud provider calls
+- No service restarts, deployment, credentials, live trading, order mutation,
+  arming/disarming, or reconciliation
+- Does **not** touch existing completion/outbox modules or Hermes `state.db`
+
+## Storage boundaries
+
+| Store | Path | Purpose |
+|-------|------|---------|
+| Application job store | `durable_jobs.sqlite_path` (required, explicit) | Jobs + append-only events |
+| LangGraph checkpointer | `durable_jobs.checkpoint_sqlite_path` (required, distinct) | Graph thread checkpoints |
+
+Both are **dev/test SQLite only**, single-process. Schema version is local
+(`SCHEMA_VERSION` in `store.py`).
+
+### Later: production PostgreSQL
+
+1. Keep the application job/outbox schema on PostgreSQL (migrations owned by
+   this domain, not Hermes SessionDB).
+2. Replace `langgraph.checkpoint.sqlite.SqliteSaver` with a PostgreSQL
+   checkpointer (e.g. `langgraph-checkpoint-postgres`) pointed at a separate
+   checkpoint schema/database.
+3. Do not merge checkpointer tables into the application job store.
+
+## Config
+
+```yaml
+durable_jobs:
+  enabled: false          # default
+  dispatch_enabled: false # default — Package 1 never dispatches
+  sqlite_path: null       # must be set explicitly when enabling
+  checkpoint_sqlite_path: null
+```
+
+## Tests
+
+```bash
+scripts/run_tests.sh tests/agent/durable_jobs/
+```
