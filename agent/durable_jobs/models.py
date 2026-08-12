@@ -27,7 +27,7 @@ NONTERMINAL_PHASES: FrozenSet[JobPhase] = frozenset(
 DEFAULT_NEXT_ACTION: Dict[JobPhase, str] = {
     JobPhase.INTAKE: "freeze_baseline",
     JobPhase.FREEZE_BASELINE: "await_dispatch",
-    JobPhase.AWAIT_DISPATCH: "reject_dispatch_until_enabled",
+    JobPhase.AWAIT_DISPATCH: "package1_hard_disabled_dispatch",
 }
 
 

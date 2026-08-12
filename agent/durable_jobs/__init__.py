@@ -1,6 +1,7 @@
 """LangGraph durable-job pilot (ENG-3 Package 1).
 
 Isolated, disabled-by-default module. No gateway / Slack / Cursor wiring.
+Dispatch is hard-disabled (never invokes adapters).
 
 SQLite usage here is disposable, explicit-path, single-process, and
 dev/test-only. Production durable store remains PostgreSQL-first and is not

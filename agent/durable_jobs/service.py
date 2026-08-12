@@ -2,8 +2,10 @@
 
 Boundaries (Package 1):
 - No gateway wiring, Slack action wiring, or Cursor/cloud provider calls.
-- External systems are represented only by injected Protocol fakes.
-- Dispatch is disabled by default and rejected as a safe no-op error.
+- External systems are represented only by injected Protocol fakes for later
+  packages; Package 1 never invokes them.
+- Dispatch is **hard-disabled** (not merely configuration-gated):
+  ``attempt_dispatch`` always raises and never calls any adapter.
 - Application job store DB is distinct from the LangGraph checkpointer DB.
 """
 
@@ -18,7 +20,7 @@ from agent.durable_jobs.store import DurableJobStore
 
 
 class DispatchDisabledError(RuntimeError):
-    """Dispatch is disabled for this pilot / config."""
+    """Package 1 hard-disables all external dispatch."""
 
 
 class PilotDisabledError(RuntimeError):
@@ -26,7 +28,10 @@ class PilotDisabledError(RuntimeError):
 
 
 class DispatchAdapter(Protocol):
-    """Injected-only seam — Package 1 never ships a live implementation."""
+    """Injected-only seam reserved for later packages.
+
+    Package 1 stores the reference for API compatibility but never calls it.
+    """
 
     def dispatch(self, job_id: str) -> None: ...
 
@@ -39,6 +44,8 @@ class DurableJobService:
         store: Optional[DurableJobStore] = None,
     ) -> None:
         self.config = config
+        # Retained for constructor compatibility / later packages only.
+        # Package 1 must never invoke this adapter.
         self._dispatch_adapter = dispatch_adapter
         self._store = store
 
@@ -105,7 +112,11 @@ class DurableJobService:
         return advanced
 
     def attempt_dispatch(self, job_id: str) -> dict:
-        # Record intent for crash-safe recovery seam, then reject when disabled.
+        """Hard-disabled in Package 1 — never invokes any adapter.
+
+        Records a rejected intent when a job exists, then always raises.
+        Config flags and injected adapters cannot enable dispatch here.
+        """
         if self.config.sqlite_path is not None:
             try:
                 store = self._require_store()
@@ -113,23 +124,15 @@ class DurableJobService:
                     store.append_intent(
                         job_id,
                         event_type="dispatch_requested",
-                        payload={"rejected": not self.config.dispatch_allowed},
+                        payload={"rejected": True, "package": 1, "hard_disabled": True},
                         idempotency_key=f"dispatch_requested:{job_id}",
                     )
             except Exception:
                 # Intent recording must not enable dispatch; ignore store misses.
                 pass
 
-        if not self.config.dispatch_allowed:
-            raise DispatchDisabledError(
-                "durable_jobs dispatch is disabled "
-                "(enabled=False and/or dispatch_enabled=False); "
-                "Package 1 performs no external dispatch"
-            )
-        if self._dispatch_adapter is None:
-            raise DispatchDisabledError(
-                "no dispatch adapter injected; live Slack/Cursor adapters "
-                "are excluded from Package 1"
-            )
-        self._dispatch_adapter.dispatch(job_id)
-        return {"job_id": job_id, "dispatched": True}
+        # Fail closed: no path may call self._dispatch_adapter.dispatch(...).
+        raise DispatchDisabledError(
+            "Package 1 hard-disables external dispatch; "
+            "adapters are never invoked regardless of enabled/dispatch_enabled"
+        )

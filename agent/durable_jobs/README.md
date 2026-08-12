@@ -11,12 +11,15 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - Deterministic phase flow via LangGraph: `INTAKE → FREEZE_BASELINE → AWAIT_DISPATCH`
 - Append-only `durable_job_events` outbox for idempotent intent recording
 - Crash-safe reopen/recovery by `job_id` on the same disposable SQLite path
-- Safe rejection of dispatch while `enabled` / `dispatch_enabled` are false
+- **Hard-disabled dispatch**: `attempt_dispatch` always raises
+  `DispatchDisabledError` and never invokes any adapter, even when
+  `enabled` and `dispatch_enabled` are both true and a fake adapter is injected
 
 ## Explicit non-goals (Package 1)
 
 - No production integration / gateway wiring / Slack action wiring
 - No Cursor or cloud provider calls
+- No external dispatch capability whatsoever (not configuration-gated)
 - No service restarts, deployment, credentials, live trading, order mutation,
   arming/disarming, or reconciliation
 - Does **not** touch existing completion/outbox modules or Hermes `state.db`
@@ -44,11 +47,15 @@ Both are **dev/test SQLite only**, single-process. Schema version is local
 
 ```yaml
 durable_jobs:
-  enabled: false          # default
-  dispatch_enabled: false # default — Package 1 never dispatches
+  enabled: false          # default; must be a real boolean (not "false")
+  dispatch_enabled: false # retained for shape only — Package 1 hard-disables dispatch
   sqlite_path: null       # must be set explicitly when enabling
   checkpoint_sqlite_path: null
 ```
+
+`enabled` / `dispatch_enabled` reject non-bool values (strings/ints) to avoid
+`bool("false") == True` ambiguity. Even with both flags true, Package 1 never
+calls an injected dispatch adapter.
 
 ## Tests
 

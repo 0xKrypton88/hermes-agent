@@ -103,7 +103,7 @@ def test_langgraph_flow_intake_to_await_dispatch_uses_separate_checkpointer_db(t
     )
     assert job.phase is JobPhase.AWAIT_DISPATCH
     assert job.frozen_baseline_sha == "baseline-sha-1"
-    assert job.next_action == "reject_dispatch_until_enabled"
+    assert job.next_action == "package1_hard_disabled_dispatch"
 
     assert cfg.sqlite_path is not None
     assert cfg.checkpoint_sqlite_path is not None

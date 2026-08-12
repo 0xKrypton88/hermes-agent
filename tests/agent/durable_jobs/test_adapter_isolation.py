@@ -33,6 +33,37 @@ def test_attempt_dispatch_never_calls_injected_adapter_when_disabled(tmp_path):
     assert calls == []
 
 
+def test_package1_hard_rejects_dispatch_even_when_both_flags_true_with_fake_adapter(
+    tmp_path,
+):
+    """Package 1 has no external dispatch capability whatsoever."""
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.service import DispatchDisabledError, DurableJobService
+
+    calls: list[str] = []
+
+    class FakeDispatch:
+        def dispatch(self, job_id: str) -> None:
+            calls.append(job_id)
+
+    cfg = load_durable_jobs_config(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": True,
+                "sqlite_path": str(tmp_path / "jobs.sqlite"),
+                "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+            }
+        }
+    )
+    assert cfg.enabled is True
+    assert cfg.dispatch_enabled is True
+    service = DurableJobService(config=cfg, dispatch_adapter=FakeDispatch())
+    with pytest.raises(DispatchDisabledError):
+        service.attempt_dispatch("job-both-flags-on")
+    assert calls == []
+
+
 def test_no_live_dispatch_adapter_is_exported():
     import agent.durable_jobs.adapters as adapters
 

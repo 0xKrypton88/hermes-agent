@@ -65,3 +65,29 @@ def test_dispatch_attempt_rejected_when_enabled_but_dispatch_flag_off(tmp_path):
     service = DurableJobService(config=cfg)
     with pytest.raises(DispatchDisabledError):
         service.attempt_dispatch(job_id="still-blocked")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("enabled", "false"),
+        ("enabled", "true"),
+        ("enabled", "0"),
+        ("enabled", "1"),
+        ("enabled", 1),
+        ("enabled", 0),
+        ("dispatch_enabled", "false"),
+        ("dispatch_enabled", "true"),
+        ("dispatch_enabled", 1),
+        ("dispatch_enabled", 0),
+    ],
+)
+def test_non_bool_flag_values_are_rejected(field, value):
+    from agent.durable_jobs.config import (
+        DurableJobsConfigError,
+        load_durable_jobs_config,
+    )
+
+    with pytest.raises(DurableJobsConfigError) as exc:
+        load_durable_jobs_config({"durable_jobs": {field: value}})
+    assert field in str(exc.value)

@@ -4,6 +4,10 @@ Disabled by default. SQLite paths must be supplied explicitly by tests/config â€
 never touch the production Hermes state DB. This pilot is single-process /
 dev-only SQLite; production durable store remains PostgreSQL-first and is NOT
 implemented here.
+
+Package 1 dispatch is **hard-disabled** in the service layer (not merely
+gated by these flags). ``dispatch_enabled`` is retained for forward-compat
+config shape only and cannot enable adapter invocation in Package 1.
 """
 
 from __future__ import annotations
@@ -34,8 +38,21 @@ class DurableJobsConfig:
 
     @property
     def dispatch_allowed(self) -> bool:
-        """Dispatch requires both the pilot and the dispatch flag."""
-        return self.enabled and self.dispatch_enabled
+        """Always False in Package 1 â€” dispatch is hard-disabled.
+
+        Flags alone must never authorize external adapter invocation.
+        """
+        return False
+
+
+def _require_bool(field: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise DurableJobsConfigError(
+            f"durable_jobs.{field} must be a boolean "
+            f"(got {type(value).__name__!r}); "
+            "string/int values like 'false'/'0' are rejected"
+        )
+    return value
 
 
 def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig:
@@ -48,8 +65,10 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
     sqlite = merged.get("sqlite_path")
     checkpoint = merged.get("checkpoint_sqlite_path")
     return DurableJobsConfig(
-        enabled=bool(merged.get("enabled", False)),
-        dispatch_enabled=bool(merged.get("dispatch_enabled", False)),
+        enabled=_require_bool("enabled", merged.get("enabled", False)),
+        dispatch_enabled=_require_bool(
+            "dispatch_enabled", merged.get("dispatch_enabled", False)
+        ),
         sqlite_path=Path(sqlite) if sqlite else None,
         checkpoint_sqlite_path=Path(checkpoint) if checkpoint else None,
     )
