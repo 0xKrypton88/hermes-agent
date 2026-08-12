@@ -18,6 +18,7 @@ Safety contract:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Union
@@ -40,6 +41,66 @@ from gateway.linear_ready_go_store import (
     LinearReadyGoStore,
     ReadyReviewRecord,
 )
+
+# Match Ready freeze identity + digest contracts (fail closed on padding / charset).
+_CANONICAL_IDENTITY = re.compile(r"^[A-Za-z0-9._:-]+$")
+_SHA256_LOWER = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _canonical_go_selector(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(canonical_value, reason_code)`` for a required Go selector.
+
+    Blank / omitted → ``missing_*`` (caller supplies the specific code).
+    Non-string, surrounding/internal whitespace, or charset mismatch →
+    ``noncanonical``. Digests must additionally be lowercase SHA-256 hex.
+    """
+    if value is None:
+        return None, "missing"
+    if not isinstance(value, str):
+        return None, "noncanonical"
+    if not value or not value.strip():
+        return None, "missing"
+    if value != value.strip() or any(ch.isspace() for ch in value):
+        return None, "noncanonical"
+    return value, None
+
+
+def _validate_go_provenance_selectors(
+    review_key: Any,
+    source_digest: Any,
+) -> tuple[Optional[str], Optional[str], tuple[str, ...]]:
+    """Require both Go selectors to be canonical and nonempty.
+
+    Returns ``(canonical_review_key, canonical_source_digest, reason_codes)``.
+    When ``reason_codes`` is non-empty both selectors are rejected (fail closed).
+    """
+    codes: list[str] = []
+    key, key_reason = _canonical_go_selector(review_key)
+    if key_reason == "missing":
+        codes.append("missing_review_key")
+        key = None
+    elif key_reason == "noncanonical" or key is None or not _CANONICAL_IDENTITY.fullmatch(
+        key
+    ):
+        codes.append("noncanonical_review_key")
+        key = None
+
+    digest, digest_reason = _canonical_go_selector(source_digest)
+    if digest_reason == "missing":
+        codes.append("missing_source_digest")
+        digest = None
+    elif (
+        digest_reason == "noncanonical"
+        or digest is None
+        or not _SHA256_LOWER.fullmatch(digest)
+    ):
+        codes.append("noncanonical_source_digest")
+        digest = None
+
+    if codes:
+        return None, None, tuple(dict.fromkeys(codes))
+    assert key is not None and digest is not None
+    return key, digest, ()
 
 
 @dataclass(frozen=True)
@@ -166,12 +227,13 @@ class LinearReadyGoControlPlane:
     ) -> GoControlResult:
         """Create exactly one non-dispatched LaunchIntent when provenance matches.
 
-        Loads persisted Ready provenance for the transition's ``issue_id`` (optionally
-        constrained by ``review_key`` / ``source_digest``), plans via the pure
-        ``plan_explicit_go_launch`` helper, and persists the intent. Duplicate
-        delivery/intent keys return ``status=duplicate`` with an explainable reason.
-        Cross-team Go attempts fail closed when ``team_key`` mismatches frozen
-        Ready provenance. Storage failures fail closed with ``storage_failure``.
+        Both ``review_key`` and ``source_digest`` are mandatory, canonical, and
+        nonempty. Go only proceeds when they match the same persisted
+        ``READY_FOR_GO`` row exactly — there is no latest-READY fallback.
+        Duplicate delivery/intent keys return ``status=duplicate`` with an
+        explainable reason. Cross-team Go attempts fail closed when ``team_key``
+        mismatches frozen Ready provenance. Storage failures fail closed with
+        ``storage_failure``.
         """
         if transition is None:
             return GoControlResult(
@@ -193,11 +255,22 @@ class LinearReadyGoControlPlane:
                 reason="missing_go_transition",
             )
 
+        canon_key, canon_digest, selector_codes = _validate_go_provenance_selectors(
+            review_key, source_digest
+        )
+        if selector_codes:
+            return GoControlResult(
+                ok=False,
+                status="rejected",
+                reason_codes=selector_codes,
+                reason=selector_codes[0],
+            )
+
         try:
             provenance_row = self._store.get_ready_provenance(
                 issue_id=str(issue_id or ""),
-                review_key=review_key,
-                source_digest=source_digest,
+                review_key=canon_key,
+                source_digest=canon_digest,
                 require_ready_for_go=True,
             )
         except (sqlite3.Error, OSError) as exc:
@@ -210,15 +283,10 @@ class LinearReadyGoControlPlane:
             )
 
         if provenance_row is None:
-            # Distinguish missing vs wrong decision / tamper when a row exists
-            # without the READY_FOR_GO requirement.
+            # Explain why the exact keyed+digest READY_FOR_GO lookup missed.
+            # Never fall back to "latest READY for issue".
             try:
-                any_row = self._store.get_ready_provenance(
-                    issue_id=str(issue_id or ""),
-                    review_key=review_key,
-                    source_digest=source_digest,
-                    require_ready_for_go=False,
-                )
+                keyed = self._store.get_ready_review_by_key(canon_key or "")
             except (sqlite3.Error, OSError) as exc:
                 _ = exc
                 return GoControlResult(
@@ -227,21 +295,34 @@ class LinearReadyGoControlPlane:
                     reason_codes=("storage_failure",),
                     reason="storage_failure",
                 )
-            if any_row is None:
-                # Stale keyed lookup: a review_key was supplied but does not match
-                # any persisted Ready row for this issue.
-                if review_key or source_digest:
-                    codes = ("stale_ready_provenance",)
-                else:
-                    codes = ("missing_ready_provenance",)
-            elif any_row.decision != DECISION_READY_FOR_GO:
-                codes = ("ready_decision_not_ready_for_go",)
-            elif source_digest and any_row.source_digest != source_digest:
-                codes = ("ready_provenance_digest_mismatch",)
-            elif review_key and any_row.review_key != review_key:
+            if keyed is None:
                 codes = ("stale_ready_provenance",)
+                # Prefer missing when this issue has no Ready rows at all.
+                try:
+                    any_for_issue = self._store.get_ready_provenance(
+                        issue_id=str(issue_id or ""),
+                        review_key=None,
+                        source_digest=None,
+                        require_ready_for_go=False,
+                    )
+                except (sqlite3.Error, OSError) as exc:
+                    _ = exc
+                    return GoControlResult(
+                        ok=False,
+                        status="rejected",
+                        reason_codes=("storage_failure",),
+                        reason="storage_failure",
+                    )
+                if any_for_issue is None:
+                    codes = ("missing_ready_provenance",)
+            elif keyed.issue_id != str(issue_id or ""):
+                codes = ("stale_ready_provenance",)
+            elif keyed.source_digest != canon_digest:
+                codes = ("ready_provenance_digest_mismatch",)
+            elif keyed.decision != DECISION_READY_FOR_GO:
+                codes = ("ready_decision_not_ready_for_go",)
             else:
-                codes = ("missing_ready_provenance",)
+                codes = ("stale_ready_provenance",)
             return GoControlResult(
                 ok=False,
                 status="rejected",
@@ -249,14 +330,15 @@ class LinearReadyGoControlPlane:
                 reason=codes[0],
             )
 
-        if source_digest and provenance_row.source_digest != source_digest:
+        # Exact same-record match (defense in depth after keyed store lookup).
+        if provenance_row.source_digest != canon_digest:
             return GoControlResult(
                 ok=False,
                 status="rejected",
                 reason_codes=("ready_provenance_digest_mismatch",),
                 reason="ready_provenance_digest_mismatch",
             )
-        if review_key and provenance_row.review_key != review_key:
+        if provenance_row.review_key != canon_key:
             return GoControlResult(
                 ok=False,
                 status="rejected",

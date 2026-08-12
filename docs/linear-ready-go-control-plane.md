@@ -20,9 +20,11 @@ It does **not** replace:
   receipt for `READY_FOR_GO` (unless `persist_blocked=True`). Ready **never**
   starts work (`starts_agent_work=False`).
 - Go path accepts only an exact normalized Go transition against matching
-  successful stored Ready provenance and creates exactly one persistent
-  `LaunchIntent(dispatched=False)`. Duplicate delivery/intent keys are
-  explainable no-ops.
+  successful stored Ready provenance (**both** ``review_key`` and
+  ``source_digest`` mandatory, canonical, nonempty, and matching the same
+  ``READY_FOR_GO`` row exactly — no latest-READY fallback) and creates exactly
+  one persistent `LaunchIntent(dispatched=False)`. Duplicate delivery/intent
+  keys are explainable no-ops.
 - Unknown / mismatched / noncanonical identities, cross-team mismatches, stale
   provenance, malformed transitions, and storage failures fail closed.
 - never invokes Cursor, LangGraph, subprocess, network I/O, Linear APIs,
