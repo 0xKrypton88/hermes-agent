@@ -1208,6 +1208,7 @@ export function useSessionActions({
         const params = await desktopSessionCreateParams(cwd?.trim() ?? '', {
           profile: profile ?? null
         })
+
         const branched = sourceSessionId
           ? await requestGateway<SessionCreateResponse>('session.branch', {
               session_id: sourceSessionId,

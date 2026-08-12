@@ -671,10 +671,8 @@ export const setCurrentReasoningEffort = (next: Updater<string>) => {
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
 }
 
-export const setCurrentReasoningMode = (next: Updater<ReasoningMode>) =>
-  updateAtom($currentReasoningMode, next)
-export const setCurrentReasoningReason = (next: Updater<string>) =>
-  updateAtom($currentReasoningReason, next)
+export const setCurrentReasoningMode = (next: Updater<ReasoningMode>) => updateAtom($currentReasoningMode, next)
+export const setCurrentReasoningReason = (next: Updater<string>) => updateAtom($currentReasoningReason, next)
 export const setCurrentAdaptivePolicyVersion = (next: Updater<string>) =>
   updateAtom($currentAdaptivePolicyVersion, next)
 

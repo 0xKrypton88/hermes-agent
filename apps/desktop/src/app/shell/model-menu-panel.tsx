@@ -271,6 +271,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
       if (patch.reasoningMode === 'auto') {
         void patchAuto()
+
         return
       }
 
