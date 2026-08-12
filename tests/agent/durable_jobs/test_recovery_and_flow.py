@@ -22,7 +22,9 @@ def _cfg(tmp_path: Path, *, enabled: bool = True):
     )
 
 
-def test_reopen_recovers_nonterminal_job_phase_and_correlation(tmp_path):
+def test_reopen_recovers_nonterminal_job_phase_and_correlation(
+    tmp_path, require_langgraph
+):
     from agent.durable_jobs.models import JobPhase
     from agent.durable_jobs.service import DurableJobService
     from agent.durable_jobs.store import DurableJobStore
@@ -86,7 +88,9 @@ def test_outbox_intent_is_append_only_and_idempotent(tmp_path):
     assert len(dispatch_events) == 1
 
 
-def test_langgraph_flow_intake_to_await_dispatch_uses_separate_checkpointer_db(tmp_path):
+def test_langgraph_flow_intake_to_await_dispatch_uses_separate_checkpointer_db(
+    tmp_path, require_langgraph
+):
     from agent.durable_jobs.models import JobPhase
     from agent.durable_jobs.service import DurableJobService
 

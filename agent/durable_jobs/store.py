@@ -193,32 +193,56 @@ class DurableJobStore:
         *,
         frozen_baseline_sha: Optional[str] = None,
     ) -> DurableJob:
-        job = self.get_job(job_id)
-        if job is None:
-            raise KeyError(f"unknown job_id: {job_id}")
-        allowed = ALLOWED_TRANSITIONS.get(job.phase, frozenset())
-        if new_phase not in allowed:
-            raise InvalidPhaseTransition(
-                f"cannot transition {job.phase.value} -> {new_phase.value}"
-            )
+        """Atomically transition phase with compare-and-swap.
+
+        Read + validate + UPDATE ... WHERE phase=<observed> + event append run
+        in one IMMEDIATE transaction so a concurrent writer cannot lose updates
+        or diverge audit history from durable state.
+        """
         now = _utcnow()
-        sha = (
-            frozen_baseline_sha
-            if frozen_baseline_sha is not None
-            else job.frozen_baseline_sha
-        )
-        next_action = DEFAULT_NEXT_ACTION[new_phase]
         with self._connect() as conn:
-            conn.execute(
+            # Single connection transaction: SELECT + CAS UPDATE + event.
+            # Raising before context exit rolls back so state and audit stay aligned.
+            row = conn.execute(
+                "SELECT * FROM durable_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown job_id: {job_id}")
+            job = self._row_to_job(row)
+            allowed = ALLOWED_TRANSITIONS.get(job.phase, frozenset())
+            if new_phase not in allowed:
+                raise InvalidPhaseTransition(
+                    f"cannot transition {job.phase.value} -> {new_phase.value}"
+                )
+            sha = (
+                frozen_baseline_sha
+                if frozen_baseline_sha is not None
+                else job.frozen_baseline_sha
+            )
+            next_action = DEFAULT_NEXT_ACTION[new_phase]
+            cur = conn.execute(
                 """
                 UPDATE durable_jobs
                    SET phase = ?, frozen_baseline_sha = ?, next_action = ?,
                        updated_at = ?
-                 WHERE job_id = ?
+                 WHERE job_id = ? AND phase = ?
                 """,
-                (new_phase.value, sha, next_action, now, job_id),
+                (
+                    new_phase.value,
+                    sha,
+                    next_action,
+                    now,
+                    job_id,
+                    job.phase.value,
+                ),
             )
-            self._append_event(
+            if cur.rowcount != 1:
+                raise InvalidPhaseTransition(
+                    f"stale phase for {job_id}: concurrent update rejected "
+                    f"(observed {job.phase.value} -> {new_phase.value})"
+                )
+            inserted = self._append_event(
                 conn,
                 job_id=job_id,
                 event_type="phase_transition",
@@ -229,10 +253,17 @@ class DurableJobStore:
                 },
                 idempotency_key=f"phase:{job.phase.value}->{new_phase.value}",
             )
-            conn.commit()
-        updated = self.get_job(job_id)
-        assert updated is not None
-        return updated
+            if not inserted:
+                raise InvalidPhaseTransition(
+                    f"duplicate phase transition event for {job_id}: "
+                    f"{job.phase.value} -> {new_phase.value}"
+                )
+            updated_row = conn.execute(
+                "SELECT * FROM durable_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        assert updated_row is not None
+        return self._row_to_job(updated_row)
 
     def append_intent(
         self,

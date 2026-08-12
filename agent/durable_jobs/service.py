@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
-from agent.durable_jobs.graph import run_pilot_graph
 from agent.durable_jobs.models import DurableJob, JobPhase
 from agent.durable_jobs.store import DurableJobStore
 
@@ -100,6 +99,10 @@ class DurableJobService:
         # Idempotent re-entry: if already advanced, return as-is.
         if job.phase is JobPhase.AWAIT_DISPATCH:
             return job
+
+        # Lazy import: LangGraph is an opt-in extra ([langgraph-durable] / [dev]),
+        # not a core runtime dependency. Keep store/config importable without it.
+        from agent.durable_jobs.graph import run_pilot_graph
 
         run_pilot_graph(
             store=store,

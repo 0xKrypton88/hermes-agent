@@ -73,7 +73,9 @@ def test_no_live_dispatch_adapter_is_exported():
     assert not hasattr(adapters, "CursorCloudAdapter")
 
 
-def test_pilot_flow_and_dispatch_rejection_open_no_network_sockets(tmp_path, monkeypatch):
+def test_pilot_flow_and_dispatch_rejection_open_no_network_sockets(
+    tmp_path, monkeypatch, require_langgraph
+):
     """Package 1 must be unable to reach Slack/Cursor/network during the flow."""
     from agent.durable_jobs.config import load_durable_jobs_config
     from agent.durable_jobs.service import DispatchDisabledError, DurableJobService

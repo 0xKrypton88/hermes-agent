@@ -11,6 +11,7 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - Deterministic phase flow via LangGraph: `INTAKE → FREEZE_BASELINE → AWAIT_DISPATCH`
 - Append-only `durable_job_events` outbox for idempotent intent recording
 - Crash-safe reopen/recovery by `job_id` on the same disposable SQLite path
+- Compare-and-swap phase transitions (no TOCTOU lost updates vs audit history)
 - **Hard-disabled dispatch**: `attempt_dispatch` always raises
   `DispatchDisabledError` and never invokes any adapter, even when
   `enabled` and `dispatch_enabled` are both true and a fake adapter is injected
@@ -23,6 +24,7 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - No service restarts, deployment, credentials, live trading, order mutation,
   arming/disarming, or reconciliation
 - Does **not** touch existing completion/outbox modules or Hermes `state.db`
+- Does **not** add LangGraph to core dependencies (opt-in extra only)
 
 ## Storage boundaries
 
@@ -57,7 +59,24 @@ durable_jobs:
 `bool("false") == True` ambiguity. Even with both flags true, Package 1 never
 calls an injected dispatch adapter.
 
-## Tests
+## Tests (clean / release-venv safe)
+
+LangGraph is **not** installed in the release venv. Use the harness (creates an
+isolated venv and installs `[dev]`, which includes `[langgraph-durable]`):
+
+```bash
+scripts/run_durable_jobs_tests.sh
+```
+
+Manual equivalent with uv (uses lockfile pins):
+
+```bash
+uv venv .venv-durable-jobs
+uv pip install -e ".[dev]" --python .venv-durable-jobs
+.venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
+```
+
+If a local `.venv` already has `[dev]`:
 
 ```bash
 scripts/run_tests.sh tests/agent/durable_jobs/

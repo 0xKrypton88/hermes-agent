@@ -135,3 +135,72 @@ def test_application_store_schema_is_local_and_isolated_from_checkpointer_tables
     assert "checkpoints" not in tables
     assert "checkpoint_blobs" not in tables
     assert SCHEMA_VERSION >= 1
+
+
+def test_stale_phase_transition_rejected_without_diverging_audit_history(
+    tmp_path, monkeypatch
+):
+    """Compare-and-swap: a stale INTAKE observation must not clobber AWAIT_DISPATCH."""
+    from agent.durable_jobs.models import DurableJob, InvalidPhaseTransition, JobPhase
+    from agent.durable_jobs.store import DurableJobStore
+
+    store = DurableJobStore(sqlite_path=_db(tmp_path))
+    created = store.create_job(
+        origin_platform="cli",
+        origin_chat_id="local",
+        origin_root_thread_id="root-cas",
+        objective="cas race",
+        repository_identity="repo",
+        frozen_baseline_sha="",
+        idempotency_key="idem-cas",
+    )
+    store.transition_phase(
+        created.job_id, JobPhase.FREEZE_BASELINE, frozen_baseline_sha="sha-cas"
+    )
+    store.transition_phase(created.job_id, JobPhase.AWAIT_DISPATCH)
+
+    before = store.get_job(created.job_id)
+    assert before is not None
+    assert before.phase is JobPhase.AWAIT_DISPATCH
+    events_before = store.list_events(created.job_id)
+
+    # Deterministic stale read: first row→job mapping claims INTAKE while DB is AWAIT.
+    real_row_to_job = DurableJobStore._row_to_job
+    flipped = {"done": False}
+
+    def stale_row_to_job(row):
+        job = real_row_to_job(row)
+        if not flipped["done"] and job.job_id == created.job_id:
+            flipped["done"] = True
+            return DurableJob(
+                job_id=job.job_id,
+                phase=JobPhase.INTAKE,
+                origin_platform=job.origin_platform,
+                origin_chat_id=job.origin_chat_id,
+                origin_root_thread_id=job.origin_root_thread_id,
+                objective=job.objective,
+                repository_identity=job.repository_identity,
+                frozen_baseline_sha=job.frozen_baseline_sha,
+                idempotency_key=job.idempotency_key,
+                next_action=job.next_action,
+                created_at=job.created_at,
+                updated_at=job.updated_at,
+            )
+        return job
+
+    monkeypatch.setattr(
+        DurableJobStore, "_row_to_job", staticmethod(stale_row_to_job)
+    )
+
+    with pytest.raises(InvalidPhaseTransition):
+        store.transition_phase(
+            created.job_id,
+            JobPhase.FREEZE_BASELINE,
+            frozen_baseline_sha="sha-stale",
+        )
+
+    after = store.get_job(created.job_id)
+    assert after is not None
+    assert after.phase is JobPhase.AWAIT_DISPATCH
+    assert after.frozen_baseline_sha == "sha-cas"
+    assert store.list_events(created.job_id) == events_before
