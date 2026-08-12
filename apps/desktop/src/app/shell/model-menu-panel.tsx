@@ -18,10 +18,10 @@ import {
   $currentReasoningMode,
   $defaultReasoningEffort,
   markComposerSelectionManual,
+  type ReasoningMode,
   setCurrentFastMode,
   setCurrentReasoningEffort,
-  setCurrentReasoningMode,
-  type ReasoningMode
+  setCurrentReasoningMode
 } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
