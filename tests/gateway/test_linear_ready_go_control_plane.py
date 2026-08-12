@@ -193,6 +193,91 @@ def test_freeze_rejects_noncanonical_and_unknown_team_identities():
     assert "cross_team_mismatch" in cross.reasons
 
 
+def test_freeze_blocks_numeric_mapping_identities_without_str_coercion():
+    """Mapping intake must not stringify ints into READY_FOR_GO identities."""
+    base = dict(
+        title="Durable Ready/Go control plane",
+        description="Freeze Ready provenance and plan non-dispatched Go intents.",
+        acceptance_criteria=(
+            "READY_FOR_GO only when the frozen source package is complete.",
+            "Go creates exactly one LaunchIntent(dispatched=False).",
+        ),
+        repository="https://github.com/0xKrypton88/hermes-agent.git",
+        target_ref="cursor/durable-ready-go-plane-52df",
+    )
+    numeric_id = evaluate_ready_freeze({**base, "issue_id": 123, "issue_identifier": ISSUE_IDENTIFIER})
+    assert numeric_id.decision == DECISION_BLOCKED
+    assert numeric_id.starts_agent_work is False
+    assert "noncanonical_issue_id" in numeric_id.reasons
+    assert numeric_id.frozen_source.issue_id == ""
+
+    numeric_ident = evaluate_ready_freeze(
+        {**base, "issue_id": ISSUE_ID, "issue_identifier": 14}
+    )
+    assert numeric_ident.decision == DECISION_BLOCKED
+    assert numeric_ident.starts_agent_work is False
+    assert "noncanonical_issue_identifier" in numeric_ident.reasons
+    assert numeric_ident.frozen_source.issue_identifier == ""
+
+    both = evaluate_ready_freeze({**base, "issue_id": 123, "issue_identifier": 14})
+    assert both.decision == DECISION_BLOCKED
+    assert "noncanonical_issue_id" in both.reasons
+    assert "noncanonical_issue_identifier" in both.reasons
+    assert both.decision != DECISION_READY_FOR_GO
+
+
+def test_go_rejects_mismatched_issue_identifier_and_padded_team_key(tmp_path):
+    store = _store(tmp_path)
+    ready = process_ready(
+        _complete_source(team_key="ENG", allowed_team_keys=("ENG",)),
+        store=store,
+    )
+    assert ready.ok is True
+
+    mismatched = process_go(
+        _valid_transition(
+            issue_identifier="ENG-999",
+            go_event_key="svix_msg_ident_mismatch",
+        ),
+        store=store,
+        review_key=ready.receipt.review_key,
+        source_digest=ready.receipt.source_digest,
+        team_key="ENG",
+    )
+    assert mismatched.ok is False
+    assert mismatched.status == "rejected"
+    assert "issue_identity_mismatch" in mismatched.reason_codes
+    assert mismatched.intent is None
+    assert mismatched.record is None
+    assert store.count_launch_intents() == 0
+
+    padded_team = process_go(
+        _valid_transition(go_event_key="svix_msg_padded_team"),
+        store=store,
+        review_key=ready.receipt.review_key,
+        source_digest=ready.receipt.source_digest,
+        team_key=" ENG ",
+    )
+    assert padded_team.ok is False
+    assert padded_team.status == "rejected"
+    assert "noncanonical_team_key" in padded_team.reason_codes
+    assert padded_team.intent is None
+    assert store.count_launch_intents() == 0
+
+    # Successful exact-identity Go still works with the same Ready provenance.
+    ok = process_go(
+        _valid_transition(go_event_key="svix_msg_exact_team"),
+        store=store,
+        review_key=ready.receipt.review_key,
+        source_digest=ready.receipt.source_digest,
+        team_key="ENG",
+    )
+    assert ok.ok is True
+    assert ok.intent is not None
+    assert ok.intent.dispatched is False
+    assert store.count_launch_intents() == 1
+
+
 def test_ready_persistence_survives_store_reconstruction(tmp_path):
     store = _store(tmp_path)
     plane = LinearReadyGoControlPlane(store=store)

@@ -72,6 +72,20 @@ def _as_canonical_identity(value: Any) -> tuple[Optional[str], Optional[str]]:
     return value, None
 
 
+def _identity_supplied(value: Any) -> bool:
+    """True when a caller-supplied identity must be validated fail-closed.
+
+    ``None`` and the exact empty string are treated as absent. Any other value
+    — including whitespace-only strings and non-strings — is present and must
+    not be silently coerced or trimmed away.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str) and value == "":
+        return False
+    return True
+
+
 def _normalize_criteria(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         text = value.strip()
@@ -88,27 +102,45 @@ def _normalize_criteria(value: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class ReadySourceInput:
-    """Caller-supplied issue source fields to freeze."""
+    """Caller-supplied issue source fields to freeze.
 
-    issue_id: str
-    issue_identifier: str
+    Identity fields (``issue_id``, ``issue_identifier``, ``team_key``) keep their
+    raw caller types. Mapping intake must **not** stringify them — numeric /
+    non-string values fail closed as noncanonical during evaluation.
+    """
+
+    issue_id: Any
+    issue_identifier: Any
     title: str
     description: str
     acceptance_criteria: Union[str, Sequence[str]]
     repository: str
     target_ref: str
     unresolved_required_inputs: bool = False
-    team_key: Optional[str] = None
-    allowed_team_keys: Optional[Sequence[str]] = None
+    team_key: Any = None
+    allowed_team_keys: Optional[Sequence[Any]] = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ReadySourceInput":
         data = _mapping(value)
-        identifier = data.get("issue_identifier", data.get("identifier", ""))
+        # Preserve raw identity types — never coerce via str()/or "".
+        # Missing keys default to blank strings so absence still maps to
+        # missing_* reasons; explicit non-strings (e.g. int 123) stay raw
+        # and are rejected as noncanonical by ``_as_canonical_identity``.
+        if "issue_id" in data:
+            issue_id: Any = data.get("issue_id")
+        else:
+            issue_id = ""
+        if "issue_identifier" in data:
+            identifier: Any = data.get("issue_identifier")
+        elif "identifier" in data:
+            identifier = data.get("identifier")
+        else:
+            identifier = ""
         allowed = data.get("allowed_team_keys")
         return cls(
-            issue_id=str(data.get("issue_id", "") or ""),
-            issue_identifier=str(identifier or ""),
+            issue_id=issue_id,
+            issue_identifier=identifier,
             title=str(data.get("title", "") or ""),
             description=str(data.get("description", "") or ""),
             acceptance_criteria=data.get("acceptance_criteria", ()),
@@ -117,7 +149,7 @@ class ReadySourceInput:
             unresolved_required_inputs=bool(
                 data.get("unresolved_required_inputs", False)
             ),
-            team_key=data.get("team_key"),  # type: ignore[arg-type]
+            team_key=data.get("team_key"),
             allowed_team_keys=(
                 allowed
                 if isinstance(allowed, Sequence)
@@ -197,7 +229,7 @@ def freeze_source_package(source: ReadySourceInput) -> FrozenReadySource:
         source.issue_identifier
     )
     team_key = ""
-    if source.team_key is not None and str(source.team_key).strip() != "":
+    if _identity_supplied(source.team_key):
         team_canon, _team_reason = _as_canonical_identity(source.team_key)
         team_key = team_canon or ""
     return FrozenReadySource(
@@ -265,7 +297,7 @@ def _collect_absence_reasons(
     if unresolved_required_inputs:
         reasons.append(REASON_UNRESOLVED_REQUIRED_INPUTS)
 
-    if source.team_key is not None and str(source.team_key).strip() != "":
+    if _identity_supplied(source.team_key):
         team_key, team_reason = _as_canonical_identity(source.team_key)
         if team_reason == "noncanonical" or team_key is None:
             reasons.append(REASON_NONCANONICAL_TEAM_KEY)
@@ -374,7 +406,7 @@ def evaluate_ready_freeze(
             # Caller-supplied review_key that does not match the frozen digest
             # is treated as an identity mismatch (tamper / stale review).
             reasons.append(REASON_ISSUE_IDENTITY_MISMATCH)
-        if review_input.team_key is not None and str(review_input.team_key).strip():
+        if _identity_supplied(review_input.team_key):
             review_team, review_team_reason = _as_canonical_identity(
                 review_input.team_key
             )

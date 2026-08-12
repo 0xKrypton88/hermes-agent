@@ -47,6 +47,26 @@ _CANONICAL_IDENTITY = re.compile(r"^[A-Za-z0-9._:-]+$")
 _SHA256_LOWER = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _exact_canonical_identity(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(identity, reason)`` with **no** str() coercion or whitespace trim.
+
+    ``reason`` is ``\"missing\"`` for None / exact empty string, else
+    ``\"noncanonical\"`` for non-strings, padding, internal whitespace, or
+    charset violations. Accepted values are returned unchanged.
+    """
+    if value is None:
+        return None, "missing"
+    if not isinstance(value, str):
+        return None, "noncanonical"
+    if value == "":
+        return None, "missing"
+    if value != value.strip() or any(ch.isspace() for ch in value):
+        return None, "noncanonical"
+    if not _CANONICAL_IDENTITY.fullmatch(value):
+        return None, "noncanonical"
+    return value, None
+
+
 def _canonical_go_selector(value: Any) -> tuple[Optional[str], Optional[str]]:
     """Return ``(canonical_value, reason_code)`` for a required Go selector.
 
@@ -101,6 +121,55 @@ def _validate_go_provenance_selectors(
         return None, None, tuple(dict.fromkeys(codes))
     assert key is not None and digest is not None
     return key, digest, ()
+
+
+def _extract_go_transition_identities(
+    transition: Union[NormalizedGoTransition, Mapping[str, Any]],
+) -> tuple[Any, Any]:
+    """Return raw ``(issue_id, issue_identifier)`` without coercion."""
+    if isinstance(transition, NormalizedGoTransition):
+        return transition.issue_id, transition.issue_identifier
+    return transition.get("issue_id"), transition.get("issue_identifier")
+
+
+def _validate_go_transition_identities(
+    issue_id: Any,
+    issue_identifier: Any,
+) -> tuple[Optional[str], Optional[str], tuple[str, ...]]:
+    """Require exact canonical Go transition identities (no trim / str())."""
+    codes: list[str] = []
+    canon_id, id_reason = _exact_canonical_identity(issue_id)
+    if id_reason == "missing":
+        codes.append("missing_issue_id")
+    elif id_reason == "noncanonical" or canon_id is None:
+        codes.append("noncanonical_issue_id")
+        canon_id = None
+
+    canon_ident, ident_reason = _exact_canonical_identity(issue_identifier)
+    if ident_reason == "missing":
+        codes.append("missing_issue_identifier")
+    elif ident_reason == "noncanonical" or canon_ident is None:
+        codes.append("noncanonical_issue_identifier")
+        canon_ident = None
+
+    if codes:
+        return None, None, tuple(dict.fromkeys(codes))
+    assert canon_id is not None and canon_ident is not None
+    return canon_id, canon_ident, ()
+
+
+def _validate_go_team_key(team_key: Any) -> tuple[Optional[str], tuple[str, ...]]:
+    """Validate optional Go ``team_key`` without trimming or str() coercion.
+
+    ``None`` / exact ``\"\"`` → no team constraint. Any other value must be an
+    exact canonical identity string; padded / non-string / noncanonical reject.
+    """
+    if team_key is None or team_key == "":
+        return None, ()
+    canon, reason = _exact_canonical_identity(team_key)
+    if reason is not None or canon is None:
+        return None, ("noncanonical_team_key",)
+    return canon, ()
 
 
 @dataclass(frozen=True)
@@ -228,12 +297,11 @@ class LinearReadyGoControlPlane:
         """Create exactly one non-dispatched LaunchIntent when provenance matches.
 
         Both ``review_key`` and ``source_digest`` are mandatory, canonical, and
-        nonempty. Go only proceeds when they match the same persisted
-        ``READY_FOR_GO`` row exactly — there is no latest-READY fallback.
-        Duplicate delivery/intent keys return ``status=duplicate`` with an
-        explainable reason. Cross-team Go attempts fail closed when ``team_key``
-        mismatches frozen Ready provenance. Storage failures fail closed with
-        ``storage_failure``.
+        nonempty. Transition ``issue_id`` / ``issue_identifier`` must be exact
+        canonical strings (no str() coercion or whitespace trim) and must equal
+        the same persisted ``READY_FOR_GO`` row. Optional ``team_key`` must be
+        exact-canonical when present/nonempty and must equal the frozen Ready
+        team key without trimming. There is no latest-READY fallback.
         """
         if transition is None:
             return GoControlResult(
@@ -244,9 +312,9 @@ class LinearReadyGoControlPlane:
             )
 
         if isinstance(transition, NormalizedGoTransition):
-            issue_id = transition.issue_id
+            pass
         elif isinstance(transition, Mapping):
-            issue_id = transition.get("issue_id", "")
+            pass
         else:
             return GoControlResult(
                 ok=False,
@@ -254,6 +322,21 @@ class LinearReadyGoControlPlane:
                 reason_codes=("missing_go_transition",),
                 reason="missing_go_transition",
             )
+
+        raw_issue_id, raw_issue_identifier = _extract_go_transition_identities(
+            transition
+        )
+        issue_id, issue_identifier, identity_codes = _validate_go_transition_identities(
+            raw_issue_id, raw_issue_identifier
+        )
+        if identity_codes:
+            return GoControlResult(
+                ok=False,
+                status="rejected",
+                reason_codes=identity_codes,
+                reason=identity_codes[0],
+            )
+        assert issue_id is not None and issue_identifier is not None
 
         canon_key, canon_digest, selector_codes = _validate_go_provenance_selectors(
             review_key, source_digest
@@ -266,9 +349,18 @@ class LinearReadyGoControlPlane:
                 reason=selector_codes[0],
             )
 
+        go_team, team_codes = _validate_go_team_key(team_key)
+        if team_codes:
+            return GoControlResult(
+                ok=False,
+                status="rejected",
+                reason_codes=team_codes,
+                reason=team_codes[0],
+            )
+
         try:
             provenance_row = self._store.get_ready_provenance(
-                issue_id=str(issue_id or ""),
+                issue_id=issue_id,
                 review_key=canon_key,
                 source_digest=canon_digest,
                 require_ready_for_go=True,
@@ -300,7 +392,7 @@ class LinearReadyGoControlPlane:
                 # Prefer missing when this issue has no Ready rows at all.
                 try:
                     any_for_issue = self._store.get_ready_provenance(
-                        issue_id=str(issue_id or ""),
+                        issue_id=issue_id,
                         review_key=None,
                         source_digest=None,
                         require_ready_for_go=False,
@@ -315,7 +407,7 @@ class LinearReadyGoControlPlane:
                     )
                 if any_for_issue is None:
                     codes = ("missing_ready_provenance",)
-            elif keyed.issue_id != str(issue_id or ""):
+            elif keyed.issue_id != issue_id:
                 codes = ("stale_ready_provenance",)
             elif keyed.source_digest != canon_digest:
                 codes = ("ready_provenance_digest_mismatch",)
@@ -345,6 +437,18 @@ class LinearReadyGoControlPlane:
                 reason_codes=("stale_ready_provenance",),
                 reason="stale_ready_provenance",
             )
+        # Exact identity equality against persisted Ready provenance — no
+        # coercion or trimming on either side.
+        if (
+            provenance_row.issue_id != issue_id
+            or provenance_row.issue_identifier != issue_identifier
+        ):
+            return GoControlResult(
+                ok=False,
+                status="rejected",
+                reason_codes=("issue_identity_mismatch",),
+                reason="issue_identity_mismatch",
+            )
         if provenance_row.starts_agent_work:
             return GoControlResult(
                 ok=False,
@@ -353,15 +457,16 @@ class LinearReadyGoControlPlane:
                 reason="ready_starts_agent_work",
             )
 
-        if team_key is not None and str(team_key).strip():
+        if go_team is not None:
             try:
                 frozen = json.loads(provenance_row.frozen_source_json)
             except (TypeError, ValueError):
                 frozen = {}
-            frozen_team = ""
+            frozen_team: Any = None
             if isinstance(frozen, Mapping):
-                frozen_team = str(frozen.get("team_key") or "").strip()
-            if not frozen_team or frozen_team != str(team_key).strip():
+                frozen_team = frozen.get("team_key")
+            # Exact match only — never str()/strip() frozen or supplied team keys.
+            if not isinstance(frozen_team, str) or frozen_team != go_team:
                 return GoControlResult(
                     ok=False,
                     status="rejected",
@@ -427,6 +532,17 @@ class LinearReadyGoControlPlane:
 
         intent = plan.intent
         assert intent.dispatched is False
+        # Intent identities must remain exact matches to the validated transition.
+        if (
+            intent.issue_id != issue_id
+            or intent.issue_identifier != issue_identifier
+        ):
+            return GoControlResult(
+                ok=False,
+                status="rejected",
+                reason_codes=("issue_identity_mismatch",),
+                reason="issue_identity_mismatch",
+            )
         try:
             insert = self._store.record_launch_intent(
                 issue_id=intent.issue_id,

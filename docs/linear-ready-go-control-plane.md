@@ -17,14 +17,19 @@ It does **not** replace:
 - Ready path freezes explicitly supplied source/review inputs through a **strict
   identity allowlist** (`[A-Za-z0-9._:-]+`), hashes the frozen source
   deterministically (SHA-256), and persists exactly one immutable Ready review
-  receipt for `READY_FOR_GO` (unless `persist_blocked=True`). Ready **never**
-  starts work (`starts_agent_work=False`).
-- Go path accepts only an exact normalized Go transition against matching
-  successful stored Ready provenance (**both** ``review_key`` and
+  receipt for `READY_FOR_GO` (unless `persist_blocked=True`). Mapping intake
+  preserves raw identity types (no `str()` coercion) so numeric / non-string
+  `issue_id` / `issue_identifier` values fail closed as noncanonical. Ready
+  **never** starts work (`starts_agent_work=False`).
+- Go path accepts only an exact normalized Go transition whose `issue_id` and
+  `issue_identifier` are exact canonical strings (no trim / coercion) and equal
+  the matching successful stored Ready provenance (**both** ``review_key`` and
   ``source_digest`` mandatory, canonical, nonempty, and matching the same
-  ``READY_FOR_GO`` row exactly — no latest-READY fallback) and creates exactly
-  one persistent `LaunchIntent(dispatched=False)`. Duplicate delivery/intent
-  keys are explainable no-ops.
+  ``READY_FOR_GO`` row exactly — no latest-READY fallback). Optional Go
+  ``team_key`` must be exact-canonical when present (padded/non-string reject,
+  no trim) and equal the frozen Ready team key. Creates exactly one persistent
+  `LaunchIntent(dispatched=False)`. Duplicate delivery/intent keys are
+  explainable no-ops.
 - Unknown / mismatched / noncanonical identities, cross-team mismatches, stale
   provenance, malformed transitions, and storage failures fail closed.
 - never invokes Cursor, LangGraph, subprocess, network I/O, Linear APIs,
