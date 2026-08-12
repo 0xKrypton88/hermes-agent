@@ -80,10 +80,7 @@ export interface ModelMenuController {
   /** Commit a model row. Return false to abort (a failed session switch). */
   select: (model: string, provider: string) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
-  setOptions: (
-    patch: ModelEditOptionsPatch,
-    row: { isActive: boolean; model: string; provider: string }
-  ) => void
+  setOptions: (patch: ModelEditOptionsPatch, row: { isActive: boolean; model: string; provider: string }) => void
 }
 
 interface ModelCatalogMenuProps {
