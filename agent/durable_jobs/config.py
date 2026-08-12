@@ -12,6 +12,7 @@ config shape only and cannot enable adapter invocation in Package 1.
 
 from __future__ import annotations
 
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -55,12 +56,32 @@ def _require_bool(field: str, value: Any) -> bool:
     return value
 
 
+def _require_mapping(label: str, value: Any) -> Mapping[str, Any]:
+    # Use collections.abc.Mapping so typed Mapping aliases still pass isinstance.
+    if not isinstance(value, MappingABC):
+        raise DurableJobsConfigError(
+            f"{label} must be a mapping (got {type(value).__name__!r})"
+        )
+    return value
+
+
 def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig:
-    section: Mapping[str, Any] = {}
-    if isinstance(raw, Mapping):
-        maybe = raw.get("durable_jobs")
-        if isinstance(maybe, Mapping):
-            section = maybe
+    """Load Package 1 durable_jobs config.
+
+    ``None`` means "use defaults". Any other non-mapping root is rejected.
+    When the ``durable_jobs`` key is present it must itself be a mapping —
+    strings/lists/None/bools are not silently ignored.
+    """
+    if raw is None:
+        root: Mapping[str, Any] = {}
+    else:
+        root = _require_mapping("durable_jobs config root", raw)
+
+    if "durable_jobs" in root:
+        section = _require_mapping("durable_jobs", root["durable_jobs"])
+    else:
+        section = {}
+
     merged = {**DEFAULT_DURABLE_JOBS_CONFIG, **dict(section)}
     sqlite = merged.get("sqlite_path")
     checkpoint = merged.get("checkpoint_sqlite_path")

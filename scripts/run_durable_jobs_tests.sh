@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Reproducible clean-environment runner for ENG-3 Package 1 durable-jobs tests.
+# Lock-respecting clean-environment runner for ENG-3 Package 1 durable-jobs tests.
 #
 # LangGraph is an *opt-in* extra ([langgraph-durable], also pulled by [dev]).
-# It is NOT a core hermes-agent dependency. Release venvs therefore omit it;
-# this script builds/uses an isolated venv, installs locked opt-in deps, and
-# runs the focused suite.
+# It is NOT a core hermes-agent dependency. Release venvs therefore omit it.
+#
+# This script REQUIRES `uv` and installs via:
+#   UV_PROJECT_ENVIRONMENT=<venv> uv sync --extra dev --locked
+# so versions match uv.lock (e.g. langgraph-checkpoint==4.1.1). Plain
+# `pip install -e '.[dev]'` is intentionally NOT used — it is non-locked and
+# can resolve newer transitive pins (observed: langgraph-checkpoint 4.2.0).
+#
+# Windows: uv creates/uses Scripts/python.exe under the target venv; the
+# UV_PROJECT_ENVIRONMENT path works the same on POSIX and Windows.
 #
 # Usage:
 #   scripts/run_durable_jobs_tests.sh
 #   scripts/run_durable_jobs_tests.sh -q --tb=short
 #   DURABLE_JOBS_VENV=/tmp/dj-venv scripts/run_durable_jobs_tests.sh
 #
-# Equivalent manual setup (uv, preferred — uses uv.lock):
+# Manual equivalent:
 #   uv venv .venv-durable-jobs
-#   uv pip install -e ".[dev]" --python .venv-durable-jobs
+#   UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --locked
 #   .venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
-#
-# Equivalent manual setup (pip):
-#   python3 -m venv .venv-durable-jobs
-#   .venv-durable-jobs/bin/pip install -U pip
-#   .venv-durable-jobs/bin/pip install -e ".[dev]"
-#   .venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
+#   # Windows: .venv-durable-jobs\Scripts\python.exe -m pytest ...
 
 set -euo pipefail
 
@@ -29,32 +31,54 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 VENV="${DURABLE_JOBS_VENV:-$REPO_ROOT/.venv-durable-jobs}"
-PYTHON_BIN="${DURABLE_JOBS_PYTHON:-python3}"
 
-echo "▶ durable-jobs clean env: venv=$VENV"
-
-if [ ! -x "$VENV/bin/python" ] && [ ! -x "$VENV/Scripts/python.exe" ]; then
-  echo "▶ creating venv via $PYTHON_BIN -m venv"
-  "$PYTHON_BIN" -m venv "$VENV"
-fi
-
-if [ -x "$VENV/bin/python" ]; then
-  PY="$VENV/bin/python"
-  PIP="$VENV/bin/pip"
-elif [ -x "$VENV/Scripts/python.exe" ]; then
-  PY="$VENV/Scripts/python.exe"
-  PIP="$VENV/Scripts/pip.exe"
-else
-  echo "error: could not locate python inside $VENV" >&2
+if ! command -v uv >/dev/null 2>&1; then
+  echo "error: uv is required for lock-respecting durable-jobs test installs." >&2
+  echo "       Install uv (https://docs.astral.sh/uv/), then re-run this script." >&2
+  echo "       Do not use bare pip install -e '.[dev]' as locked evidence." >&2
   exit 1
 fi
 
-echo "▶ installing opt-in deps: pip install -e '.[dev]' (includes [langgraph-durable])"
-"$PY" -m pip install -U pip >/dev/null
-"$PIP" install -e ".[dev]"
+echo "▶ durable-jobs clean env (uv --locked): venv=$VENV"
+echo "▶ UV_PROJECT_ENVIRONMENT=$VENV uv sync --extra dev --locked"
+
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --extra dev --locked
+
+if [ -x "$VENV/bin/python" ]; then
+  PY="$VENV/bin/python"
+elif [ -x "$VENV/Scripts/python.exe" ]; then
+  PY="$VENV/Scripts/python.exe"
+else
+  echo "error: could not locate python inside $VENV after uv sync" >&2
+  exit 1
+fi
 
 if ! "$PY" -c 'import langgraph, langgraph.checkpoint.sqlite, pytest' 2>/dev/null; then
-  echo "error: langgraph/pytest missing after install -e '.[dev]'" >&2
+  echo "error: langgraph/pytest missing after uv sync --extra dev --locked" >&2
+  exit 1
+fi
+
+# Prove the installed transitive matches uv.lock (pip previously drifted here).
+LOCKED_CP="$("$PY" -c 'import importlib.metadata as m; print(m.version("langgraph-checkpoint"))')"
+EXPECTED_CP="$("$PY" - <<'PY'
+from pathlib import Path
+text = Path("uv.lock").read_text(encoding="utf-8")
+needle = 'name = "langgraph-checkpoint"\n'
+idx = text.find(needle)
+if idx < 0:
+    raise SystemExit("langgraph-checkpoint missing from uv.lock")
+chunk = text[idx : idx + 200]
+for line in chunk.splitlines():
+    if line.startswith("version = "):
+        print(line.split("=", 1)[1].strip().strip('"'))
+        break
+else:
+    raise SystemExit("version not found for langgraph-checkpoint in uv.lock")
+PY
+)"
+echo "▶ langgraph-checkpoint installed=$LOCKED_CP uv.lock=$EXPECTED_CP"
+if [ "$LOCKED_CP" != "$EXPECTED_CP" ]; then
+  echo "error: langgraph-checkpoint drift vs uv.lock ($LOCKED_CP != $EXPECTED_CP)" >&2
   exit 1
 fi
 

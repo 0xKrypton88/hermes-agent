@@ -91,3 +91,58 @@ def test_non_bool_flag_values_are_rejected(field, value):
     with pytest.raises(DurableJobsConfigError) as exc:
         load_durable_jobs_config({"durable_jobs": {field: value}})
     assert field in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-a-mapping",
+        ["durable_jobs"],
+        42,
+        True,
+        object(),
+    ],
+)
+def test_non_mapping_raw_config_is_rejected(raw):
+    from agent.durable_jobs.config import (
+        DurableJobsConfigError,
+        load_durable_jobs_config,
+    )
+
+    with pytest.raises(DurableJobsConfigError) as exc:
+        load_durable_jobs_config(raw)
+    assert "mapping" in str(exc.value).lower()
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "enabled",
+        ["nested"],
+        1,
+        True,
+        None,
+        object(),
+    ],
+)
+def test_non_mapping_durable_jobs_section_is_rejected(section):
+    from agent.durable_jobs.config import (
+        DurableJobsConfigError,
+        load_durable_jobs_config,
+    )
+
+    with pytest.raises(DurableJobsConfigError) as exc:
+        load_durable_jobs_config({"durable_jobs": section})
+    msg = str(exc.value).lower()
+    assert "durable_jobs" in msg
+    assert "mapping" in msg
+
+
+def test_none_raw_config_loads_disabled_defaults():
+    from agent.durable_jobs.config import DurableJobsConfig, load_durable_jobs_config
+
+    cfg = load_durable_jobs_config(None)
+    assert isinstance(cfg, DurableJobsConfig)
+    assert cfg.enabled is False
+    assert cfg.dispatch_enabled is False
+    assert cfg.dispatch_allowed is False

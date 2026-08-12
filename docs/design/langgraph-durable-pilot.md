@@ -1,7 +1,7 @@
 # ENG-3 LangGraph Durable-Job Pilot — Package 1
 
 Status: implemented as an isolated, disabled-by-default module
-Digest: `5506a50c7dc4493c00f72147670b28e9cd5cbdaf936b6c09c0387454a37cb056`
+Digest: `b446c762a312d32dd3c483f9e58975bb36e62211f1dff21f108c82e397d61789`
 Code: `agent/durable_jobs/`
 
 ## Decision summary
@@ -31,6 +31,8 @@ Phase transitions use compare-and-swap inside a single SQLite transaction so
 stale concurrent updates cannot diverge job state from audit history.
 
 ## Clean-environment tests
+
+Requires `uv`. Lock-respecting install (`uv sync --extra dev --locked`):
 
 ```bash
 scripts/run_durable_jobs_tests.sh

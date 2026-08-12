@@ -61,22 +61,25 @@ calls an injected dispatch adapter.
 
 ## Tests (clean / release-venv safe)
 
-LangGraph is **not** installed in the release venv. Use the harness (creates an
-isolated venv and installs `[dev]`, which includes `[langgraph-durable]`):
+LangGraph is **not** installed in the release venv. Use the harness — it requires
+`uv` and installs via `uv sync --extra dev --locked` into an isolated venv so
+transitive pins match `uv.lock` (e.g. `langgraph-checkpoint==4.1.1`). Bare
+`pip install -e '.[dev]'` is **non-locked** and must not be treated as
+reproducible locked evidence.
 
 ```bash
 scripts/run_durable_jobs_tests.sh
 ```
 
-Manual equivalent with uv (uses lockfile pins):
+Manual equivalent (Windows: use `Scripts\python.exe`):
 
 ```bash
 uv venv .venv-durable-jobs
-uv pip install -e ".[dev]" --python .venv-durable-jobs
+UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --locked
 .venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
 ```
 
-If a local `.venv` already has `[dev]`:
+If a local `.venv` already has `[dev]` synced from the lockfile:
 
 ```bash
 scripts/run_tests.sh tests/agent/durable_jobs/
