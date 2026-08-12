@@ -26,13 +26,17 @@ does not start coding or agent work.
 
 Absence reasons are stable and individually named:
 
-1. `missing_issue_identifier`
-2. `missing_issue_title`
-3. `missing_issue_description`
-4. `missing_acceptance_criteria`
-5. `missing_repository_binding`
-6. `missing_target_ref`
-7. `unresolved_required_inputs`
+1. `missing_issue_id`
+2. `missing_issue_identifier`
+3. `missing_issue_title`
+4. `missing_issue_description`
+5. `missing_acceptance_criteria`
+6. `missing_repository_binding`
+7. `missing_target_ref`
+8. `unresolved_required_inputs`
+
+A missing canonical Linear `issue_id` always fails closed: the gate returns
+`BLOCKED` (never `READY_FOR_GO`) and `plan_linear_mutation` returns no intent.
 
 A passing decision builds an immutable normalized source-package snapshot and a
 SHA-256 digest suitable for later persistence/checkpointing.
@@ -61,6 +65,10 @@ LinearMutationIntent
 LinearMutationPort.apply_comment_and_transition(intent)  # not implemented here
 ```
 
+`plan_linear_mutation` is fail-closed: it returns `None` (no mutation) when the
+review key was already seen, the decision lacks a canonical `issue_id`, or the
+policy is missing the destination state id (`ready_for_go_state_id` /
+`blocked_state_id`). It never emits an empty `issue_id` or `target_state_id`.
 ### Intended sequence
 
 1. **Ready event** → normalize issue snapshot (outside this module).

@@ -28,6 +28,7 @@ from typing import Any, AbstractSet, Mapping, Optional, Protocol, Sequence, Unio
 DECISION_READY_FOR_GO = "READY_FOR_GO"
 DECISION_BLOCKED = "BLOCKED"
 
+REASON_MISSING_ISSUE_ID = "missing_issue_id"
 REASON_MISSING_ISSUE_IDENTIFIER = "missing_issue_identifier"
 REASON_MISSING_ISSUE_TITLE = "missing_issue_title"
 REASON_MISSING_ISSUE_DESCRIPTION = "missing_issue_description"
@@ -37,6 +38,7 @@ REASON_MISSING_TARGET_REF = "missing_target_ref"
 REASON_UNRESOLVED_REQUIRED_INPUTS = "unresolved_required_inputs"
 
 _CHECKED_REQUIREMENTS = (
+    "canonical issue id",
     "issue identifier",
     "issue title",
     "issue description/context",
@@ -211,6 +213,8 @@ def _collect_absence_reasons(
     unresolved_required_inputs: bool,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
+    if not package.issue_id:
+        reasons.append(REASON_MISSING_ISSUE_ID)
     if not package.identifier:
         reasons.append(REASON_MISSING_ISSUE_IDENTIFIER)
     if not package.title:
@@ -331,8 +335,14 @@ def plan_linear_mutation(
     *,
     seen_review_keys: Optional[AbstractSet[str]] = None,
 ) -> Optional[LinearMutationIntent]:
-    """Build a comment+transition intent, or None when idempotency suppresses it.
+    """Build a comment+transition intent, or None when fail-closed / idempotent.
 
+    Returns ``None`` (no mutation) when:
+    - the review_key was already emitted;
+    - the decision has no canonical issue_id;
+    - the policy lacks the destination state id for this decision.
+
+    Never emits an intent with an empty ``issue_id`` or ``target_state_id``.
     This is the narrow adapter boundary for a later Linear mutation layer.
     It does not perform provider calls.
     """
@@ -340,18 +350,22 @@ def plan_linear_mutation(
     if not should_emit_review(decision.review_key, seen_review_keys=seen):
         return None
 
+    issue_id = ""
+    if decision.source_package is not None:
+        issue_id = (_as_nonempty_str(decision.source_package.issue_id) or "").strip()
+    if not issue_id:
+        return None
+
     parsed = _coerce_policy(policy)
     if decision.decision == DECISION_READY_FOR_GO:
-        target_state_id = parsed.ready_for_go_state_id
+        target_state_id = _as_nonempty_str(parsed.ready_for_go_state_id)
     else:
-        target_state_id = parsed.blocked_state_id
+        target_state_id = _as_nonempty_str(parsed.blocked_state_id)
+    if target_state_id is None:
+        return None
 
     return LinearMutationIntent(
-        issue_id=(
-            decision.source_package.issue_id
-            if decision.source_package and decision.source_package.issue_id
-            else ""
-        ),
+        issue_id=issue_id,
         comment_body=decision.comment_body,
         target_state_id=target_state_id,
         review_key=decision.review_key,

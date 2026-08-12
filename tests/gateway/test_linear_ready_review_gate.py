@@ -145,6 +145,17 @@ def test_ready_gate_blocks_when_acceptance_criteria_blank_strings():
     assert "missing_acceptance_criteria" in decision.reasons
 
 
+def test_ready_gate_blocks_when_canonical_issue_id_missing():
+    snapshot = _complete_snapshot(issue_id="  ")
+    decision = assess_linear_ready_review(snapshot, _policy())
+
+    assert decision.decision == DECISION_BLOCKED
+    assert decision.decision != DECISION_READY_FOR_GO
+    assert "missing_issue_id" in decision.reasons
+    assert "missing_issue_id" in decision.comment_body
+    assert plan_linear_mutation(decision, _policy()) is None
+
+
 def test_mutation_plan_is_comment_and_transition_only():
     snapshot = _complete_snapshot()
     policy = _policy()
@@ -174,6 +185,24 @@ def test_mutation_plan_for_blocked_uses_blocked_state():
     assert decision.decision == DECISION_BLOCKED
     assert intent is not None
     assert intent.target_state_id == policy.blocked_state_id
+
+
+def test_mutation_plan_fail_closed_without_ready_for_go_state_id():
+    snapshot = _complete_snapshot()
+    policy = _policy(ready_for_go_state_id="")
+    decision = assess_linear_ready_review(snapshot, policy)
+
+    assert decision.decision == DECISION_READY_FOR_GO
+    assert plan_linear_mutation(decision, policy) is None
+
+
+def test_mutation_plan_fail_closed_without_blocked_state_id():
+    snapshot = _complete_snapshot(description="")
+    policy = _policy(blocked_state_id="   ")
+    decision = assess_linear_ready_review(snapshot, policy)
+
+    assert decision.decision == DECISION_BLOCKED
+    assert plan_linear_mutation(decision, policy) is None
 
 
 def test_duplicate_ready_review_key_suppresses_second_mutation():
