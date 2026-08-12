@@ -113,6 +113,14 @@ def _store(tmp_path: Path) -> LinearReadyGoStore:
     return LinearReadyGoStore(db_path=tmp_path / "linear_ready_go.db")
 
 
+def _ready_selectors(ready) -> dict:
+    """Mandatory exact review_key + source_digest for process_go."""
+    return {
+        "review_key": ready.receipt.review_key,
+        "source_digest": ready.receipt.source_digest,
+    }
+
+
 def test_freeze_ready_for_go_receipt_never_starts_work():
     receipt = evaluate_ready_freeze(_complete_source())
     assert isinstance(receipt, ReadyFreezeReceipt)
@@ -193,6 +201,33 @@ def test_freeze_rejects_noncanonical_and_unknown_team_identities():
     assert "cross_team_mismatch" in cross.reasons
 
 
+def test_from_mapping_rejects_non_string_identities_without_str_coercion(tmp_path):
+    """Non-string issue_id/issue_identifier must never become READY via str()."""
+    base = _complete_source()
+    payload = {
+        "issue_id": 123,
+        "issue_identifier": 456,
+        "title": base.title,
+        "description": base.description,
+        "acceptance_criteria": list(base.acceptance_criteria),
+        "repository": base.repository,
+        "target_ref": base.target_ref,
+        "unresolved_required_inputs": False,
+    }
+    receipt = evaluate_ready_freeze(payload)
+    assert receipt.decision == DECISION_BLOCKED
+    assert "noncanonical_issue_id" in receipt.reasons
+    assert "noncanonical_issue_identifier" in receipt.reasons
+    assert receipt.starts_agent_work is False
+
+    store = _store(tmp_path)
+    result = process_ready(payload, store=store)
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert store.count_ready_reviews() == 0
+    assert result.record is None
+
+
 def test_ready_persistence_survives_store_reconstruction(tmp_path):
     store = _store(tmp_path)
     plane = LinearReadyGoControlPlane(store=store)
@@ -253,10 +288,11 @@ def test_go_creates_exactly_one_non_dispatched_intent(tmp_path):
 def test_duplicate_go_delivery_and_intent_are_safe_noops(tmp_path):
     store = _store(tmp_path)
     ready = process_ready(_complete_source(), store=store)
-    first = process_go(_valid_transition(), store=store)
+    selectors = _ready_selectors(ready)
+    first = process_go(_valid_transition(), store=store, **selectors)
     assert first.ok is True
 
-    dup_delivery = process_go(_valid_transition(), store=store)
+    dup_delivery = process_go(_valid_transition(), store=store, **selectors)
     assert dup_delivery.ok is False
     assert dup_delivery.status == "duplicate"
     assert "duplicate_delivery_key" in dup_delivery.reason_codes
@@ -279,11 +315,123 @@ def test_duplicate_go_delivery_and_intent_are_safe_noops(tmp_path):
 
 def test_go_fails_closed_without_ready_provenance(tmp_path):
     store = _store(tmp_path)
-    result = process_go(_valid_transition(), store=store)
+    # Synthesize plausible selectors that cannot match any Ready row.
+    fake_digest = "c" * 64
+    result = process_go(
+        _valid_transition(),
+        store=store,
+        review_key=f"{ISSUE_ID}:{fake_digest}",
+        source_digest=fake_digest,
+    )
     assert result.ok is False
     assert result.status == "rejected"
     assert "missing_ready_provenance" in result.reason_codes
     assert store.count_launch_intents() == 0
+
+
+def test_go_requires_exact_review_key_and_source_digest(tmp_path):
+    store = _store(tmp_path)
+    ready = process_ready(_complete_source(), store=store)
+    assert ready.ok is True
+
+    omitted = process_go(_valid_transition(go_event_key="svix_msg_omit_selectors"), store=store)
+    assert omitted.ok is False
+    assert omitted.status == "rejected"
+    assert "missing_review_key" in omitted.reason_codes
+    assert "missing_source_digest" in omitted.reason_codes
+    assert store.count_launch_intents() == 0
+
+    wrong_key = process_go(
+        _valid_transition(go_event_key="svix_msg_wrong_key"),
+        store=store,
+        review_key=f"{ISSUE_ID}:{'d' * 64}",
+        source_digest=ready.receipt.source_digest,
+    )
+    assert wrong_key.ok is False
+    assert wrong_key.status == "rejected"
+    assert "stale_ready_provenance" in wrong_key.reason_codes
+    assert store.count_launch_intents() == 0
+
+    wrong_digest = process_go(
+        _valid_transition(go_event_key="svix_msg_wrong_digest"),
+        store=store,
+        review_key=ready.receipt.review_key,
+        source_digest="e" * 64,
+    )
+    assert wrong_digest.ok is False
+    assert wrong_digest.status == "rejected"
+    assert (
+        "ready_provenance_digest_mismatch" in wrong_digest.reason_codes
+        or "stale_ready_provenance" in wrong_digest.reason_codes
+    )
+    assert store.count_launch_intents() == 0
+
+
+def test_go_rejects_mismatched_issue_identifier(tmp_path):
+    """Ready ENG-1 then Go OTHER-999 (same issue_id/selectors) → reject, 0 intent."""
+    store = _store(tmp_path)
+    ready = process_ready(
+        _complete_source(issue_identifier="ENG-1"),
+        store=store,
+    )
+    assert ready.ok is True
+    rejected = process_go(
+        _valid_transition(
+            issue_identifier="OTHER-999",
+            go_event_key="svix_msg_identifier_mismatch",
+        ),
+        store=store,
+        **_ready_selectors(ready),
+    )
+    assert rejected.ok is False
+    assert rejected.status == "rejected"
+    assert "ready_provenance_issue_identifier_mismatch" in rejected.reason_codes
+    assert rejected.intent is None
+    assert store.count_launch_intents() == 0
+
+    # Store layer independently enforces identifier equality (defense in depth).
+    with pytest.raises(ValueError, match="ready_provenance_issue_identifier_mismatch"):
+        store.record_launch_intent(
+            issue_id=ISSUE_ID,
+            issue_identifier="OTHER-999",
+            review_key=ready.receipt.review_key,
+            source_digest=ready.receipt.source_digest,
+            go_event_key="svix_msg_store_identifier_mismatch",
+            idempotency_key="go_launch:store-id-mismatch",
+            dispatched=False,
+        )
+    assert store.count_launch_intents() == 0
+
+
+def test_go_rejects_padded_team_key(tmp_path):
+    """Padded Go team_key must not pass via .strip() — reject with 0 intent."""
+    store = _store(tmp_path)
+    ready = process_ready(
+        _complete_source(team_key="ENG", allowed_team_keys=("ENG",)),
+        store=store,
+    )
+    assert ready.ok is True
+    rejected = process_go(
+        _valid_transition(go_event_key="svix_msg_padded_team"),
+        store=store,
+        **_ready_selectors(ready),
+        team_key=" ENG ",
+    )
+    assert rejected.ok is False
+    assert rejected.status == "rejected"
+    assert "noncanonical_team_key" in rejected.reason_codes
+    assert rejected.intent is None
+    assert store.count_launch_intents() == 0
+
+    # Canonical matching team still succeeds.
+    ok = process_go(
+        _valid_transition(go_event_key="svix_msg_canonical_team"),
+        store=store,
+        **_ready_selectors(ready),
+        team_key="ENG",
+    )
+    assert ok.ok is True
+    assert store.count_launch_intents() == 1
 
 
 def test_go_fails_closed_on_digest_mismatch_and_tamper(tmp_path):
@@ -348,10 +496,12 @@ def test_go_fails_closed_on_stale_provenance(tmp_path):
 
 def test_go_rejects_invalid_and_unknown_transitions(tmp_path):
     store = _store(tmp_path)
-    process_ready(_complete_source(), store=store)
+    ready = process_ready(_complete_source(), store=store)
+    selectors = _ready_selectors(ready)
     result = process_go(
         _valid_transition(target_state="In Progress", go_event_key="svix_msg_bad"),
         store=store,
+        **selectors,
     )
     assert result.ok is False
     assert result.status == "rejected"
@@ -360,6 +510,7 @@ def test_go_rejects_invalid_and_unknown_transitions(tmp_path):
     unknown = process_go(
         _valid_transition(target_state="TotallyUnknown", go_event_key="svix_msg_unknown"),
         store=store,
+        **selectors,
     )
     assert unknown.ok is False
     assert "non_go_target_state" in unknown.reason_codes
@@ -405,14 +556,15 @@ def test_store_rejects_dispatched_true(tmp_path):
 
 def test_concurrent_duplicate_go_inserts_are_race_safe(tmp_path):
     store = _store(tmp_path)
-    process_ready(_complete_source(), store=store)
+    ready = process_ready(_complete_source(), store=store)
+    selectors = _ready_selectors(ready)
     barrier = threading.Barrier(8)
     results: list[GoControlResult] = []
     lock = threading.Lock()
 
     def _worker():
         barrier.wait(timeout=5)
-        outcome = process_go(_valid_transition(), store=store)
+        outcome = process_go(_valid_transition(), store=store, **selectors)
         with lock:
             results.append(outcome)
 
@@ -479,7 +631,7 @@ def test_control_plane_does_not_touch_webhook_receipt_path(tmp_path, monkeypatch
     )
     store = _store(tmp_path)
     ready = process_ready(_complete_source(), store=store)
-    go = process_go(_valid_transition(), store=store)
+    go = process_go(_valid_transition(), store=store, **_ready_selectors(ready))
     assert ready.ok and go.ok
     assert calls == []
 
@@ -497,7 +649,8 @@ def test_storage_failure_fails_closed(tmp_path, monkeypatch):
 
     # Restore a working store, then break Go persistence.
     good = _store(tmp_path / "go-fail")
-    assert process_ready(_complete_source(), store=good).ok is True
+    ready_ok = process_ready(_complete_source(), store=good)
+    assert ready_ok.ok is True
     monkeypatch.setattr(
         good,
         "record_launch_intent",
@@ -505,7 +658,11 @@ def test_storage_failure_fails_closed(tmp_path, monkeypatch):
             sqlite3.OperationalError("disk I/O error")
         ),
     )
-    go = process_go(_valid_transition(go_event_key="svix_msg_storage_fail"), store=good)
+    go = process_go(
+        _valid_transition(go_event_key="svix_msg_storage_fail"),
+        store=good,
+        **_ready_selectors(ready_ok),
+    )
     assert go.ok is False
     assert go.status == "rejected"
     assert "storage_failure" in go.reason_codes
