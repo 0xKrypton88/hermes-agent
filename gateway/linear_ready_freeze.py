@@ -103,17 +103,32 @@ class ReadySourceInput:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ReadySourceInput":
+        """Build from a mapping without coercing identity fields via ``str()``.
+
+        Non-string ``issue_id`` / ``issue_identifier`` / ``team_key`` (and other
+        identity-shaped values) are preserved as-is so ``_as_canonical_identity``
+        can fail closed. Never stringify arbitrary values into a READY path.
+        """
         data = _mapping(value)
-        identifier = data.get("issue_identifier", data.get("identifier", ""))
+        if "issue_identifier" in data:
+            identifier: Any = data.get("issue_identifier")
+        elif "identifier" in data:
+            identifier = data.get("identifier")
+        else:
+            identifier = ""
+        if identifier is None:
+            identifier = ""
         allowed = data.get("allowed_team_keys")
+        # Preserve raw types for identity/content fields — evaluate_ready_freeze
+        # rejects non-strings / noncanonical identities as BLOCKED.
         return cls(
-            issue_id=str(data.get("issue_id", "") or ""),
-            issue_identifier=str(identifier or ""),
-            title=str(data.get("title", "") or ""),
-            description=str(data.get("description", "") or ""),
+            issue_id=data.get("issue_id", ""),  # type: ignore[arg-type]
+            issue_identifier=identifier,  # type: ignore[arg-type]
+            title=data.get("title", ""),  # type: ignore[arg-type]
+            description=data.get("description", ""),  # type: ignore[arg-type]
             acceptance_criteria=data.get("acceptance_criteria", ()),
-            repository=str(data.get("repository", "") or ""),
-            target_ref=str(data.get("target_ref", "") or ""),
+            repository=data.get("repository", ""),  # type: ignore[arg-type]
+            target_ref=data.get("target_ref", ""),  # type: ignore[arg-type]
             unresolved_required_inputs=bool(
                 data.get("unresolved_required_inputs", False)
             ),
@@ -197,7 +212,8 @@ def freeze_source_package(source: ReadySourceInput) -> FrozenReadySource:
         source.issue_identifier
     )
     team_key = ""
-    if source.team_key is not None and str(source.team_key).strip() != "":
+    # Do not str()-coerce team_key: non-strings / padded values stay invalid.
+    if source.team_key is not None and source.team_key != "":
         team_canon, _team_reason = _as_canonical_identity(source.team_key)
         team_key = team_canon or ""
     return FrozenReadySource(
@@ -265,7 +281,7 @@ def _collect_absence_reasons(
     if unresolved_required_inputs:
         reasons.append(REASON_UNRESOLVED_REQUIRED_INPUTS)
 
-    if source.team_key is not None and str(source.team_key).strip() != "":
+    if source.team_key is not None and source.team_key != "":
         team_key, team_reason = _as_canonical_identity(source.team_key)
         if team_reason == "noncanonical" or team_key is None:
             reasons.append(REASON_NONCANONICAL_TEAM_KEY)
@@ -374,7 +390,7 @@ def evaluate_ready_freeze(
             # Caller-supplied review_key that does not match the frozen digest
             # is treated as an identity mismatch (tamper / stale review).
             reasons.append(REASON_ISSUE_IDENTITY_MISMATCH)
-        if review_input.team_key is not None and str(review_input.team_key).strip():
+        if review_input.team_key is not None and review_input.team_key != "":
             review_team, review_team_reason = _as_canonical_identity(
                 review_input.team_key
             )

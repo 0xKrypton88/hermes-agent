@@ -419,6 +419,8 @@ class LinearReadyGoStore:
                 raise ValueError("ready_provenance_digest_mismatch")
             if ready_rec.issue_id != issue_id:
                 raise ValueError("ready_provenance_issue_mismatch")
+            if ready_rec.issue_identifier != issue_identifier:
+                raise ValueError("ready_provenance_issue_identifier_mismatch")
 
             try:
                 conn.execute(
