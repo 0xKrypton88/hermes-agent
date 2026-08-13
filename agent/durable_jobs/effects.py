@@ -20,8 +20,10 @@ the stable idempotency key and never blindly creates. Empty lookup stays
 RECOVERING until ``recovery_deadline``, then typed UNKNOWN **only if** the
 persisted in-flight witness has also expired (a live create_run still
 renews that witness in SQLite after claim takeover). A persisted
-foreign token is never caller authority. Cancel is terminal: accepted
-effects cannot overwrite a canceled job.
+foreign token is never caller authority. Cancel is terminal: a
+pre-existing accepted Cancel refuses claim, inflight, create_run, and
+recovery lookup. Accepted/adopted bind cannot overwrite Cancel. SQLite
+cannot abort an RPC that already began after the last Cancel SELECT.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 It does not satisfy ENG-25 production PostgreSQL acceptance.
@@ -192,6 +194,16 @@ class ProviderEffectLedger:
                 self._reject_mapping_mismatch(conn, job_id, snapshot)
                 return ClaimResult(claim=self._row_to_claim(existing), won=False)
 
+            from agent.durable_jobs.decisions import (
+                JobCanceledError,
+                job_is_canceled_on_conn,
+            )
+
+            if job_is_canceled_on_conn(conn, job_id):
+                raise JobCanceledError(
+                    f"job {job_id} is canceled; refusing provider claim {action_id}"
+                )
+
             mapping = conn.execute(
                 "SELECT * FROM provider_job_mappings WHERE job_id = ?",
                 (job_id,),
@@ -306,6 +318,10 @@ class ProviderEffectLedger:
             claim = self._row_to_claim(current)
             if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
                 return ClaimResult(claim=claim, won=False)
+            from agent.durable_jobs.decisions import job_is_canceled_on_conn
+
+            if job_is_canceled_on_conn(conn, job_id):
+                return ClaimResult(claim=claim, won=False)
             if not claim_is_expired(claim.claim_expires_at, now):
                 return ClaimResult(claim=claim, won=False)
             cur = conn.execute(
@@ -414,6 +430,10 @@ class ProviderEffectLedger:
         now = self._now()
         until = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            from agent.durable_jobs.decisions import job_is_canceled_on_conn
+
+            if job_is_canceled_on_conn(conn, job_id):
+                return False
             cur = conn.execute(
                 """
                 UPDATE provider_effect_claims
@@ -966,8 +986,11 @@ def reconcile_cursor_create(
     while ``create_run`` is in flight; renew False/exception is observable
     and does not cancel that call. Only an expired CLAIMED/RECOVERING may
     be taken over (new token); recovery looks up by the stable idempotency
-    key. Empty lookup stays RECOVERING until ``recovery_deadline`` **and**
-    the persisted in-flight witness has expired.
+    key.     Empty lookup stays RECOVERING until ``recovery_deadline`` **and**
+    the persisted in-flight witness has expired. A pre-existing accepted
+    Cancel refuses claim/inflight/create_run/lookup; Cancel after RPC
+    begin stays terminal and cannot be overwritten by accepted/adopted
+    bind. SQLite cannot abort an outstanding adapter RPC.
     """
     origin_platform, origin_chat_id, origin_root_thread_id = (
         _authoritative_origin_from_slack_binding(
@@ -1000,6 +1023,8 @@ def reconcile_cursor_create(
         )
     if not claimed.won:
         if claim.status is EffectStatus.CLAIMED:
+            if ledger._job_is_canceled(job_id):
+                return claim
             taken = ledger.takeover_stale_claim(job_id, action_id)
             if not taken.won:
                 return taken.claim
@@ -1021,8 +1046,22 @@ def reconcile_cursor_create(
         )
         return bool(inflight_ok or claim_ok)
 
-    ledger.begin_inflight(job_id, action_id, owner_token=won_token)
+    from agent.durable_jobs.decisions import raise_if_job_canceled
+
+    if not ledger.begin_inflight(job_id, action_id, owner_token=won_token):
+        raise_if_job_canceled(
+            ledger.sqlite_path, job_id, action="provider create_run"
+        )
+        current = ledger.get_claim(job_id, action_id)
+        return current if current is not None else claim
+
     try:
+        # Latest committed-Cancel SELECT before the adapter call. If Cancel
+        # commits after this check, create_run may still execute; adapters
+        # cannot abort an outstanding RPC. Bind stays fail-closed.
+        raise_if_job_canceled(
+            ledger.sqlite_path, job_id, action="provider create_run"
+        )
         with owner_lease_heartbeat(
             renew_fn=_renew_owner,
             now_fn=ledger._now_fn,
@@ -1092,6 +1131,9 @@ def _recover_or_poll_provider(
     caller_token: Optional[str],
 ) -> ProviderEffectClaim:
     """RECOVERING: matching live owner looks up; anyone else polls or takeovers."""
+    if ledger._job_is_canceled(claim.job_id):
+        current = ledger.get_claim(claim.job_id, claim.action_id)
+        return current if current is not None else claim
     if caller_holds_live_lease(
         caller_token=caller_token,
         persisted_token=claim.claim_owner_token,
@@ -1153,6 +1195,9 @@ def _recover_claimed_provider(
 ) -> ProviderEffectClaim:
     if not owner_token:
         return claim
+    if ledger._job_is_canceled(claim.job_id):
+        current = ledger.get_claim(claim.job_id, claim.action_id)
+        return current if current is not None else claim
     matches = list(
         provider.lookup_runs(idempotency_key=claim.provider_idempotency_key)
     )

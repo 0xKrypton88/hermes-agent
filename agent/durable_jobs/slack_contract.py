@@ -13,7 +13,10 @@ lease may be taken over (CLAIMED or RECOVERING), minting a new owner token.
 Recovery looks up by the stable ``client_msg_id`` and never blindly
 reposts. Empty lookup stays RECOVERING until ``recovery_deadline``. A
 persisted foreign token is never caller authority. The previous owner is
-fenced from mark_delivered after takeover.
+fenced from mark_delivered after takeover. Cancel is terminal: a
+pre-existing accepted Cancel refuses claim, inflight, post_root, and
+recovery lookup. Delivered/adopted bind cannot overwrite Cancel. SQLite
+cannot abort an RPC that already began after the last Cancel SELECT.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 No live Slack API client is constructed.
@@ -377,6 +380,15 @@ class SlackBindingLedger:
             binding = self._row_to_binding(current)
             if binding.status is not SlackRootStatus.BOUND:
                 return DeliveryClaimResult(binding=binding, won=False)
+            from agent.durable_jobs.decisions import (
+                JobCanceledError,
+                job_is_canceled_on_conn,
+            )
+
+            if job_is_canceled_on_conn(conn, job_id):
+                raise JobCanceledError(
+                    f"job {job_id} is canceled; refusing Slack delivery claim"
+                )
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
@@ -446,6 +458,10 @@ class SlackBindingLedger:
                 SlackRootStatus.CLAIMED,
                 SlackRootStatus.RECOVERING,
             ):
+                return DeliveryClaimResult(binding=binding, won=False)
+            from agent.durable_jobs.decisions import job_is_canceled_on_conn
+
+            if job_is_canceled_on_conn(conn, job_id):
                 return DeliveryClaimResult(binding=binding, won=False)
             if not claim_is_expired(binding.claim_expires_at, now):
                 return DeliveryClaimResult(binding=binding, won=False)
@@ -543,6 +559,10 @@ class SlackBindingLedger:
         now = self._now()
         until = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            from agent.durable_jobs.decisions import job_is_canceled_on_conn
+
+            if job_is_canceled_on_conn(conn, job_id):
+                return False
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
@@ -973,7 +993,10 @@ def deliver_slack_root(
     observable and does not cancel that call. An expired CLAIMED/RECOVERING
     may be taken over (new token); recovery looks up by the stable
     ``client_msg_id`` and never blindly reposts. Empty lookup stays
-    RECOVERING until ``recovery_deadline``.
+    RECOVERING until ``recovery_deadline``. A pre-existing accepted
+    Cancel refuses claim/inflight/post_root/lookup; Cancel after RPC
+    begin stays terminal and cannot be overwritten by delivered/adopted
+    bind. SQLite cannot abort an outstanding adapter RPC.
     """
     binding = ledger.get_binding(job_id)
     if binding is None:
@@ -989,6 +1012,8 @@ def deliver_slack_root(
             ledger, slack_port, binding, caller_token=owner_token
         )
     if binding.status is SlackRootStatus.CLAIMED:
+        if ledger._job_is_canceled(job_id):
+            return binding
         taken = ledger.takeover_stale_delivery(job_id)
         if not taken.won:
             return taken.binding
@@ -1010,8 +1035,22 @@ def deliver_slack_root(
         claim_ok = ledger.renew_delivery(job_id, owner_token=won_token)
         return bool(inflight_ok or claim_ok)
 
-    ledger.begin_inflight(job_id, owner_token=won_token)
+    from agent.durable_jobs.decisions import raise_if_job_canceled
+
+    if not ledger.begin_inflight(job_id, owner_token=won_token):
+        raise_if_job_canceled(
+            ledger.sqlite_path, job_id, action="slack post_root"
+        )
+        current = ledger.get_binding(job_id)
+        return current if current is not None else binding
+
     try:
+        # Latest committed-Cancel SELECT before the adapter call. If Cancel
+        # commits after this check, post_root may still execute; adapters
+        # cannot abort an outstanding RPC. Bind stays fail-closed.
+        raise_if_job_canceled(
+            ledger.sqlite_path, job_id, action="slack post_root"
+        )
         with owner_lease_heartbeat(
             renew_fn=_renew_owner,
             now_fn=ledger._now_fn,
@@ -1058,6 +1097,9 @@ def _recover_or_poll_slack(
     *,
     caller_token: Optional[str],
 ) -> SlackJobBinding:
+    if ledger._job_is_canceled(binding.job_id):
+        current = ledger.get_binding(binding.job_id)
+        return current if current is not None else binding
     if caller_holds_live_lease(
         caller_token=caller_token,
         persisted_token=binding.claim_owner_token,
@@ -1111,6 +1153,9 @@ def _lookup_slack_root(
 ) -> SlackJobBinding:
     if not owner_token:
         return binding
+    if ledger._job_is_canceled(binding.job_id):
+        current = ledger.get_binding(binding.job_id)
+        return current if current is not None else binding
     matches = list(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )

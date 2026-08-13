@@ -71,6 +71,19 @@ class DecisionResult:
     reason_codes: tuple[str, ...] = ()
 
 
+class JobCanceledError(RuntimeError):
+    """Accepted Cancel is terminal for new provider/Slack call-outs.
+
+    SQLite can refuse a new claim, inflight witness, recovery lookup, or
+    the last SELECT immediately before an adapter call when Cancel is
+    already committed. It cannot abort a Cursor/Slack RPC that has already
+    begun after that SELECT — adapters do not expose cancellation of an
+    outstanding request. In that race the RPC may complete, but
+    accepted/adopted bind must not overwrite Cancel, and later Go stays
+    rejected.
+    """
+
+
 class DecisionLedger:
     def __init__(
         self,
@@ -393,3 +406,14 @@ class DecisionLedger:
             reason_codes=tuple(json.loads(row["reason_codes_json"] or "[]")),
             created_at=row["created_at"],
         )
+
+
+def job_is_canceled_on_conn(conn: sqlite3.Connection, job_id: str) -> bool:
+    """True when an accepted/duplicate Cancel is visible on this connection."""
+    return DecisionLedger._canceled_row(conn, job_id) is not None
+
+
+def raise_if_job_canceled(sqlite_path: Path, job_id: str, *, action: str) -> None:
+    """Fail closed using the latest committed Cancel visible on a new snapshot."""
+    if DecisionLedger(sqlite_path=sqlite_path).is_canceled(job_id):
+        raise JobCanceledError(f"job {job_id} is canceled; refusing {action}")

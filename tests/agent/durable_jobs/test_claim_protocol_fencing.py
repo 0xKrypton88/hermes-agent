@@ -1,12 +1,15 @@
 """Adversarial lease/recovery ownership tests (isolated, default-off).
 
-Covers three independently reproduced defects:
+Covers independently reproduced defects:
 1. Heartbeat swallows renew False/exception while create_run/post_root is
    in flight; a loser then empty-lookups to UNKNOWN although the external
    effect succeeds.
 2. RECOVERING reuses the persisted owner token for any caller, so foreign
    connections can spend recovery attempts at one frozen instant.
 3. renew_* succeeds after claim_expires_at if nobody has taken over yet.
+4. Accepted Cancel that exists *before* reconcile/deliver still create_runs
+   / posts (and recovery-looks-up). In-flight Cancel tests only fence bind
+   after RPC has begun; they do not cover this call-out TOCTOU.
 
 Deterministic FrozenClock + barriers only — no wall-clock sleeps.
 """
@@ -949,6 +952,145 @@ def test_slack_cancel_blocks_inflight_bind_and_stays_terminal(tmp_path):
         actor_id="U-alice",
         policy_version="pol-1",
         decision_idempotency_key="k-go-after-cancel-slack",
+    )
+    assert go_after.ok is False
+    assert "canceled" in go_after.reason_codes
+
+
+def test_provider_accepted_cancel_before_reconcile_does_not_call_out(tmp_path):
+    """Accepted Cancel before reconcile_cursor_create must not create or lookup."""
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-cancel-before-provider")
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(**_bind_kwargs(job.job_id))
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    canceled = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="cancel",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-cancel-before-provider",
+    )
+    assert canceled.ok is True
+    assert decisions.is_canceled(job.job_id) is True
+
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    provider = EmptyLookupProvider()
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert provider.create_calls == [], "provider create executed after accepted Cancel"
+    assert provider.lookup_calls == [], "provider lookup executed after accepted Cancel"
+    from agent.durable_jobs.decisions import JobCanceledError
+
+    assert caught and isinstance(caught[0], JobCanceledError)
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is None or persisted.status not in (
+        EffectStatus.ACCEPTED,
+        EffectStatus.ADOPTED,
+        EffectStatus.UNKNOWN,
+    )
+    assert persisted is None
+    assert decisions.is_canceled(job.job_id) is True
+    go_after = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="go",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-go-after-cancel-before-provider",
+    )
+    assert go_after.ok is False
+    assert "canceled" in go_after.reason_codes
+
+
+def test_slack_accepted_cancel_before_deliver_does_not_call_out(tmp_path):
+    """Accepted Cancel before deliver_slack_root must not post or lookup."""
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-cancel-before-slack")
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    canceled = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="cancel",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-cancel-before-slack",
+    )
+    assert canceled.ok is True
+    assert decisions.is_canceled(job.job_id) is True
+
+    port = EmptyLookupPort()
+    caught: list[BaseException] = []
+    try:
+        deliver_slack_root(ledger, port, job_id=job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert port.posts == [], "slack post executed after accepted Cancel"
+    assert port.lookup_calls == [], "slack lookup executed after accepted Cancel"
+    from agent.durable_jobs.decisions import JobCanceledError
+
+    assert caught and isinstance(caught[0], JobCanceledError)
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.BOUND
+    assert persisted.status is not SlackRootStatus.DELIVERED
+    assert persisted.status is not SlackRootStatus.ADOPTED
+    assert persisted.status is not SlackRootStatus.CLAIMED
+    assert persisted.status is not SlackRootStatus.UNKNOWN
+    assert decisions.is_canceled(job.job_id) is True
+    go_after = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="go",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-go-after-cancel-before-slack",
     )
     assert go_after.ok is False
     assert "canceled" in go_after.reason_codes
