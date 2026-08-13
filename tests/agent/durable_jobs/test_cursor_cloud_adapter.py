@@ -1054,3 +1054,164 @@ def test_v1_items_generated_name_lost_create_adopts_client_agent_id(tmp_path):
     assert second.status is EffectStatus.ADOPTED
     assert second.provider_run_id == sent
     assert len(transport.create_calls) == 1
+
+
+def test_typed_sdk_foreign_record_is_not_adoptable(tmp_path):
+    """Typed SDK-like foreign records must not inherit the caller ledger key.
+
+    On 65c3fe4, ``_looks_like_official_cursor_record`` is dict-only, so a
+    typed object without explicit correlation falls back to ``expected_key``
+    and is incorrectly adoptable. Repair must normalize typed/raw the same
+    way — not special-case SimpleNamespace.
+    """
+    from types import SimpleNamespace
+
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        parse_lookup_runs,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    foreign = SimpleNamespace(
+        id="bc-99999999-9999-4999-8999-999999999999",
+        name="unrelated",
+        status="ACTIVE",
+    )
+    assert not hasattr(foreign, "idempotency_key")
+    parsed = parse_lookup_runs(
+        [foreign], expected_key="cursor:job123:create_run"
+    )
+    assert parsed == []
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    transport = MemoryCursorTransport(
+        create_payload={"kind": "lost_response"},
+        lookups=[
+            SimpleNamespace(
+                id="bc-99999999-9999-4999-8999-999999999999",
+                name="unrelated",
+                status="ACTIVE",
+            )
+        ],
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is not EffectStatus.ADOPTED
+    assert claim.status is EffectStatus.RECOVERING
+    assert claim.provider_run_id is None
+    assert len(transport.create_calls) == 1
+    looked = adapter.lookup_runs(idempotency_key=key)
+    assert looked == []
+
+
+def test_typed_sdk_derived_id_adopts_and_matches_raw_dict(tmp_path):
+    """Typed and raw official records must agree; exact derived id adopts."""
+    from types import SimpleNamespace
+
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        cursor_correlation_agent_id,
+        parse_lookup_runs,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    derived = cursor_correlation_agent_id(key)
+    generated = "ENG-26 disposable sandbox"
+    latest_run = "run-00000000-0000-0000-0000-000000000099"
+    raw_exact = {
+        "id": derived,
+        "name": generated,
+        "status": "ACTIVE",
+        "latestRunId": latest_run,
+    }
+    typed_exact = SimpleNamespace(
+        id=derived,
+        name=generated,
+        status="ACTIVE",
+        latestRunId=latest_run,
+    )
+    raw_foreign = {
+        "id": "bc-99999999-9999-4999-8999-999999999999",
+        "name": "unrelated",
+        "status": "ACTIVE",
+    }
+    typed_foreign = SimpleNamespace(
+        id="bc-99999999-9999-4999-8999-999999999999",
+        name="unrelated",
+        status="ACTIVE",
+    )
+    typed_latest_trap = SimpleNamespace(
+        id="bc-88888888-8888-4888-8888-888888888888",
+        name="unrelated",
+        status="ACTIVE",
+        latestRunId=derived,
+    )
+    for raw, typed in (
+        (raw_exact, typed_exact),
+        (raw_foreign, typed_foreign),
+    ):
+        raw_parsed = parse_lookup_runs([raw], expected_key=key)
+        typed_parsed = parse_lookup_runs([typed], expected_key=key)
+        assert [(r.run_id, r.idempotency_key) for r in raw_parsed] == [
+            (r.run_id, r.idempotency_key) for r in typed_parsed
+        ]
+    assert [
+        (r.run_id, r.idempotency_key)
+        for r in parse_lookup_runs([typed_exact], expected_key=key)
+    ] == [(derived, key)]
+    assert parse_lookup_runs([typed_foreign], expected_key=key) == []
+    assert parse_lookup_runs([typed_latest_trap], expected_key=key) == []
+    mixed = parse_lookup_runs(
+        [typed_foreign, typed_exact, typed_latest_trap], expected_key=key
+    )
+    assert [r.run_id for r in mixed] == [derived]
+    assert all(r.idempotency_key == key for r in mixed)
+
+    transport = MemoryCursorTransport(
+        create_payload={"kind": "lost_response"},
+        lookups=[typed_foreign, typed_exact, typed_latest_trap],
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is EffectStatus.ADOPTED
+    assert claim.provider_run_id == derived
+    assert claim.provider_run_id != latest_run
+    assert claim.provider_idempotency_key == key
+    assert len(transport.create_calls) == 1
+    second = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert second.status is EffectStatus.ADOPTED
+    assert second.provider_run_id == derived
+    assert len(transport.create_calls) == 1

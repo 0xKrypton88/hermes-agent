@@ -153,25 +153,42 @@ def cursor_correlation_prompt(idempotency_key: str, text: str = "") -> str:
     return marker if not body else f"{marker}\n{body}"
 
 
-def _display_name(raw: Any) -> str:
+def _record_get(raw: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a dict or typed SDK object. Same keys, both shapes."""
     if isinstance(raw, dict):
-        name = raw.get("name")
-    else:
-        name = getattr(raw, "name", None)
+        return raw.get(key, default)
+    if raw is None or isinstance(raw, (str, bytes, int, float, bool)):
+        return default
+    return getattr(raw, key, default)
+
+
+def _is_mapping_like(raw: Any) -> bool:
+    if isinstance(raw, dict):
+        return True
+    if raw is None or isinstance(
+        raw, (str, bytes, int, float, bool, list, tuple, CursorRun)
+    ):
+        return False
+    return hasattr(raw, "__dict__") or hasattr(raw, "__dataclass_fields__")
+
+
+def _display_name(raw: Any) -> str:
+    name = _record_get(raw, "name")
     return name.strip() if isinstance(name, str) else ""
 
 
 def _prompt_first_line(raw: Any) -> str:
-    prompt: Any = None
-    if isinstance(raw, dict):
-        prompt = raw.get("prompt")
-        source = raw.get("source")
-        if prompt is None and isinstance(source, dict):
-            prompt = source.get("prompt")
-    else:
-        prompt = getattr(raw, "prompt", None)
+    prompt: Any = _record_get(raw, "prompt")
+    if prompt is None:
+        source = _record_get(raw, "source")
+        if source is not None:
+            prompt = _record_get(source, "prompt")
     if isinstance(prompt, dict):
         prompt = prompt.get("text")
+    elif prompt is not None and not isinstance(prompt, str):
+        nested = _record_get(prompt, "text")
+        if nested is not None:
+            prompt = nested
     if not isinstance(prompt, str):
         return ""
     return prompt.strip().splitlines()[0].strip() if prompt.strip() else ""
@@ -208,16 +225,21 @@ def _extract_preserved_correlation(
 
 
 def _looks_like_official_cursor_record(raw: Any) -> bool:
-    if not isinstance(raw, dict):
+    """Official Cursor agent/run shape, whether a dict or a typed SDK object."""
+    if raw is None or isinstance(raw, CursorRun):
         return False
-    if isinstance(raw.get("agent"), dict):
+    if isinstance(raw, (str, bytes, int, float, bool, list, tuple)):
+        return False
+    if _is_mapping_like(_record_get(raw, "agent")):
         return True
-    rid = raw.get("id") or raw.get("run_id")
-    if isinstance(rid, str) and _CURSOR_AGENT_ID_RE.match(rid):
+    rid = _record_get(raw, "id") or _record_get(raw, "run_id")
+    if isinstance(rid, str) and _CURSOR_AGENT_ID_RE.match(rid.strip()):
         return True
-    if raw.get("latestRunId") or raw.get("agentId"):
+    if _record_get(raw, "latestRunId") or _record_get(raw, "agentId"):
         return True
-    if isinstance(raw.get("source"), dict) or isinstance(raw.get("target"), dict):
+    if _is_mapping_like(_record_get(raw, "source")) or _is_mapping_like(
+        _record_get(raw, "target")
+    ):
         return True
     return False
 
@@ -238,10 +260,7 @@ def _provider_records(raw: Any) -> Sequence[Any]:
 
 
 def _record_id(raw: Any) -> str:
-    if isinstance(raw, dict):
-        rid = raw.get("run_id") or raw.get("id")
-    else:
-        rid = getattr(raw, "run_id", None) or getattr(raw, "id", None)
+    rid = _record_get(raw, "run_id") or _record_get(raw, "id")
     if isinstance(rid, str) and rid.strip():
         return rid.strip()
     return ""
@@ -275,10 +294,7 @@ def _is_cursor_agent_id_conflict(raw: Any) -> bool:
 
 
 def _correlation_for_record(raw: Any, *, fallback_key: str) -> str:
-    if isinstance(raw, dict):
-        explicit = raw.get("idempotency_key")
-    else:
-        explicit = getattr(raw, "idempotency_key", None)
+    explicit = _record_get(raw, "idempotency_key")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     if _matches_derived_agent_id(raw, expected_key=fallback_key):
@@ -297,23 +313,13 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
         return None
     if isinstance(raw, CursorRun):
         return raw
-    if isinstance(raw, dict):
-        run_id = raw.get("run_id") or raw.get("id")
-        key = _correlation_for_record(raw, fallback_key=fallback_key)
-        if not run_id:
-            return None
-        return CursorRun(
-            run_id=str(run_id),
-            idempotency_key=str(key or ""),
-            state=_parse_run_state(raw.get("state") or raw.get("status")),
-        )
-    run_id = getattr(raw, "run_id", None) or getattr(raw, "id", None)
+    run_id = _record_id(raw)
     if not run_id:
         return None
     key = _correlation_for_record(raw, fallback_key=fallback_key)
-    state = getattr(raw, "state", None) or getattr(raw, "status", None)
+    state = _record_get(raw, "state") or _record_get(raw, "status")
     return CursorRun(
-        run_id=str(run_id),
+        run_id=run_id,
         idempotency_key=str(key or ""),
         state=_parse_run_state(state),
     )
