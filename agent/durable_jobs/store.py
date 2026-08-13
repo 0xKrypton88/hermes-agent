@@ -220,6 +220,15 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def after_job_rows_before_commit() -> None:
+    """Test seam after job+event rows, before COMMIT.
+
+    Production is a no-op. Crash injection must leave zero job rows and
+    zero events: the write transaction is still uncommitted.
+    """
+    return None
+
+
 def _ensure_claim_lease_columns(conn: sqlite3.Connection) -> None:
     """Evolve candidate-created v2 DBs; no-op when columns already exist."""
     for table in _CLAIM_LEASE_TABLES:
@@ -443,6 +452,7 @@ class DurableJobStore:
                     payload={"phase": job.phase.value},
                     idempotency_key=f"create:{job.idempotency_key}",
                 )
+                after_job_rows_before_commit()
                 conn.commit()
             except sqlite3.IntegrityError:
                 conn.rollback()

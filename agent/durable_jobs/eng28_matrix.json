@@ -1,0 +1,263 @@
+{
+  "matrix_version": "eng28-failure-matrix-v1",
+  "scope": "isolated default-off SQLite durable Cursor→job→Slack-resume lane",
+  "disclaimer": "SQLite is not PostgreSQL. Injected fakes are not sandbox E2E. This is local component/integration evidence only — not live Slack, not live Cursor, not gateway ingress, not production control plane.",
+  "proof_layers": [
+    "PROVEN_LOCAL",
+    "PARTIAL",
+    "BLOCKED_EXTERNAL",
+    "BLOCKED_MISSING_SEAM"
+  ],
+  "rows": [
+    {
+      "id": 1,
+      "title": "before/after immutable job/package commit",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row01_crash_before_job_commit_persists_nothing",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row01_crash_after_job_commit_reopens_exactly_one",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row01_tuple_rejected_before_job_exists"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 2,
+      "title": "before decision and Go persist/consume",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_crash_before_go_commit_blocks_effect",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_go_persist_then_consume_claim"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 3,
+      "title": "concurrent Go/Hold/Cancel and crash during consume+claim",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row03_concurrent_go_hold_cancel_cancel_is_terminal",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row03_crash_during_consume_claim_no_create_run"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 4,
+      "title": "effect claim before provider create",
+      "selectors": [
+        "tests/agent/durable_jobs/test_provider_effects.py::test_claim_happens_before_provider_create_call",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row04_claim_before_create_zero_effect_without_go"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 5,
+      "title": "accepted-lost provider create plus timeout/5xx/busy; lookup/adopt or PROVIDER_AMBIGUOUS; never blind retry",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row05_timeout_unique_lookup_adopts_without_retry",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row05_http_5xx_busy_never_blind_retry",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row05_multiple_lookup_is_provider_ambiguous"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 6,
+      "title": "response before correlation commit; mismatch/orphan fail closed",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row06_accepted_orphan_run_fail_closed",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row06_idempotency_mismatch_fail_closed"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 7,
+      "title": "duplicate ingress/concurrent dispatch/restart one job/effect",
+      "selectors": [
+        "tests/agent/durable_jobs/test_store.py::test_duplicate_idempotency_key_adopts_original_without_second_record",
+        "tests/agent/durable_jobs/test_provider_effects.py::test_concurrent_effect_claims_single_winner_same_idempotency_key",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row07_restart_does_not_create_second_effect"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 8,
+      "title": "poll transient + missing/multiple/wrong lookup bounded retry then typed Hold",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row08_empty_lookup_bound_then_typed_hold",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row08_wrong_lookup_key_is_provider_ambiguous_hold"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 9,
+      "title": "cancellation ambiguity reconciliation",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row09_cancel_during_inflight_does_not_bind",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row09_crash_during_cancel_is_atomic"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 10,
+      "title": "Slack root intent before send",
+      "selectors": [
+        "tests/agent/durable_jobs/test_slack_bindings.py::test_binding_required_before_any_slack_effect",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row10_claim_before_post_root"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 11,
+      "title": "accepted-lost root/status adopt or REMOTE_DELIVERY_AMBIGUOUS",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row11_lost_root_unique_adopt",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row11_ambiguous_root_is_remote_delivery_ambiguous"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 12,
+      "title": "root accepted before durable bind; no cross bind",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row12_post_without_bind_rejected",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row12_accepted_root_cannot_cross_bind"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 13,
+      "title": "duplicate/stale/cross-job/workspace actions and ACK-before-decision-commit",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_cross_job_action_rejected_without_ack",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_decision_commits_before_ack",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_crash_after_decision_before_ack_reacks"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 14,
+      "title": "terminal evidence commit/checkpoint",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row14_terminal_evidence_requires_matching_durable_status",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row14_crash_before_evidence_commit_persists_nothing"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 15,
+      "title": "terminal evidence before resume enqueue; accepted enqueue before local mark; stable idempotency key",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row15_enqueue_requires_terminal_evidence",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row15_cannot_local_mark_before_accepted_enqueue",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row15_stable_resume_idempotency_key"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 16,
+      "title": "delivery lease/sink accepted-lost/ACK-before-delivered; fail-closed/at-least-once",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row16_slack_delivery_claim_before_post_and_ack_after_accept",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row16_lost_post_adopt_at_least_once"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": "Generic non-Slack delivery sink is not a production coordinator; Slack root delivery lease is the supported seam."
+    },
+    {
+      "id": 17,
+      "title": "exact lease expiry and clock changes",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row17_exact_expiry_equality_is_expired",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row17_clock_rewind_cannot_unexpire_lease"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 18,
+      "title": "restart each supported nonterminal state executes only persisted permitted next_action",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row18_restart_executes_only_persisted_next_action",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row18_tampered_next_action_is_denied"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 19,
+      "title": "real OS-process contention for effect/resume/delivery single winner where supported by SQLite",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row19_two_processes_single_provider_claim_winner",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row19_two_processes_single_slack_delivery_winner",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row19_two_processes_single_resume_enqueue_winner"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": "SQLite IMMEDIATE writer lock is not PostgreSQL advisory locks or sandbox multi-replica."
+    },
+    {
+      "id": 20,
+      "title": "datastore unavailable/locked/full and transaction failure no partial mutation",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row20_locked_writer_no_partial_job",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row20_injected_full_no_partial_mutation",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row20_crash_mid_transaction_rolls_back"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 21,
+      "title": "unknown policy/version/schema/pruned data default-deny and key nonreuse",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng29_go_guard.py::test_unknown_unclassified_actions_default_deny_require_go",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_unknown_schema_version_refuses_writes",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_pruned_authorization_key_not_reused"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    },
+    {
+      "id": 22,
+      "title": "logs/events redact tokens/prompts and preserve correlation IDs",
+      "selectors": [
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row22_events_redact_tokens_and_prompts",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row22_events_preserve_job_and_idempotency_correlation"
+      ],
+      "proof_layer": "PENDING",
+      "status": "PENDING",
+      "notes": ""
+    }
+  ]
+}
