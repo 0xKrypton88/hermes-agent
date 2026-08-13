@@ -33,6 +33,11 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def after_decision_rows_before_commit() -> None:
+    """Test seam after decision+event rows, before COMMIT. Production no-op."""
+    return None
+
+
 def _parse_dt(value: str) -> datetime:
     text = value.strip()
     if text.endswith("Z"):
@@ -384,6 +389,7 @@ class DecisionLedger:
                 },
                 idempotency_key=f"job_decision_recorded:{decision_idempotency_key}",
             )
+            after_decision_rows_before_commit()
             row = conn.execute(
                 "SELECT * FROM job_decisions WHERE decision_id = ?",
                 (decision_id,),
@@ -403,12 +409,43 @@ class DecisionLedger:
                 """
                 SELECT * FROM job_decisions
                  WHERE job_id = ? AND status = 'accepted'
-                 ORDER BY created_at DESC, decision_id DESC
+                 ORDER BY created_at DESC, rowid DESC
                  LIMIT 1
                 """,
                 (job_id,),
             ).fetchone()
         return self._row_to_decision(row) if row else None
+
+    def record_recovery_hold(
+        self, job_id: str, *, scope: str, reason: str = "empty_lookup"
+    ) -> Optional[DecisionResult]:
+        """Typed Hold after bounded/ambiguous recovery. Never a blind retry."""
+        _ = reason
+        binding = None
+        from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+        binding = SlackBindingLedger(sqlite_path=self.sqlite_path).get_binding(job_id)
+        if binding is None:
+            return None
+        with self._connect() as conn:
+            policy_row = conn.execute(
+                "SELECT * FROM job_authz_policies WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if policy_row is None:
+            return None
+        policy = self._row_to_policy(policy_row)
+        if not policy.allowed_actors:
+            return None
+        return self.record_decision(
+            job_id=job_id,
+            decision_type=DecisionType.HOLD.value,
+            candidate_id=binding.candidate_id,
+            candidate_version=binding.candidate_version,
+            actor_id=policy.allowed_actors[0],
+            policy_version=policy.policy_version,
+            decision_idempotency_key=f"hold:recovery:{job_id}:{scope}",
+        )
 
     def is_canceled(self, job_id: str) -> bool:
         with self._connect() as conn:

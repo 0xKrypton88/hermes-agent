@@ -46,6 +46,30 @@ def claim_is_expired(expires_at: Optional[str], now_iso: str) -> bool:
     return parse_iso(expires_at) <= parse_iso(now_iso)
 
 
+class ClockWatermark:
+    """Per-ledger high-watermark so a rewind cannot un-expire a lease.
+
+    Instance-local: must not be shared across wall-clock and FrozenClock
+    ledgers on the same SQLite file.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value: Optional[str] = None
+
+    def observe(self, now_iso: str) -> str:
+        with self._lock:
+            current = self._value
+            try:
+                if current and parse_iso(current) > parse_iso(now_iso):
+                    return current
+            except ValueError:
+                self._value = now_iso
+                return now_iso
+            self._value = now_iso
+            return now_iso
+
+
 class FrozenClock:
     """Deterministic clock. Tests advance it explicitly — no sleeps.
 

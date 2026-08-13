@@ -37,6 +37,7 @@ from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
     DEFAULT_RECOVERY_MAX_ATTEMPTS,
     DEFAULT_RECOVERY_WINDOW_SECONDS,
+    ClockWatermark,
     add_seconds_iso,
     claim_is_expired,
     utcnow_iso,
@@ -61,7 +62,8 @@ class SlackRootStatus(str, Enum):
 
 class SlackUnknownReason(str, Enum):
     EMPTY_LOOKUP = "empty_lookup"
-    AMBIGUOUS_LOOKUP = "ambiguous_lookup"
+    REMOTE_DELIVERY_AMBIGUOUS = "REMOTE_DELIVERY_AMBIGUOUS"
+    AMBIGUOUS_LOOKUP = REMOTE_DELIVERY_AMBIGUOUS
     AMBIGUOUS_RESPONSE = "ambiguous_response"
 
 
@@ -168,9 +170,10 @@ class SlackBindingLedger:
         self._lease_seconds = int(lease_seconds)
         self._recovery_max_attempts = int(recovery_max_attempts)
         self._recovery_window_seconds = int(recovery_window_seconds)
+        self._clock_watermark = ClockWatermark()
 
     def _now(self) -> str:
-        return self._now_fn()
+        return self._clock_watermark.observe(self._now_fn())
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.sqlite_path, timeout=10)
@@ -1224,6 +1227,24 @@ def _finish_observed_slack_delivery(
     return ledger.bind_observed_delivery(job_id, message_ts, status=status)
 
 
+def _filter_slack_lookup_matches(
+    matches: list, expected_client_msg_id: str
+) -> tuple[list, bool]:
+    """Keep posts for the immutable client_msg_id. Foreign ids are never adopted."""
+    usable: list = []
+    foreign = False
+    for posted in matches:
+        message_ts = getattr(posted, "message_ts", None)
+        client_msg_id = getattr(posted, "client_msg_id", None)
+        if not message_ts:
+            continue
+        if client_msg_id is None or client_msg_id == expected_client_msg_id:
+            usable.append(posted)
+        else:
+            foreign = True
+    return usable, foreign
+
+
 def _lookup_slack_root(
     ledger: SlackBindingLedger,
     slack_port: SlackMessagePort,
@@ -1255,21 +1276,24 @@ def _lookup_slack_root(
     matches = list(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )
-    if len(matches) == 1:
+    usable, foreign = _filter_slack_lookup_matches(
+        matches, binding.outbound_client_msg_id
+    )
+    if len(usable) == 1 and not foreign:
         return _finish_observed_slack_delivery(
             ledger,
             binding.job_id,
-            matches[0].message_ts,
+            usable[0].message_ts,
             owner_token=owner_token,
             status=SlackRootStatus.ADOPTED,
         )
-    if len(matches) == 0:
+    if len(usable) == 0 and not foreign:
         return ledger.note_empty_lookup(
             binding.job_id, owner_token=owner_token
         )
     unknown = ledger.mark_unknown(
         binding.job_id,
-        SlackUnknownReason.AMBIGUOUS_LOOKUP.value,
+        SlackUnknownReason.REMOTE_DELIVERY_AMBIGUOUS.value,
         owner_token=owner_token,
     )
     if unknown.status is SlackRootStatus.UNKNOWN:

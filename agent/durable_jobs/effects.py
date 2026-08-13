@@ -45,6 +45,7 @@ from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
     DEFAULT_RECOVERY_MAX_ATTEMPTS,
     DEFAULT_RECOVERY_WINDOW_SECONDS,
+    ClockWatermark,
     add_seconds_iso,
     claim_is_expired,
     utcnow_iso,
@@ -68,8 +69,11 @@ class EffectStatus(str, Enum):
 
 class UnknownReason(str, Enum):
     EMPTY_LOOKUP = "empty_lookup"
-    AMBIGUOUS_LOOKUP = "ambiguous_lookup"
+    PROVIDER_AMBIGUOUS = "PROVIDER_AMBIGUOUS"
+    AMBIGUOUS_LOOKUP = PROVIDER_AMBIGUOUS
     AMBIGUOUS_RESPONSE = "ambiguous_response"
+    ORPHAN_RESPONSE = "orphan_response"
+    CORRELATION_MISMATCH = "correlation_mismatch"
 
 
 def provider_idempotency_key(job_id: str, action_id: str) -> str:
@@ -147,9 +151,10 @@ class ProviderEffectLedger:
         self._lease_seconds = int(lease_seconds)
         self._recovery_max_attempts = int(recovery_max_attempts)
         self._recovery_window_seconds = int(recovery_window_seconds)
+        self._clock_watermark = ClockWatermark()
 
     def _now(self) -> str:
-        return self._now_fn()
+        return self._clock_watermark.observe(self._now_fn())
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.sqlite_path, timeout=10)
@@ -698,12 +703,17 @@ class ProviderEffectLedger:
             now_iso=now,
             max_attempts=self._recovery_max_attempts,
         ):
-            return self.mark_unknown(
+            unknown = self.mark_unknown(
                 job_id,
                 action_id,
                 UnknownReason.EMPTY_LOOKUP.value,
                 owner_token=owner_token,
             )
+            if unknown.status is EffectStatus.UNKNOWN:
+                _persist_provider_recovery_hold(
+                    self, job_id, reason=UnknownReason.EMPTY_LOOKUP.value
+                )
+            return unknown
         return updated
 
     def _complete_claim(
@@ -1027,6 +1037,35 @@ class ProviderEffectLedger:
         )
 
 
+def _persist_provider_recovery_hold(
+    ledger: ProviderEffectLedger, job_id: str, *, reason: str
+) -> None:
+    """Typed Hold after bounded/ambiguous provider recovery. Never a retry."""
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    DecisionLedger(sqlite_path=ledger.sqlite_path).record_recovery_hold(
+        job_id, scope="provider", reason=reason
+    )
+
+
+def _filter_provider_lookup_matches(
+    matches: list[Any], expected_key: str
+) -> tuple[list[Any], bool]:
+    """Keep runs for the immutable key. Foreign keys are never adopted."""
+    usable: list[Any] = []
+    foreign = False
+    for run in matches:
+        run_id = getattr(run, "run_id", None)
+        run_key = getattr(run, "idempotency_key", None)
+        if not run_id:
+            continue
+        if run_key is None or run_key == expected_key:
+            usable.append(run)
+        else:
+            foreign = True
+    return usable, foreign
+
+
 def reconcile_cursor_create(
     ledger: ProviderEffectLedger,
     provider: CursorProviderPort,
@@ -1152,6 +1191,34 @@ def reconcile_cursor_create(
         kind = getattr(result, "kind", None)
         run = getattr(result, "run", None)
         if kind == "accepted" and run is not None:
+            run_id = getattr(run, "run_id", None)
+            run_key = getattr(run, "idempotency_key", None)
+            if not run_id:
+                unknown = ledger.mark_unknown(
+                    job_id,
+                    action_id,
+                    UnknownReason.ORPHAN_RESPONSE.value,
+                    owner_token=won_token,
+                )
+                _persist_provider_recovery_hold(
+                    ledger, job_id, reason=UnknownReason.ORPHAN_RESPONSE.value
+                )
+                return unknown
+            if (
+                isinstance(run_key, str)
+                and run_key.startswith("cursor:")
+                and run_key != claim.provider_idempotency_key
+            ):
+                unknown = ledger.mark_unknown(
+                    job_id,
+                    action_id,
+                    UnknownReason.CORRELATION_MISMATCH.value,
+                    owner_token=won_token,
+                )
+                _persist_provider_recovery_hold(
+                    ledger, job_id, reason=UnknownReason.CORRELATION_MISMATCH.value
+                )
+                return unknown
             return _finish_observed_provider_run(
                 ledger,
                 claim,
@@ -1167,6 +1234,9 @@ def reconcile_cursor_create(
                 owner_token=won_token,
             )
             if unknown.status is EffectStatus.UNKNOWN:
+                _persist_provider_recovery_hold(
+                    ledger, job_id, reason=UnknownReason.AMBIGUOUS_RESPONSE.value
+                )
                 return unknown
             current = ledger.get_claim(job_id, action_id)
             return current if current is not None else unknown
@@ -1295,25 +1365,40 @@ def _recover_claimed_provider(
     matches = list(
         provider.lookup_runs(idempotency_key=claim.provider_idempotency_key)
     )
-    if len(matches) == 1:
+    usable, foreign = _filter_provider_lookup_matches(
+        matches, claim.provider_idempotency_key
+    )
+    if len(usable) == 1 and not foreign:
         return _finish_observed_provider_run(
             ledger,
             claim,
-            matches[0].run_id,
+            usable[0].run_id,
             owner_token=owner_token,
             status=EffectStatus.ADOPTED,
         )
-    if len(matches) == 0:
-        return ledger.note_empty_lookup(
+    if len(usable) == 0 and not foreign:
+        result = ledger.note_empty_lookup(
             claim.job_id, claim.action_id, owner_token=owner_token
         )
+        if result.status is EffectStatus.UNKNOWN:
+            _persist_provider_recovery_hold(
+                ledger,
+                claim.job_id,
+                reason=result.unknown_reason or UnknownReason.EMPTY_LOOKUP.value,
+            )
+        return result
     unknown = ledger.mark_unknown(
         claim.job_id,
         claim.action_id,
-        UnknownReason.AMBIGUOUS_LOOKUP.value,
+        UnknownReason.PROVIDER_AMBIGUOUS.value,
         owner_token=owner_token,
     )
     if unknown.status is EffectStatus.UNKNOWN:
+        _persist_provider_recovery_hold(
+            ledger,
+            claim.job_id,
+            reason=UnknownReason.PROVIDER_AMBIGUOUS.value,
+        )
         return unknown
     current = ledger.get_claim(claim.job_id, claim.action_id)
     return current if current is not None else unknown

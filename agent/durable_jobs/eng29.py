@@ -335,6 +335,16 @@ def register_authorization_tuple(
         existing_key = _fetch_tuple_by_key(conn, authorization_idempotency_key)
         if existing_key is not None:
             return _conflict(existing_key)
+        retired = conn.execute(
+            "SELECT 1 FROM retired_idempotency_keys WHERE idempotency_key = ?",
+            (authorization_idempotency_key,),
+        ).fetchone()
+        if retired is not None:
+            return AuthorizationTupleResult(
+                ok=False,
+                status="rejected",
+                reason_codes=("replayed",),
+            )
         try:
             conn.execute(
                 """
@@ -928,3 +938,43 @@ def _raise_unless_adapter_go_on_conn(
         now_iso=now_iso,
         action=action,
     )
+
+
+def prune_authorization_tuple(
+    sqlite_path: SqlitePath, job_id: str, target_action: str
+) -> bool:
+    """Delete the tuple and retire its idempotency key. Keys are never reused."""
+    path = _ensure_store(sqlite_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    with _connect(path, immediate=True) as conn:
+        existing = _fetch_tuple_by_job_action(conn, job_id, target_action)
+        if existing is None:
+            return False
+        conn.execute(
+            """
+            DELETE FROM job_authorization_tuples
+             WHERE job_id = ? AND target_action = ?
+            """,
+            (job_id, target_action),
+        )
+        conn.execute(
+            """
+            INSERT INTO retired_idempotency_keys(idempotency_key, origin, retired_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(idempotency_key) DO NOTHING
+            """,
+            (existing.authorization_idempotency_key, "authorization_tuple_prune", now),
+        )
+        DurableJobStore._append_event(
+            conn,
+            job_id=job_id,
+            event_type="job_authorization_tuple_pruned",
+            payload={
+                "target_action": target_action,
+                "authorization_idempotency_key": existing.authorization_idempotency_key,
+            },
+            idempotency_key=(
+                f"job_authorization_tuple_pruned:{existing.authorization_idempotency_key}"
+            ),
+        )
+    return True

@@ -25,8 +25,9 @@ from agent.durable_jobs.models import (
     InvalidPhaseTransition,
     JobPhase,
 )
+from agent.durable_jobs.redaction import redact_payload
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -183,6 +184,56 @@ CREATE TABLE IF NOT EXISTS job_authorization_tuples (
     PRIMARY KEY (job_id, target_action),
     FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
 );
+
+CREATE TABLE IF NOT EXISTS job_terminal_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    source_status TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    CHECK (kind IN ('provider_run', 'slack_root')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_resume_enqueues (
+    enqueue_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    local_marked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (status IN ('queued', 'accepted', 'failed')),
+    CHECK (local_marked = 0 OR status = 'accepted'),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id),
+    FOREIGN KEY (evidence_id) REFERENCES job_terminal_evidence(evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_inbound_actions (
+    inbound_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    root_thread_ts TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    decision_idempotency_key TEXT NOT NULL UNIQUE,
+    decision_id TEXT,
+    ack_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (ack_status IN ('pending', 'acked', 'rejected')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS retired_idempotency_keys (
+    idempotency_key TEXT PRIMARY KEY,
+    origin TEXT NOT NULL,
+    retired_at TEXT NOT NULL
+);
 """
 
 
@@ -216,6 +267,10 @@ _TUPLE_CANDIDATE_COLUMNS = (
 )
 
 
+class UnknownSchemaError(ValueError):
+    """Refuse writes when schema_version is missing, newer, or unparseable."""
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -227,6 +282,28 @@ def after_job_rows_before_commit() -> None:
     zero events: the write transaction is still uncommitted.
     """
     return None
+
+
+def _read_schema_version(conn: sqlite3.Connection) -> Optional[str]:
+    try:
+        row = conn.execute(
+            "SELECT value FROM durable_jobs_meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    return str(row[0]) if row[0] is not None else None
+
+
+def _parse_schema_version(raw: str) -> Optional[int]:
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value < 1:
+        return None
+    return value
 
 
 def _ensure_claim_lease_columns(conn: sqlite3.Connection) -> None:
@@ -377,6 +454,14 @@ class DurableJobStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            existing = _read_schema_version(conn)
+            if existing is not None:
+                parsed = _parse_schema_version(existing)
+                if parsed is None or parsed > SCHEMA_VERSION:
+                    raise UnknownSchemaError(
+                        f"unknown durable-jobs schema_version {existing!r}; "
+                        f"refusing writes (local SCHEMA_VERSION={SCHEMA_VERSION})"
+                    )
             conn.executescript(_SCHEMA_SQL)
             _ensure_claim_lease_columns(conn)
             _ensure_recovery_protocol(conn)
@@ -609,6 +694,26 @@ class DurableJobStore:
             return None
         return job
 
+    def retire_idempotency_key(self, idempotency_key: str, *, origin: str) -> None:
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO retired_idempotency_keys(idempotency_key, origin, retired_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (idempotency_key, origin, now),
+            )
+
+    def is_idempotency_key_retired(self, idempotency_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM retired_idempotency_keys WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return row is not None
+
     @staticmethod
     def _append_event(
         conn: sqlite3.Connection,
@@ -628,7 +733,7 @@ class DurableJobStore:
                 (
                     job_id,
                     event_type,
-                    json.dumps(payload, sort_keys=True),
+                    json.dumps(redact_payload(payload), sort_keys=True),
                     idempotency_key,
                     _utcnow(),
                 ),
