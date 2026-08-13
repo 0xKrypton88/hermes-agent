@@ -15,8 +15,10 @@ reposts. Empty lookup stays RECOVERING until ``recovery_deadline``. A
 persisted foreign token is never caller authority. The previous owner is
 fenced from mark_delivered after takeover. Cancel is terminal: a
 pre-existing accepted Cancel refuses claim, inflight, post_root, and
-recovery lookup. Delivered/adopted bind cannot overwrite Cancel. SQLite
-cannot abort an RPC that already began after the last Cancel SELECT.
+recovery lookup. Delivered/adopted bind cannot overwrite Cancel: the
+success UPDATE-CAS includes an authoritative Cancel predicate in the
+same SQLite transaction. SQLite cannot abort an RPC that already began
+after the last Cancel SELECT, and this fence is not PostgreSQL-safe.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 No live Slack API client is constructed.
@@ -753,6 +755,8 @@ class SlackBindingLedger:
         unknown_reason: Optional[str] = None,
     ) -> SlackJobBinding:
         now = self._now()
+        # Fast path only. The success UPDATE-CAS Cancel predicate below is
+        # the fence; a separate-connection pre-check is not sufficient.
         if status in (
             SlackRootStatus.DELIVERED,
             SlackRootStatus.ADOPTED,
@@ -803,6 +807,13 @@ class SlackBindingLedger:
                     " OR effect_inflight_token = ?)"
                 )
                 unknown_inflight_args = (now, owner_token)
+            cancel_sql = ""
+            if status in (SlackRootStatus.DELIVERED, SlackRootStatus.ADOPTED):
+                from agent.durable_jobs.decisions import (
+                    sql_reject_authoritative_cancel,
+                )
+
+                cancel_sql = sql_reject_authoritative_cancel("slack_job_bindings")
             cur = conn.execute(
                 f"""
                 UPDATE slack_job_bindings
@@ -811,6 +822,7 @@ class SlackBindingLedger:
                        updated_at = ?
                  WHERE job_id = ? AND status IN (?, ?) AND claim_owner_token = ?
                    {unknown_inflight_sql}
+                   {cancel_sql}
                 """,
                 (
                     status.value,
@@ -873,6 +885,8 @@ class SlackBindingLedger:
             else "slack_root_adopted"
         )
         now = self._now()
+        # Fast path only. The success UPDATE-CAS Cancel predicate below is
+        # the fence; a separate-connection pre-check is not sufficient.
         if self._job_is_canceled(job_id):
             blocked = self.get_binding(job_id)
             if blocked is None:
@@ -891,14 +905,17 @@ class SlackBindingLedger:
                 SlackRootStatus.RECOVERING,
             ):
                 return binding
+            from agent.durable_jobs.decisions import sql_reject_authoritative_cancel
+
             cur = conn.execute(
-                """
+                f"""
                 UPDATE slack_job_bindings
                    SET status = ?, delivered_message_ts = ?, unknown_reason = NULL,
                        effect_inflight_token = NULL, effect_inflight_until = NULL,
                        updated_at = ?
                  WHERE job_id = ? AND status IN (?, ?)
                    AND (delivered_message_ts IS NULL OR delivered_message_ts = ?)
+                   {sql_reject_authoritative_cancel("slack_job_bindings")}
                 """,
                 (
                     status.value,

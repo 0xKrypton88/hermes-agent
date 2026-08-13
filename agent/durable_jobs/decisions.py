@@ -84,6 +84,30 @@ class JobCanceledError(RuntimeError):
     """
 
 
+_CANCEL_FENCE_TABLES = frozenset(
+    {"provider_effect_claims", "slack_job_bindings"}
+)
+
+
+def sql_reject_authoritative_cancel(table: str) -> str:
+    """Correlated predicate for a success UPDATE-CAS on ``table``.
+
+    The Cancel row must be visible in the *same* SQLite write transaction as
+    the UPDATE. A prior ``_job_is_canceled()`` on another connection is not
+    a fence. This is single-file SQLite only; it does not claim PostgreSQL
+    or distributed isolation.
+    """
+    if table not in _CANCEL_FENCE_TABLES:
+        raise ValueError(f"unknown cancel-fence table: {table}")
+    return (
+        " AND NOT EXISTS ("
+        " SELECT 1 FROM job_decisions"
+        f" WHERE job_id = {table}.job_id"
+        " AND decision_type = 'cancel'"
+        " AND status IN ('accepted', 'duplicate'))"
+    )
+
+
 class DecisionLedger:
     def __init__(
         self,

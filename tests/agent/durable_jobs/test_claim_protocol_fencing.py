@@ -10,6 +10,8 @@ Covers independently reproduced defects:
 4. Accepted Cancel that exists *before* reconcile/deliver still create_runs
    / posts (and recovery-looks-up). In-flight Cancel tests only fence bind
    after RPC has begun; they do not cover this call-out TOCTOU.
+5. Cancel committed on a separate SQLite connection after `_job_is_canceled()`
+   and before the completion transaction still binds accepted/delivered.
 
 Deterministic FrozenClock + barriers only — no wall-clock sleeps.
 """
@@ -20,6 +22,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+import pytest
 
 from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
@@ -1094,3 +1098,233 @@ def test_slack_accepted_cancel_before_deliver_does_not_call_out(tmp_path):
     )
     assert go_after.ok is False
     assert "canceled" in go_after.reason_codes
+
+
+def _arm_authz(store, job):
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(**_bind_kwargs(job.job_id))
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    return decisions
+
+
+def _record_cancel_on_separate_connection(sqlite_path, job_id: str, key: str) -> None:
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    other = DecisionLedger(sqlite_path=sqlite_path)
+    canceled = other.record_decision(
+        job_id=job_id,
+        decision_type="cancel",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key=key,
+    )
+    assert canceled.ok is True
+    assert other.is_canceled(job_id) is True
+
+
+def _inject_cancel_after_precheck(ledger, job_id: str, key: str) -> dict:
+    original = ledger._job_is_canceled
+    fired = {"done": False}
+
+    def _hook(checked_id: str) -> bool:
+        seen = original(checked_id)
+        if checked_id == job_id and not fired["done"]:
+            fired["done"] = True
+            _record_cancel_on_separate_connection(ledger.sqlite_path, job_id, key)
+        return seen
+
+    ledger._job_is_canceled = _hook
+    return fired
+
+
+def _assert_later_go_rejected(decisions, job_id: str, key: str) -> None:
+    go_after = decisions.record_decision(
+        job_id=job_id,
+        decision_type="go",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key=key,
+    )
+    assert go_after.ok is False
+    assert "canceled" in go_after.reason_codes
+
+
+@pytest.mark.parametrize("mode", ["accepted", "adopted"])
+def test_provider_cancel_between_precheck_and_complete_does_not_bind(tmp_path, mode):
+    """Cancel on a separate conn after _job_is_canceled must lose the success CAS."""
+    from agent.durable_jobs.effects import EffectStatus, ProviderEffectLedger
+
+    store, job = _make_job(tmp_path, idempotency_key=f"idem-race-complete-{mode}")
+    decisions = _arm_authz(store, job)
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=FrozenClock(),
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    claimed = ledger.claim_effect(**_provider_kwargs(job))
+    assert claimed.won is True
+    assert claimed.owner_token
+    fired = _inject_cancel_after_precheck(
+        ledger, job.job_id, f"k-race-complete-{mode}"
+    )
+    if mode == "accepted":
+        result = ledger.mark_accepted(
+            job.job_id, "create_run", "run-race", owner_token=claimed.owner_token
+        )
+    else:
+        result = ledger.adopt_run(
+            job.job_id, "create_run", "run-race", owner_token=claimed.owner_token
+        )
+    assert fired["done"] is True
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert decisions.is_canceled(job.job_id) is True
+    for row in (result, persisted):
+        assert row.status is not EffectStatus.ACCEPTED, (
+            f"PROVIDER canceled=True status={row.status.value} run={row.provider_run_id}"
+        )
+        assert row.status is not EffectStatus.ADOPTED, (
+            f"PROVIDER canceled=True status={row.status.value} run={row.provider_run_id}"
+        )
+        assert row.provider_run_id != "run-race"
+    mapping = ledger.get_mapping(job.job_id)
+    assert mapping is None or mapping.provider_run_id != "run-race"
+    event_types = [event["event_type"] for event in store.list_events(job.job_id)]
+    assert "provider_effect_accepted" not in event_types
+    assert "provider_effect_adopted" not in event_types
+    _assert_later_go_rejected(decisions, job.job_id, f"k-go-after-race-complete-{mode}")
+
+
+@pytest.mark.parametrize("mode", ["accepted", "adopted"])
+def test_provider_cancel_between_precheck_and_bind_does_not_bind(tmp_path, mode):
+    from agent.durable_jobs.effects import EffectStatus, ProviderEffectLedger
+
+    store, job = _make_job(tmp_path, idempotency_key=f"idem-race-bind-{mode}")
+    decisions = _arm_authz(store, job)
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=FrozenClock(),
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    claimed = ledger.claim_effect(**_provider_kwargs(job))
+    assert claimed.won is True
+    status = EffectStatus.ACCEPTED if mode == "accepted" else EffectStatus.ADOPTED
+    fired = _inject_cancel_after_precheck(ledger, job.job_id, f"k-race-bind-{mode}")
+    result = ledger.bind_observed_run(
+        job.job_id, "create_run", "run-race", status=status
+    )
+    assert fired["done"] is True
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert decisions.is_canceled(job.job_id) is True
+    for row in (result, persisted):
+        assert row.status is not EffectStatus.ACCEPTED, (
+            f"PROVIDER canceled=True status={row.status.value} run={row.provider_run_id}"
+        )
+        assert row.status is not EffectStatus.ADOPTED, (
+            f"PROVIDER canceled=True status={row.status.value} run={row.provider_run_id}"
+        )
+        assert row.provider_run_id != "run-race"
+    mapping = ledger.get_mapping(job.job_id)
+    assert mapping is None or mapping.provider_run_id != "run-race"
+    event_types = [event["event_type"] for event in store.list_events(job.job_id)]
+    assert "provider_effect_accepted" not in event_types
+    assert "provider_effect_adopted" not in event_types
+    _assert_later_go_rejected(decisions, job.job_id, f"k-go-after-race-bind-{mode}")
+
+
+@pytest.mark.parametrize("mode", ["delivered", "adopted"])
+def test_slack_cancel_between_precheck_and_complete_does_not_bind(tmp_path, mode):
+    from agent.durable_jobs.slack_contract import SlackBindingLedger, SlackRootStatus
+
+    store, job = _make_job(tmp_path, idempotency_key=f"idem-race-slack-complete-{mode}")
+    decisions = _arm_authz(store, job)
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=FrozenClock(),
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    claimed = ledger.claim_delivery(job.job_id)
+    assert claimed.won is True
+    assert claimed.owner_token
+    fired = _inject_cancel_after_precheck(
+        ledger, job.job_id, f"k-race-slack-complete-{mode}"
+    )
+    if mode == "delivered":
+        result = ledger.mark_delivered(
+            job.job_id, "42.race", owner_token=claimed.owner_token
+        )
+    else:
+        result = ledger.adopt_delivery(
+            job.job_id, "42.race", owner_token=claimed.owner_token
+        )
+    assert fired["done"] is True
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert decisions.is_canceled(job.job_id) is True
+    for row in (result, persisted):
+        assert row.status is not SlackRootStatus.DELIVERED, (
+            f"SLACK canceled=True status={row.status.value} ts={row.delivered_message_ts}"
+        )
+        assert row.status is not SlackRootStatus.ADOPTED, (
+            f"SLACK canceled=True status={row.status.value} ts={row.delivered_message_ts}"
+        )
+        assert row.delivered_message_ts != "42.race"
+    event_types = [event["event_type"] for event in store.list_events(job.job_id)]
+    assert "slack_root_delivered" not in event_types
+    assert "slack_root_adopted" not in event_types
+    _assert_later_go_rejected(
+        decisions, job.job_id, f"k-go-after-race-slack-complete-{mode}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["delivered", "adopted"])
+def test_slack_cancel_between_precheck_and_bind_does_not_bind(tmp_path, mode):
+    from agent.durable_jobs.slack_contract import SlackBindingLedger, SlackRootStatus
+
+    store, job = _make_job(tmp_path, idempotency_key=f"idem-race-slack-bind-{mode}")
+    decisions = _arm_authz(store, job)
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=FrozenClock(),
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    claimed = ledger.claim_delivery(job.job_id)
+    assert claimed.won is True
+    status = (
+        SlackRootStatus.DELIVERED if mode == "delivered" else SlackRootStatus.ADOPTED
+    )
+    fired = _inject_cancel_after_precheck(
+        ledger, job.job_id, f"k-race-slack-bind-{mode}"
+    )
+    result = ledger.bind_observed_delivery(job.job_id, "42.race", status=status)
+    assert fired["done"] is True
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert decisions.is_canceled(job.job_id) is True
+    for row in (result, persisted):
+        assert row.status is not SlackRootStatus.DELIVERED, (
+            f"SLACK canceled=True status={row.status.value} ts={row.delivered_message_ts}"
+        )
+        assert row.status is not SlackRootStatus.ADOPTED, (
+            f"SLACK canceled=True status={row.status.value} ts={row.delivered_message_ts}"
+        )
+        assert row.delivered_message_ts != "42.race"
+    event_types = [event["event_type"] for event in store.list_events(job.job_id)]
+    assert "slack_root_delivered" not in event_types
+    assert "slack_root_adopted" not in event_types
+    _assert_later_go_rejected(
+        decisions, job.job_id, f"k-go-after-race-slack-bind-{mode}"
+    )

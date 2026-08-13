@@ -22,8 +22,10 @@ persisted in-flight witness has also expired (a live create_run still
 renews that witness in SQLite after claim takeover). A persisted
 foreign token is never caller authority. Cancel is terminal: a
 pre-existing accepted Cancel refuses claim, inflight, create_run, and
-recovery lookup. Accepted/adopted bind cannot overwrite Cancel. SQLite
-cannot abort an RPC that already began after the last Cancel SELECT.
+recovery lookup. Accepted/adopted bind cannot overwrite Cancel: the
+success UPDATE-CAS includes an authoritative Cancel predicate in the
+same SQLite transaction. SQLite cannot abort an RPC that already began
+after the last Cancel SELECT, and this fence is not PostgreSQL-safe.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 It does not satisfy ENG-25 production PostgreSQL acceptance.
@@ -673,6 +675,8 @@ class ProviderEffectLedger:
         unknown_reason: Optional[str] = None,
     ) -> ProviderEffectClaim:
         now = self._now()
+        # Fast path only. The success UPDATE-CAS Cancel predicate below is
+        # the fence; a separate-connection pre-check is not sufficient.
         if status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED) and self._job_is_canceled(
             job_id
         ):
@@ -716,6 +720,15 @@ class ProviderEffectLedger:
                     " OR effect_inflight_token = ?)"
                 )
                 unknown_inflight_args = (now, owner_token)
+            cancel_sql = ""
+            if status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED):
+                from agent.durable_jobs.decisions import (
+                    sql_reject_authoritative_cancel,
+                )
+
+                cancel_sql = sql_reject_authoritative_cancel(
+                    "provider_effect_claims"
+                )
             cur = conn.execute(
                 f"""
                 UPDATE provider_effect_claims
@@ -726,6 +739,7 @@ class ProviderEffectLedger:
                    AND status IN (?, ?)
                    AND claim_owner_token = ?
                    {unknown_inflight_sql}
+                   {cancel_sql}
                 """,
                 (
                     status.value,
@@ -804,6 +818,8 @@ class ProviderEffectLedger:
             else "provider_effect_adopted"
         )
         now = self._now()
+        # Fast path only. The success UPDATE-CAS Cancel predicate below is
+        # the fence; a separate-connection pre-check is not sufficient.
         if self._job_is_canceled(job_id):
             blocked = self.get_claim(job_id, action_id)
             if blocked is None:
@@ -822,8 +838,10 @@ class ProviderEffectLedger:
             claim = self._row_to_claim(current)
             if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
                 return claim
+            from agent.durable_jobs.decisions import sql_reject_authoritative_cancel
+
             cur = conn.execute(
-                """
+                f"""
                 UPDATE provider_effect_claims
                    SET status = ?, provider_run_id = ?, unknown_reason = NULL,
                        effect_inflight_token = NULL, effect_inflight_until = NULL,
@@ -831,6 +849,7 @@ class ProviderEffectLedger:
                  WHERE job_id = ? AND action_id = ?
                    AND status IN (?, ?)
                    AND (provider_run_id IS NULL OR provider_run_id = ?)
+                   {sql_reject_authoritative_cancel("provider_effect_claims")}
                 """,
                 (
                     status.value,
