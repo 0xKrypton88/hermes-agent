@@ -62,6 +62,11 @@ takeover, recovery lookup, `create_run`, and `post_root`. Adapter identity is
 derived from the job row, live policy, and the effect/binding
 `candidate_id`/`candidate_version` — never from hardcoded defaults or the
 stored tuple actor. Missing or mismatching identity fields default-deny.
+The current live `job_authz_policies` row is revalidated on every guard:
+absent, expired, revoked/inactive, malformed, actor-mismatched, or
+policy-version-mismatched fail closed even when an accepted Go and the
+immutable tuple are still unexpired under the same policy version.
+Candidate/package/SHA/environment/action/matrix bindings are preserved.
 Mandatory and unknown actions require an **exact matching, unexpired ACCEPTED
 Go**. Hold, Cancel, tuple mismatch, expiry, missing prerequisites, or
 unresolved provider ambiguity fail closed: zero new claim persistence and

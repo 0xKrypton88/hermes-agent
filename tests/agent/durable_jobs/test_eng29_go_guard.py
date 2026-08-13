@@ -100,12 +100,15 @@ class FakeCreateResult:
 
 
 class CountingProvider:
-    def __init__(self) -> None:
+    def __init__(self, *, create_kind: str = "accepted") -> None:
+        self.create_kind = create_kind
         self.create_calls: list[str] = []
         self.lookup_calls: list[str] = []
 
     def create_run(self, *, idempotency_key: str, job_id: str) -> FakeCreateResult:
         self.create_calls.append(idempotency_key)
+        if self.create_kind != "accepted":
+            return FakeCreateResult(kind=self.create_kind)
         return FakeCreateResult(kind="accepted", run=FakeRun("run-1", idempotency_key))
 
     def lookup_runs(self, *, idempotency_key: str) -> list[FakeRun]:
@@ -120,12 +123,15 @@ class FakePostResult:
 
 
 class CountingPort:
-    def __init__(self) -> None:
+    def __init__(self, *, post_kind: str = "accepted") -> None:
+        self.post_kind = post_kind
         self.posts: list[str] = []
         self.lookup_calls: list[str] = []
 
     def post_root(self, **kwargs) -> FakePostResult:
         self.posts.append(kwargs["client_msg_id"])
+        if self.post_kind != "accepted":
+            return FakePostResult(kind=self.post_kind)
         return FakePostResult(kind="accepted", message_ts="42.0")
 
     def lookup_by_client_msg_id(self, client_msg_id: str) -> list:
@@ -294,6 +300,121 @@ def _register_and_go(store, job, decisions, *, target_action: str, **tuple_overr
     )
     assert go.ok is True
     return registered, go
+
+
+def _restore_live_policy(
+    store,
+    job,
+    *,
+    actor: str = "U-alice",
+    policy_version: str = "pol-1",
+    expires_at: str = "2099-01-01T00:00:00+00:00",
+):
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
+        job_id=job.job_id,
+        policy_version=policy_version,
+        allowed_actors=(actor,),
+        expires_at=expires_at,
+    )
+
+
+def _apply_live_policy_defect(store, job, defect: str) -> None:
+    import sqlite3
+
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    if defect == "absent":
+        conn = sqlite3.connect(store.sqlite_path)
+        try:
+            conn.execute(
+                "DELETE FROM job_authz_policies WHERE job_id = ?", (job.job_id,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    if defect == "expired":
+        decisions.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-1",
+            allowed_actors=("U-alice",),
+            expires_at="2020-01-01T00:00:00+00:00",
+        )
+        return
+    if defect == "revoked":
+        decisions.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-1",
+            allowed_actors=(),
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        return
+    if defect == "inactive":
+        decisions.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-1",
+            allowed_actors=("",),
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        return
+    if defect == "actor_mismatch":
+        decisions.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-1",
+            allowed_actors=("U-bob",),
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        return
+    if defect == "policy_version_mismatch":
+        decisions.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-2",
+            allowed_actors=("U-alice",),
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        return
+
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        if defect == "malformed":
+            conn.execute(
+                """
+                UPDATE job_authz_policies
+                   SET allowed_actors_json = 'not-json'
+                 WHERE job_id = ?
+                """,
+                (job.job_id,),
+            )
+        elif defect == "missing_expires_at":
+            conn.execute(
+                "UPDATE job_authz_policies SET expires_at = NULL WHERE job_id = ?",
+                (job.job_id,),
+            )
+        elif defect == "malformed_expires_at":
+            conn.execute(
+                """
+                UPDATE job_authz_policies
+                   SET expires_at = 'not-a-timestamp'
+                 WHERE job_id = ?
+                """,
+                (job.job_id,),
+            )
+        else:
+            raise AssertionError(f"unknown live policy defect: {defect}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _effect_event_types(store, job_id: str) -> list[str]:
+    return [
+        event["event_type"]
+        for event in store.list_events(job_id)
+        if event["event_type"].startswith(("provider_effect_", "slack_root_"))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -899,3 +1020,690 @@ def test_slack_post_rejects_unauthorized_binding_candidate(tmp_path):
     assert persisted is not None
     assert persisted.status is SlackRootStatus.BOUND
     assert caught and isinstance(caught[0], AuthorizationDenied)
+
+
+# ---------------------------------------------------------------------------
+# Live policy revalidation: expiry/revocation under the same policy version
+# ---------------------------------------------------------------------------
+
+LIVE_POLICY_DEFECTS = (
+    ("absent", "unauthorized"),
+    ("expired", "expired"),
+    ("revoked", "unauthorized"),
+    ("inactive", "unauthorized"),
+    ("malformed", "unauthorized"),
+    ("actor_mismatch", "unauthorized"),
+    ("policy_version_mismatch", "mismatch"),
+    ("missing_expires_at", "expired"),
+    ("malformed_expires_at", "expired"),
+)
+
+
+@pytest.mark.parametrize("defect,reason", LIVE_POLICY_DEFECTS)
+def test_guard_fail_closed_on_current_live_policy_defects(tmp_path, defect, reason):
+    """Unexpired tuple + accepted Go must not survive a dead live policy."""
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        evaluate_authorization,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key=f"idem-eng29-live-{defect}")
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    green = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job)
+    )
+    assert green.ok is True
+
+    _apply_live_policy_defect(store, job, defect)
+    denied = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job)
+    )
+    assert denied.ok is False
+    assert reason in denied.reason_codes
+
+    _restore_live_policy(store, job)
+    restored = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job)
+    )
+    assert restored.ok is True
+    assert restored.reason_codes == ()
+
+
+def test_guard_live_policy_expiry_does_not_use_unexpired_tuple(tmp_path):
+    """RED→GREEN: same policy version, unexpired tuple, expired live policy."""
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        evaluate_authorization,
+        get_authorization_tuple,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-live-expiry-tuple")
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    tup = get_authorization_tuple(
+        store.sqlite_path, job.job_id, PROVIDER_CREATE_TARGET_ACTION
+    )
+    assert tup is not None
+    assert tup.expires_at == "2099-01-01T00:00:00+00:00"
+    assert tup.policy_version == "pol-1"
+
+    _apply_live_policy_defect(store, job, "expired")
+    denied = evaluate_authorization(
+        sqlite_path=store.sqlite_path,
+        **_guard_kwargs(job, now_iso="2026-01-01T00:00:00+00:00"),
+    )
+    assert denied.ok is False
+    assert "expired" in denied.reason_codes
+
+    _restore_live_policy(store, job)
+    allowed = evaluate_authorization(
+        sqlite_path=store.sqlite_path,
+        **_guard_kwargs(job, now_iso="2026-01-01T00:00:00+00:00"),
+    )
+    assert allowed.ok is True
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_provider_create_zero_claim_and_zero_calls_when_live_policy_dead(
+    tmp_path, defect
+):
+    from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        PROVIDER_CREATE_TARGET_ACTION,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-provider-live-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    _apply_live_policy_defect(store, job, defect)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    provider = CountingProvider()
+    events_before = _effect_event_types(store, job.job_id)
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert ledger.get_claim(job.job_id, "create_run") is None
+    assert _effect_event_types(store, job.job_id) == events_before
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    _restore_live_policy(store, job)
+    result = reconcile_cursor_create(ledger, CountingProvider(), **_provider_kwargs(job))
+    from agent.durable_jobs.effects import EffectStatus
+
+    assert result.status is EffectStatus.ACCEPTED
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_slack_post_zero_claim_and_zero_calls_when_live_policy_dead(
+    tmp_path, defect
+):
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-slack-live-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=SLACK_POST_ROOT_TARGET_ACTION
+    )
+    _apply_live_policy_defect(store, job, defect)
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    port = CountingPort()
+    events_before = _effect_event_types(store, job.job_id)
+    caught: list[BaseException] = []
+    try:
+        deliver_slack_root(ledger, port, job_id=job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert port.posts == []
+    assert port.lookup_calls == []
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.BOUND
+    assert _effect_event_types(store, job.job_id) == events_before
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    _restore_live_policy(store, job)
+    delivered = deliver_slack_root(ledger, CountingPort(), job_id=job.job_id)
+    assert delivered.status is SlackRootStatus.DELIVERED
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_provider_stale_takeover_zero_mutation_when_live_policy_dead(
+    tmp_path, defect
+):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.effects import (
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        PROVIDER_CREATE_TARGET_ACTION,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-provider-takeover-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    first = ledger.claim_effect(**_provider_kwargs(job))
+    assert first.won is True
+    generation = first.claim.claim_generation
+    owner = first.claim.claim_owner_token
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    _apply_live_policy_defect(store, job, defect)
+    events_before = _effect_event_types(store, job.job_id)
+    provider = CountingProvider()
+    caught: list[BaseException] = []
+    try:
+        ledger.takeover_stale_claim(job.job_id, "create_run")
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert persisted.claim_generation == generation
+    assert persisted.claim_owner_token == owner
+    assert "provider_effect_claim_taken" not in _effect_event_types(store, job.job_id)
+    assert _effect_event_types(store, job.job_id) == events_before
+
+    caught.clear()
+    try:
+        reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+    after = ledger.get_claim(job.job_id, "create_run")
+    assert after is not None
+    assert after.claim_generation == generation
+    assert after.claim_owner_token == owner
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_slack_stale_takeover_zero_mutation_when_live_policy_dead(
+    tmp_path, defect
+):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-slack-takeover-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=SLACK_POST_ROOT_TARGET_ACTION
+    )
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    first = ledger.claim_delivery(job.job_id)
+    assert first.won is True
+    generation = first.binding.claim_generation
+    owner = first.binding.claim_owner_token
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    _apply_live_policy_defect(store, job, defect)
+    events_before = _effect_event_types(store, job.job_id)
+    port = CountingPort()
+    caught: list[BaseException] = []
+    try:
+        ledger.takeover_stale_delivery(job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.CLAIMED
+    assert persisted.claim_generation == generation
+    assert persisted.claim_owner_token == owner
+    assert "slack_root_claim_taken" not in _effect_event_types(store, job.job_id)
+    assert _effect_event_types(store, job.job_id) == events_before
+
+    caught.clear()
+    try:
+        deliver_slack_root(ledger, port, job_id=job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert port.posts == []
+    assert port.lookup_calls == []
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+    after = ledger.get_binding(job.job_id)
+    assert after is not None
+    assert after.claim_generation == generation
+    assert after.claim_owner_token == owner
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_provider_recovery_lookup_zero_calls_when_live_policy_dead(
+    tmp_path, defect
+):
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        PROVIDER_CREATE_TARGET_ACTION,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-provider-lookup-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path, now_fn=clock)
+    recovering = reconcile_cursor_create(
+        ledger,
+        CountingProvider(create_kind="lost_response"),
+        **_provider_kwargs(job),
+    )
+    assert recovering.status is EffectStatus.RECOVERING
+    _apply_live_policy_defect(store, job, defect)
+    generation = recovering.claim_generation
+    owner = recovering.claim_owner_token
+    events_before = _effect_event_types(store, job.job_id)
+    provider = CountingProvider()
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(
+            ledger,
+            provider,
+            owner_token=owner,
+            **_provider_kwargs(job),
+        )
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+    after = ledger.get_claim(job.job_id, "create_run")
+    assert after is not None
+    assert after.status is EffectStatus.RECOVERING
+    assert after.claim_generation == generation
+    assert after.claim_owner_token == owner
+    assert _effect_event_types(store, job.job_id) == events_before
+
+
+@pytest.mark.parametrize("defect", ("expired", "revoked"))
+def test_slack_recovery_lookup_zero_calls_when_live_policy_dead(tmp_path, defect):
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-slack-lookup-{defect}"
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=SLACK_POST_ROOT_TARGET_ACTION
+    )
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path, now_fn=clock)
+    recovering = deliver_slack_root(
+        ledger, CountingPort(post_kind="lost_response"), job_id=job.job_id
+    )
+    assert recovering.status is SlackRootStatus.RECOVERING
+    _apply_live_policy_defect(store, job, defect)
+    generation = recovering.claim_generation
+    owner = recovering.claim_owner_token
+    events_before = _effect_event_types(store, job.job_id)
+    port = CountingPort()
+    caught: list[BaseException] = []
+    try:
+        deliver_slack_root(
+            ledger, port, job_id=job.job_id, owner_token=owner
+        )
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert port.posts == []
+    assert port.lookup_calls == []
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+    after = ledger.get_binding(job.job_id)
+    assert after is not None
+    assert after.status is SlackRootStatus.RECOVERING
+    assert after.claim_generation == generation
+    assert after.claim_owner_token == owner
+    assert _effect_event_types(store, job.job_id) == events_before
+
+
+def test_install_default_adapter_authorization_is_test_only(tmp_path, monkeypatch):
+    from agent.durable_jobs import eng29
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-install-test-only")
+    monkeypatch.setattr(eng29, "_in_test_runtime", lambda: False)
+    with pytest.raises(RuntimeError, match="test-only"):
+        eng29.install_default_adapter_authorization(store.sqlite_path, job.job_id)
+
+
+# ---------------------------------------------------------------------------
+# Schema v7: pre-v7 ENG-29 tuples migrate to blank candidate identity
+# ---------------------------------------------------------------------------
+
+_PRE_V7_ENG29_SCHEMA = """
+CREATE TABLE durable_jobs_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE durable_jobs (
+    job_id TEXT PRIMARY KEY,
+    phase TEXT NOT NULL,
+    origin_platform TEXT NOT NULL,
+    origin_chat_id TEXT NOT NULL,
+    origin_root_thread_id TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    frozen_baseline_sha TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    next_action TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE durable_job_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id, event_type, idempotency_key)
+);
+CREATE TABLE job_authz_policies (
+    job_id TEXT PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    allowed_actors_json TEXT NOT NULL,
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+CREATE TABLE job_decisions (
+    decision_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    decision_idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    source_package_id TEXT,
+    source_package_version TEXT,
+    candidate_sha TEXT,
+    target_environment TEXT,
+    target_action TEXT,
+    matrix_version TEXT,
+    CHECK (decision_type IN ('go', 'hold', 'cancel')),
+    CHECK (status IN ('accepted', 'duplicate', 'rejected')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+CREATE TABLE job_authorization_tuples (
+    job_id TEXT NOT NULL,
+    target_action TEXT NOT NULL,
+    source_package_id TEXT NOT NULL,
+    source_package_version TEXT NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    target_environment TEXT NOT NULL,
+    authorized_actor TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    matrix_version TEXT NOT NULL,
+    authorization_idempotency_key TEXT NOT NULL UNIQUE,
+    prerequisites_satisfied INTEGER NOT NULL DEFAULT 0,
+    provider_ambiguity_resolved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, target_action),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+CREATE TABLE slack_job_bindings (
+    job_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    root_thread_ts TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    outbound_client_msg_id TEXT NOT NULL UNIQUE,
+    delivered_message_ts TEXT,
+    status TEXT NOT NULL,
+    unknown_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def test_schema_v7_migrates_pre_v7_tuple_blank_candidate_fail_closed(tmp_path):
+    """Pre-v7 tuples gain blank candidate identity and cannot authorize effects."""
+    import sqlite3
+
+    from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
+    from agent.durable_jobs.eng29 import (
+        MATRIX_VERSION,
+        PROVIDER_CREATE_TARGET_ACTION,
+        AuthorizationDenied,
+        evaluate_authorization,
+        get_authorization_tuple,
+        register_authorization_tuple,
+    )
+    from agent.durable_jobs.store import SCHEMA_VERSION, DurableJobStore
+
+    path = _db(tmp_path)
+    now = "2026-01-01T00:00:00+00:00"
+    job_id = "dj_prev7"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_PRE_V7_ENG29_SCHEMA)
+        conn.execute(
+            "INSERT INTO durable_jobs_meta(key, value) VALUES('schema_version', '6')"
+        )
+        conn.execute(
+            """
+            INSERT INTO durable_jobs(
+                job_id, phase, origin_platform, origin_chat_id,
+                origin_root_thread_id, objective, repository_identity,
+                frozen_baseline_sha, idempotency_key, next_action,
+                created_at, updated_at
+            ) VALUES (?, 'INTAKE', 'slack', 'C123', '111.222', 'v6 tuple',
+                      'github.com/example/repo', 'sha-eng29-test', 'idem-prev7',
+                      'freeze_baseline', ?, ?)
+            """,
+            (job_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO job_authz_policies(
+                job_id, policy_version, allowed_actors_json, expires_at, created_at
+            ) VALUES (?, 'pol-1', ?, '2099-01-01T00:00:00+00:00', ?)
+            """,
+            (job_id, '["U-alice"]', now),
+        )
+        conn.execute(
+            """
+            INSERT INTO slack_job_bindings(
+                job_id, workspace_id, channel_id, root_thread_ts,
+                candidate_id, candidate_version, outbound_client_msg_id,
+                delivered_message_ts, status, unknown_reason, created_at, updated_at
+            ) VALUES (?, 'T1', 'C123', '111.222', 'cand-1', 'v1',
+                      'msg-prev7', NULL, 'bound', NULL, ?, ?)
+            """,
+            (job_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO job_authorization_tuples(
+                job_id, target_action, source_package_id, source_package_version,
+                candidate_sha, target_environment, authorized_actor, expires_at,
+                policy_version, matrix_version, authorization_idempotency_key,
+                prerequisites_satisfied, provider_ambiguity_resolved, created_at
+            ) VALUES (?, ?, 'github.com/example/repo', 'v1', 'sha-eng29-test',
+                      'slack', 'U-alice', '2099-01-01T00:00:00+00:00', 'pol-1',
+                      ?, 'tuple:dj_prev7:create', 1, 1, ?)
+            """,
+            (job_id, PROVIDER_CREATE_TARGET_ACTION, MATRIX_VERSION, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO job_decisions(
+                decision_id, job_id, decision_type, candidate_id,
+                candidate_version, actor_id, policy_version,
+                decision_idempotency_key, status, reason_codes_json,
+                created_at, source_package_id, source_package_version,
+                candidate_sha, target_environment, target_action, matrix_version
+            ) VALUES ('dd_prev7', ?, 'go', 'cand-1', 'v1', 'U-alice', 'pol-1',
+                      'go:dj_prev7:create', 'accepted', '[]', ?,
+                      'github.com/example/repo', 'v1', 'sha-eng29-test',
+                      'slack', ?, ?)
+            """,
+            (job_id, now, PROVIDER_CREATE_TARGET_ACTION, MATRIX_VERSION),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    probe = sqlite3.connect(path)
+    try:
+        before_cols = {
+            row[1]
+            for row in probe.execute(
+                "PRAGMA table_info(job_authorization_tuples)"
+            ).fetchall()
+        }
+    finally:
+        probe.close()
+    assert "candidate_id" not in before_cols
+    assert "candidate_version" not in before_cols
+
+    DurableJobStore(sqlite_path=path)
+    assert SCHEMA_VERSION >= 7
+    probe = sqlite3.connect(path)
+    try:
+        after_cols = {
+            row[1]
+            for row in probe.execute(
+                "PRAGMA table_info(job_authorization_tuples)"
+            ).fetchall()
+        }
+    finally:
+        probe.close()
+    assert "candidate_id" in after_cols
+    assert "candidate_version" in after_cols
+
+    migrated = get_authorization_tuple(
+        path, job_id, PROVIDER_CREATE_TARGET_ACTION
+    )
+    assert migrated is not None
+    assert migrated.candidate_id == ""
+    assert migrated.candidate_version == ""
+
+    class _Job:
+        job_id = job_id
+        repository_identity = "github.com/example/repo"
+        frozen_baseline_sha = "sha-eng29-test"
+        origin_platform = "slack"
+        origin_chat_id = "C123"
+        origin_root_thread_id = "111.222"
+
+    job = _Job()
+    blank = evaluate_authorization(
+        sqlite_path=path,
+        **_guard_kwargs(job, candidate_id="", candidate_version=""),
+    )
+    assert blank.ok is False
+    assert "unauthorized" in blank.reason_codes
+
+    replay = evaluate_authorization(sqlite_path=path, **_guard_kwargs(job))
+    assert replay.ok is False
+    assert "mismatch" in replay.reason_codes or "unauthorized" in replay.reason_codes
+
+    overwritten = register_authorization_tuple(
+        sqlite_path=path,
+        **_default_tuple_kwargs(
+            job,
+            target_action=PROVIDER_CREATE_TARGET_ACTION,
+            authorization_idempotency_key="tuple:dj_prev7:reauth",
+        ),
+    )
+    assert overwritten.ok is False
+
+    ledger = ProviderEffectLedger(sqlite_path=path)
+    provider = CountingProvider()
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert ledger.get_claim(job_id, "create_run") is None
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    store2, job2 = _make_job(tmp_path, idempotency_key="idem-eng29-v7-reauth")
+    decisions2 = _bind_and_policy(store2, job2, root_thread_ts="111.223")
+    _register_and_go(
+        store2, job2, decisions2, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    allowed = evaluate_authorization(
+        sqlite_path=store2.sqlite_path, **_guard_kwargs(job2)
+    )
+    assert allowed.ok is True

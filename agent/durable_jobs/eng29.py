@@ -9,7 +9,9 @@ implemented — those categories are enforced by the classifier and guard.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -509,6 +511,15 @@ def evaluate_authorization(
         if latest is not None and latest["decision_type"] == DecisionType.HOLD.value:
             return GuardResult(ok=False, reason_codes=("hold",))
 
+        live_denial = _live_policy_denial(
+            _load_live_policy_row(conn, job_id),
+            actor_id=actor_id,
+            policy_version=policy_version,
+            now=now,
+        )
+        if live_denial is not None:
+            return live_denial
+
         tup = _fetch_tuple_by_job_action(conn, job_id, target_action)
         if tup is None:
             any_tuple = conn.execute(
@@ -630,27 +641,93 @@ def raise_unless_authorized_go(
     raise AuthorizationDenied(result.reason_codes)
 
 
+def _load_live_policy_row(
+    conn: sqlite3.Connection, job_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM job_authz_policies WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+
+
+def _parse_allowed_actors(raw: object) -> Optional[tuple[str, ...]]:
+    try:
+        actors = json.loads(raw or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(actors, list):
+        return None
+    return tuple("" if item is None else str(item) for item in actors)
+
+
+def _live_policy_denial(
+    row: Optional[sqlite3.Row],
+    *,
+    actor_id: str,
+    policy_version: str,
+    now: str,
+) -> Optional[GuardResult]:
+    """Deny when the current live policy cannot authorize this actor/version.
+
+    Tuple expiry is a separate check. A still-unexpired immutable Go tuple
+    must not authorize effects after the live policy expires, is revoked,
+    or no longer matches the requested actor/policy version.
+    """
+    if row is None:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+
+    if "status" in row.keys():
+        status = str(row["status"] or "").strip().lower()
+        if status in ("revoked", "inactive") or (status and status != "active"):
+            return GuardResult(ok=False, reason_codes=("unauthorized",))
+
+    live_version = str(row["policy_version"] or "").strip()
+    if not live_version:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+    if live_version != str(policy_version).strip():
+        return GuardResult(ok=False, reason_codes=("mismatch",))
+
+    actors = _parse_allowed_actors(
+        row["allowed_actors_json"] if "allowed_actors_json" in row.keys() else None
+    )
+    if actors is None:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+    allowed = tuple(actor for actor in actors if str(actor).strip())
+    if not allowed:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+    if actor_id not in allowed:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+
+    expires_at = row["expires_at"] if "expires_at" in row.keys() else None
+    if expires_at is None or not str(expires_at).strip():
+        return GuardResult(ok=False, reason_codes=("expired",))
+    try:
+        if parse_iso(str(expires_at)) <= parse_iso(now):
+            return GuardResult(ok=False, reason_codes=("expired",))
+    except ValueError:
+        return GuardResult(ok=False, reason_codes=("expired",))
+    return None
+
+
 def _live_policy_actor(
     conn: sqlite3.Connection, job_id: str
 ) -> tuple[str, str]:
-    row = conn.execute(
-        """
-        SELECT policy_version, allowed_actors_json
-          FROM job_authz_policies
-         WHERE job_id = ?
-        """,
-        (job_id,),
-    ).fetchone()
+    row = _load_live_policy_row(conn, job_id)
     if row is None:
         return "", ""
     policy_version = str(row["policy_version"] or "")
-    try:
-        actors = json.loads(row["allowed_actors_json"] or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return "", policy_version
-    if not isinstance(actors, list) or not actors:
+    actors = _parse_allowed_actors(
+        row["allowed_actors_json"] if "allowed_actors_json" in row.keys() else None
+    )
+    if actors is None or not actors:
         return "", policy_version
     return str(actors[0] or ""), policy_version
+
+
+def _in_test_runtime() -> bool:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return "pytest" in sys.modules
 
 
 def raise_unless_adapter_go(
@@ -721,8 +798,14 @@ def install_default_adapter_authorization(
     Used by existing effect/fencing fixtures so they keep exercising claim
     fencing after ENG-29. Derives the immutable tuple from the job row and
     Slack binding (or binds cand-1/v1 when none exists). ENG-29 no-Go tests
-    must not call this. Production adapter paths never call this helper.
+    must not call this. Production adapter paths never call this helper;
+    it is test-only and raises outside a pytest runtime.
     """
+    if not _in_test_runtime():
+        raise RuntimeError(
+            "install_default_adapter_authorization is test-only and "
+            "unreachable in production runtime"
+        )
     from agent.durable_jobs.decisions import DecisionLedger
     from agent.durable_jobs.slack_contract import BindingConflict, SlackBindingLedger
 
