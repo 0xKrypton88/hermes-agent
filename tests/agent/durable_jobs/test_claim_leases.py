@@ -64,6 +64,19 @@ def _bind_kwargs(job_id: str):
     )
 
 
+def _advance_in_lease_steps(clock, seconds: float, *, step: float = 10.0) -> None:
+    """Advance without jumping past an unexpired lease in one tick.
+
+    Late renewal after expiry is rejected, so owner-alive tests must renew
+    while the lease is still live (step < DEFAULT_CLAIM_LEASE_SECONDS).
+    """
+    remaining = float(seconds)
+    while remaining > 0:
+        chunk = min(float(step), remaining)
+        clock.advance(chunk)
+        remaining -= chunk
+
+
 class FrozenClock:
     """Deterministic clock used as ``now_fn``. Advance explicitly — no sleeps."""
 
@@ -767,7 +780,7 @@ def test_provider_expiry_during_live_create_does_not_unknown_while_owner_alive(t
     thread = threading.Thread(target=winner)
     thread.start()
     assert started.wait(5.0), "winner never reached create_run"
-    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    _advance_in_lease_steps(clock, DEFAULT_CLAIM_LEASE_SECONDS + 1)
     loser_ledger = ProviderEffectLedger(
         sqlite_path=store.sqlite_path,
         now_fn=clock,
@@ -830,7 +843,7 @@ def test_slack_expiry_during_live_post_does_not_unknown_while_owner_alive(tmp_pa
     thread = threading.Thread(target=winner)
     thread.start()
     assert started.wait(5.0), "winner never reached post_root"
-    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    _advance_in_lease_steps(clock, DEFAULT_CLAIM_LEASE_SECONDS + 1)
     loser_ledger = SlackBindingLedger(
         sqlite_path=store.sqlite_path,
         now_fn=clock,
@@ -876,7 +889,7 @@ def test_provider_heartbeat_stop_then_expiry_allows_lookup_only_takeover(tmp_pat
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     ):
-        clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+        _advance_in_lease_steps(clock, DEFAULT_CLAIM_LEASE_SECONDS + 1)
         live = ledger.takeover_stale_claim(job.job_id, "create_run")
         assert live.won is False
         assert live.claim.claim_owner_token == first.owner_token
@@ -909,7 +922,7 @@ def test_slack_heartbeat_stop_then_expiry_allows_lookup_only_takeover(tmp_path):
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     ):
-        clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+        _advance_in_lease_steps(clock, DEFAULT_CLAIM_LEASE_SECONDS + 1)
         live = ledger.takeover_stale_delivery(job.job_id)
         assert live.won is False
     clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
@@ -1014,7 +1027,9 @@ def test_provider_delayed_visibility_after_takeover_does_not_false_negative(tmp_
     assert unknown_events == []
 
     provider.visible = True
-    adopted = reconcile_cursor_create(recovered, provider, **kwargs)
+    adopted = reconcile_cursor_create(
+        recovered, provider, owner_token=empty.claim_owner_token, **kwargs
+    )
     assert adopted.status is EffectStatus.ADOPTED
     assert adopted.provider_run_id == "run-late"
     assert provider.create_calls == []
@@ -1060,7 +1075,9 @@ def test_slack_delayed_visibility_after_takeover_does_not_false_negative(tmp_pat
     assert unknown_events == []
 
     port.visible = True
-    adopted = deliver_slack_root(recovered, port, job_id=job.job_id)
+    adopted = deliver_slack_root(
+        recovered, port, job_id=job.job_id, owner_token=empty.claim_owner_token
+    )
     assert adopted.status is SlackRootStatus.ADOPTED
     assert adopted.delivered_message_ts == "10.9"
     assert port.posts == []
@@ -1070,7 +1087,7 @@ def test_slack_delayed_visibility_after_takeover_does_not_false_negative(tmp_pat
 def test_provider_empty_recovery_bound_then_unknown_without_create(tmp_path):
     from agent.durable_jobs.clock import (
         DEFAULT_CLAIM_LEASE_SECONDS,
-        DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        DEFAULT_RECOVERY_WINDOW_SECONDS,
         FrozenClock,
     )
     from agent.durable_jobs.effects import (
@@ -1096,11 +1113,10 @@ def test_provider_empty_recovery_bound_then_unknown_without_create(tmp_path):
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     )
-    last = None
-    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 1):
-        last = reconcile_cursor_create(recovered, provider, **kwargs)
-        assert last.status is EffectStatus.RECOVERING
-        assert last.unknown_reason is None
+    recovering = reconcile_cursor_create(recovered, provider, **kwargs)
+    assert recovering.status is EffectStatus.RECOVERING
+    assert recovering.unknown_reason is None
+    clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
     terminal = reconcile_cursor_create(recovered, provider, **kwargs)
     assert terminal.status is EffectStatus.UNKNOWN
     assert terminal.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
@@ -1116,7 +1132,7 @@ def test_provider_empty_recovery_bound_then_unknown_without_create(tmp_path):
 def test_slack_empty_recovery_bound_then_unknown_without_repost(tmp_path):
     from agent.durable_jobs.clock import (
         DEFAULT_CLAIM_LEASE_SECONDS,
-        DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        DEFAULT_RECOVERY_WINDOW_SECONDS,
         FrozenClock,
     )
     from agent.durable_jobs.slack_contract import (
@@ -1142,10 +1158,10 @@ def test_slack_empty_recovery_bound_then_unknown_without_repost(tmp_path):
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     )
-    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 1):
-        last = deliver_slack_root(recovered, port, job_id=job.job_id)
-        assert last.status is SlackRootStatus.RECOVERING
-        assert last.unknown_reason is None
+    recovering = deliver_slack_root(recovered, port, job_id=job.job_id)
+    assert recovering.status is SlackRootStatus.RECOVERING
+    assert recovering.unknown_reason is None
+    clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
     terminal = deliver_slack_root(recovered, port, job_id=job.job_id)
     assert terminal.status is SlackRootStatus.UNKNOWN
     assert terminal.unknown_reason == SlackUnknownReason.EMPTY_LOOKUP.value

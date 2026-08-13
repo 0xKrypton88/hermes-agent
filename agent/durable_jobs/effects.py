@@ -9,13 +9,16 @@ Authorities live in this ledger, not LangGraph context:
 - job_id ↔ langgraph thread_id (same opaque id) ↔ provider run mapping
 - frozen origin Slack + candidate/version snapshot
 
-A non-owner that encounters an unexpired CLAIMED must poll and must not
-lookup, create, adopt, or terminalize. The live owner renews the persisted
-lease (owner-fenced heartbeat) so a long create_run cannot be stolen.
-Only an expired/legacy-null lease may be taken over; recovery looks up by
-the stable idempotency key and never blindly creates. An empty lookup after
-takeover enters bounded RECOVERING instead of immediately persisting typed
-UNKNOWN, so delayed provider visibility can still be adopted.
+A non-owner that encounters an unexpired CLAIMED/RECOVERING lease must poll
+and must not lookup, create, adopt, increment recovery attempts, or
+terminalize. The live owner renews the persisted lease (owner-fenced
+heartbeat) so a long create_run cannot be stolen. Renew CAS requires the
+lease still unexpired; False/exception is observable and does not cancel
+an in-flight create. Only an expired/legacy-null lease may be taken over
+(CLAIMED or RECOVERING), minting a new owner token; recovery looks up by
+the stable idempotency key and never blindly creates. Empty lookup stays
+RECOVERING until ``recovery_deadline``, then typed UNKNOWN. A persisted
+foreign token is never caller authority.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 It does not satisfy ENG-25 production PostgreSQL acceptance.
@@ -40,6 +43,7 @@ from agent.durable_jobs.clock import (
     utcnow_iso,
 )
 from agent.durable_jobs.claim_protocol import (
+    caller_holds_live_lease,
     owner_lease_heartbeat,
     recovery_bound_exceeded,
 )
@@ -277,7 +281,11 @@ class ProviderEffectLedger:
         )
 
     def takeover_stale_claim(self, job_id: str, action_id: str) -> ClaimResult:
-        """Atomically take an expired/legacy CLAIMED row. Unexpired → poll."""
+        """Atomically take an expired/legacy CLAIMED or RECOVERING row.
+
+        Mints a new owner token. Unexpired → poll. RECOVERING keeps its
+        recovery window; the new owner starts attempt bookkeeping at 0.
+        """
         now = self._now()
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
@@ -292,7 +300,7 @@ class ProviderEffectLedger:
             if current is None:
                 raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
             claim = self._row_to_claim(current)
-            if claim.status is not EffectStatus.CLAIMED:
+            if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
                 return ClaimResult(claim=claim, won=False)
             if not claim_is_expired(claim.claim_expires_at, now):
                 return ClaimResult(claim=claim, won=False)
@@ -302,8 +310,12 @@ class ProviderEffectLedger:
                    SET claim_owner_token = ?, claim_leased_at = ?,
                        claim_expires_at = ?,
                        claim_generation = claim_generation + 1,
+                       recovery_attempt_count = CASE
+                           WHEN status = ? THEN 0
+                           ELSE recovery_attempt_count
+                       END,
                        updated_at = ?
-                 WHERE job_id = ? AND action_id = ? AND status = ?
+                 WHERE job_id = ? AND action_id = ? AND status IN (?, ?)
                    AND claim_generation = ?
                    AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
                 """,
@@ -311,10 +323,12 @@ class ProviderEffectLedger:
                     owner_token,
                     now,
                     expires_at,
+                    EffectStatus.RECOVERING.value,
                     now,
                     job_id,
                     action_id,
                     EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
                     claim.claim_generation,
                     now,
                 ),
@@ -355,7 +369,11 @@ class ProviderEffectLedger:
         )
 
     def renew_claim(self, job_id: str, action_id: str, *, owner_token: str) -> bool:
-        """Owner-fenced lease renewal. Stale tokens and terminal rows fail."""
+        """Owner-fenced lease renewal. Requires an unexpired matching lease.
+
+        Late renewal after ``claim_expires_at`` (or legacy NULL expiry) returns
+        False even if nobody has taken over yet.
+        """
         now = self._now()
         expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
@@ -366,6 +384,8 @@ class ProviderEffectLedger:
                  WHERE job_id = ? AND action_id = ?
                    AND claim_owner_token = ?
                    AND status IN (?, ?)
+                   AND claim_expires_at IS NOT NULL
+                   AND claim_expires_at > ?
                 """,
                 (
                     now,
@@ -376,6 +396,7 @@ class ProviderEffectLedger:
                     owner_token,
                     EffectStatus.CLAIMED.value,
                     EffectStatus.RECOVERING.value,
+                    now,
                 ),
             )
             return cur.rowcount == 1
@@ -624,6 +645,102 @@ class ProviderEffectLedger:
         assert row is not None
         return self._row_to_claim(row)
 
+    def bind_observed_run(
+        self,
+        job_id: str,
+        action_id: str,
+        provider_run_id: str,
+        *,
+        status: EffectStatus,
+    ) -> ProviderEffectClaim:
+        """Bind a uniquely observed provider run without a caller owner token.
+
+        In-flight ``create_run`` cannot be canceled. If the original owner is
+        fenced after heartbeat loss, this CAS still completes while the row is
+        CLAIMED/RECOVERING. Already-terminal rows (including UNKNOWN) are
+        unchanged — terminal events fire only when this CAS wins.
+        """
+        if status not in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED):
+            raise ValueError(f"bind_observed_run status must be accepted/adopted, got {status}")
+        event_type = (
+            "provider_effect_accepted"
+            if status is EffectStatus.ACCEPTED
+            else "provider_effect_adopted"
+        )
+        now = self._now()
+        with self._connect() as conn:
+            current = conn.execute(
+                """
+                SELECT * FROM provider_effect_claims
+                 WHERE job_id = ? AND action_id = ?
+                """,
+                (job_id, action_id),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
+            claim = self._row_to_claim(current)
+            if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
+                return claim
+            cur = conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET status = ?, provider_run_id = ?, unknown_reason = NULL,
+                       updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND status IN (?, ?)
+                   AND (provider_run_id IS NULL OR provider_run_id = ?)
+                """,
+                (
+                    status.value,
+                    provider_run_id,
+                    now,
+                    job_id,
+                    action_id,
+                    EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
+                    provider_run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    """
+                    SELECT * FROM provider_effect_claims
+                     WHERE job_id = ? AND action_id = ?
+                    """,
+                    (job_id, action_id),
+                ).fetchone()
+                assert row is not None
+                return self._row_to_claim(row)
+            conn.execute(
+                """
+                UPDATE provider_job_mappings
+                   SET provider_run_id = ?, updated_at = ?
+                 WHERE job_id = ?
+                """,
+                (provider_run_id, now, job_id),
+            )
+            DurableJobStore._append_event(
+                conn,
+                job_id=job_id,
+                event_type=event_type,
+                payload={
+                    "action_id": action_id,
+                    "status": status.value,
+                    "provider_run_id": provider_run_id,
+                    "unknown_reason": None,
+                },
+                idempotency_key=f"{event_type}:{job_id}:{action_id}",
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM provider_effect_claims
+                 WHERE job_id = ? AND action_id = ?
+                """,
+                (job_id, action_id),
+            ).fetchone()
+        assert row is not None
+        return self._row_to_claim(row)
+
     @staticmethod
     def _reject_mapping_mismatch(
         conn: sqlite3.Connection,
@@ -717,15 +834,17 @@ def reconcile_cursor_create(
     origin_root_thread_id: str,
     candidate_id: str,
     candidate_version: str,
+    owner_token: Optional[str] = None,
 ) -> ProviderEffectClaim:
     """Claim first, then reconcile a fake provider create. Never blindly redispatch.
 
     UNKNOWN / ACCEPTED / ADOPTED claims do not call ``create_run`` again.
-    A live foreign CLAIMED is polled — no lookup, create, adopt, or UNKNOWN.
-    The winner renews the persisted lease while ``create_run`` is in flight.
-    Only an expired CLAIMED may be taken over; recovery looks up by the
-    stable idempotency key and never blindly calls ``create_run``. Empty
-    lookup enters RECOVERING until the recovery bound, then typed UNKNOWN.
+    A live foreign CLAIMED/RECOVERING is polled — no lookup, create, adopt,
+    attempt increment, or UNKNOWN. The winner renews the persisted lease
+    while ``create_run`` is in flight; renew False/exception is observable
+    and does not cancel that call. Only an expired CLAIMED/RECOVERING may
+    be taken over (new token); recovery looks up by the stable idempotency
+    key. Empty lookup stays RECOVERING until ``recovery_deadline``.
     """
     origin_platform, origin_chat_id, origin_root_thread_id = (
         _authoritative_origin_from_slack_binding(
@@ -753,14 +872,8 @@ def reconcile_cursor_create(
     ):
         return claim
     if claim.status is EffectStatus.RECOVERING:
-        token = claim.claim_owner_token
-        if not token:
-            taken = ledger.takeover_stale_claim(job_id, action_id)
-            if not taken.won:
-                return taken.claim
-            token = taken.owner_token
-        return _recover_claimed_provider(
-            ledger, provider, claim, owner_token=token
+        return _recover_or_poll_provider(
+            ledger, provider, claim, caller_token=owner_token
         )
     if not claimed.won:
         if claim.status is EffectStatus.CLAIMED:
@@ -772,12 +885,12 @@ def reconcile_cursor_create(
             )
         return claim
 
-    owner_token = claimed.owner_token
-    if not owner_token:
+    won_token = claimed.owner_token
+    if not won_token:
         return claim
     with owner_lease_heartbeat(
         renew_fn=lambda: ledger.renew_claim(
-            job_id, action_id, owner_token=owner_token
+            job_id, action_id, owner_token=won_token
         ),
         now_fn=ledger._now_fn,
         lease_seconds=ledger._lease_seconds,
@@ -789,18 +902,26 @@ def reconcile_cursor_create(
     kind = getattr(result, "kind", None)
     run = getattr(result, "run", None)
     if kind == "accepted" and run is not None:
-        return ledger.mark_accepted(
-            job_id, action_id, provider_run_id=run.run_id, owner_token=owner_token
+        return _finish_observed_provider_run(
+            ledger,
+            claim,
+            run.run_id,
+            owner_token=won_token,
+            status=EffectStatus.ACCEPTED,
         )
     if kind == "ambiguous_response":
-        return ledger.mark_unknown(
+        unknown = ledger.mark_unknown(
             job_id,
             action_id,
             UnknownReason.AMBIGUOUS_RESPONSE.value,
-            owner_token=owner_token,
+            owner_token=won_token,
         )
+        if unknown.status is EffectStatus.UNKNOWN:
+            return unknown
+        current = ledger.get_claim(job_id, action_id)
+        return current if current is not None else unknown
     return _recover_claimed_provider(
-        ledger, provider, claim, owner_token=owner_token
+        ledger, provider, claim, owner_token=won_token
     )
 
 
@@ -828,6 +949,66 @@ def _authoritative_origin_from_slack_binding(
     )
 
 
+def _recover_or_poll_provider(
+    ledger: ProviderEffectLedger,
+    provider: CursorProviderPort,
+    claim: ProviderEffectClaim,
+    *,
+    caller_token: Optional[str],
+) -> ProviderEffectClaim:
+    """RECOVERING: matching live owner looks up; anyone else polls or takeovers."""
+    if caller_holds_live_lease(
+        caller_token=caller_token,
+        persisted_token=claim.claim_owner_token,
+        expires_at=claim.claim_expires_at,
+        now_iso=ledger._now(),
+        status=claim.status.value,
+        live_statuses=(EffectStatus.RECOVERING.value,),
+    ):
+        assert caller_token is not None
+        return _recover_claimed_provider(
+            ledger, provider, claim, owner_token=caller_token
+        )
+    taken = ledger.takeover_stale_claim(claim.job_id, claim.action_id)
+    if not taken.won:
+        return taken.claim
+    return _recover_claimed_provider(
+        ledger, provider, taken.claim, owner_token=taken.owner_token
+    )
+
+
+def _finish_observed_provider_run(
+    ledger: ProviderEffectLedger,
+    claim: ProviderEffectClaim,
+    provider_run_id: str,
+    *,
+    owner_token: str,
+    status: EffectStatus,
+) -> ProviderEffectClaim:
+    if status is EffectStatus.ACCEPTED:
+        completed = ledger.mark_accepted(
+            claim.job_id,
+            claim.action_id,
+            provider_run_id=provider_run_id,
+            owner_token=owner_token,
+        )
+    else:
+        completed = ledger.adopt_run(
+            claim.job_id,
+            claim.action_id,
+            provider_run_id=provider_run_id,
+            owner_token=owner_token,
+        )
+    if (
+        completed.status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED)
+        and completed.provider_run_id == provider_run_id
+    ):
+        return completed
+    return ledger.bind_observed_run(
+        claim.job_id, claim.action_id, provider_run_id, status=status
+    )
+
+
 def _recover_claimed_provider(
     ledger: ProviderEffectLedger,
     provider: CursorProviderPort,
@@ -841,19 +1022,24 @@ def _recover_claimed_provider(
         provider.lookup_runs(idempotency_key=claim.provider_idempotency_key)
     )
     if len(matches) == 1:
-        return ledger.adopt_run(
-            claim.job_id,
-            claim.action_id,
-            provider_run_id=matches[0].run_id,
+        return _finish_observed_provider_run(
+            ledger,
+            claim,
+            matches[0].run_id,
             owner_token=owner_token,
+            status=EffectStatus.ADOPTED,
         )
     if len(matches) == 0:
         return ledger.note_empty_lookup(
             claim.job_id, claim.action_id, owner_token=owner_token
         )
-    return ledger.mark_unknown(
+    unknown = ledger.mark_unknown(
         claim.job_id,
         claim.action_id,
         UnknownReason.AMBIGUOUS_LOOKUP.value,
         owner_token=owner_token,
     )
+    if unknown.status is EffectStatus.UNKNOWN:
+        return unknown
+    current = ledger.get_claim(claim.job_id, claim.action_id)
+    return current if current is not None else unknown

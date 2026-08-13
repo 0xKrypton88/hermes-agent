@@ -77,12 +77,15 @@ class DurableLaneService:
         )
 
     def deliver_slack_root(
-        self, *, job_id: str, slack_port: SlackMessagePort
+        self, *, job_id: str, slack_port: SlackMessagePort,
+        owner_token: Optional[str] = None,
     ) -> SlackJobBinding:
         self._require_enabled()
         store = self._require_sqlite_path()
         ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
-        return deliver_slack_root(ledger, slack_port, job_id=job_id)
+        return deliver_slack_root(
+            ledger, slack_port, job_id=job_id, owner_token=owner_token
+        )
 
     def reconcile_cursor_create(
         self,
@@ -95,6 +98,7 @@ class DurableLaneService:
         candidate_id: str,
         candidate_version: str,
         provider: CursorProviderPort,
+        owner_token: Optional[str] = None,
     ) -> ProviderEffectClaim:
         self._require_enabled()
         store = self._require_sqlite_path()
@@ -129,6 +133,7 @@ class DurableLaneService:
             origin_root_thread_id=origin_root_thread_id,
             candidate_id=binding.candidate_id,
             candidate_version=binding.candidate_version,
+            owner_token=owner_token,
         )
 
     def set_job_policy(

@@ -5,12 +5,15 @@ A job is bound to workspace/channel/root-thread/candidate/version *before*
 any outbound effect. Rebind and cross-job/cross-binding resume fail closed.
 
 Delivery claims persist an owner token and lease. A non-owner that sees an
-unexpired CLAIMED must poll and must not lookup, post, adopt, or terminalize.
-The live owner renews the persisted lease while ``post_root`` is in flight.
-Only an expired/legacy-null lease may be taken over; recovery looks up by
-the stable ``client_msg_id`` and never blindly reposts. An empty lookup after
-takeover enters bounded RECOVERING instead of immediately persisting typed
-UNKNOWN. The previous owner is fenced from mark_delivered after takeover.
+unexpired CLAIMED/RECOVERING lease must poll and must not lookup, post,
+adopt, increment recovery attempts, or terminalize. The live owner renews
+the persisted lease while ``post_root`` is in flight; renew False/exception
+is observable and does not cancel that call. Only an expired/legacy-null
+lease may be taken over (CLAIMED or RECOVERING), minting a new owner token.
+Recovery looks up by the stable ``client_msg_id`` and never blindly
+reposts. Empty lookup stays RECOVERING until ``recovery_deadline``. A
+persisted foreign token is never caller authority. The previous owner is
+fenced from mark_delivered after takeover.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 No live Slack API client is constructed.
@@ -34,6 +37,7 @@ from agent.durable_jobs.clock import (
     utcnow_iso,
 )
 from agent.durable_jobs.claim_protocol import (
+    caller_holds_live_lease,
     owner_lease_heartbeat,
     recovery_bound_exceeded,
 )
@@ -421,7 +425,11 @@ class SlackBindingLedger:
         )
 
     def takeover_stale_delivery(self, job_id: str) -> DeliveryClaimResult:
-        """Atomically take an expired/legacy CLAIMED delivery. Unexpired → poll."""
+        """Atomically take an expired/legacy CLAIMED or RECOVERING delivery.
+
+        Mints a new owner token. Unexpired → poll. RECOVERING keeps its
+        recovery window; the new owner starts attempt bookkeeping at 0.
+        """
         now = self._now()
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
@@ -433,7 +441,10 @@ class SlackBindingLedger:
             if current is None:
                 raise BindingRequiredError(f"no Slack binding for {job_id}")
             binding = self._row_to_binding(current)
-            if binding.status is not SlackRootStatus.CLAIMED:
+            if binding.status not in (
+                SlackRootStatus.CLAIMED,
+                SlackRootStatus.RECOVERING,
+            ):
                 return DeliveryClaimResult(binding=binding, won=False)
             if not claim_is_expired(binding.claim_expires_at, now):
                 return DeliveryClaimResult(binding=binding, won=False)
@@ -443,8 +454,12 @@ class SlackBindingLedger:
                    SET claim_owner_token = ?, claim_leased_at = ?,
                        claim_expires_at = ?,
                        claim_generation = claim_generation + 1,
+                       recovery_attempt_count = CASE
+                           WHEN status = ? THEN 0
+                           ELSE recovery_attempt_count
+                       END,
                        updated_at = ?
-                 WHERE job_id = ? AND status = ?
+                 WHERE job_id = ? AND status IN (?, ?)
                    AND claim_generation = ?
                    AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
                 """,
@@ -452,9 +467,11 @@ class SlackBindingLedger:
                     owner_token,
                     now,
                     expires_at,
+                    SlackRootStatus.RECOVERING.value,
                     now,
                     job_id,
                     SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
                     binding.claim_generation,
                     now,
                 ),
@@ -490,7 +507,11 @@ class SlackBindingLedger:
         )
 
     def renew_delivery(self, job_id: str, *, owner_token: str) -> bool:
-        """Owner-fenced lease renewal. Stale tokens and terminal rows fail."""
+        """Owner-fenced lease renewal. Requires an unexpired matching lease.
+
+        Late renewal after ``claim_expires_at`` (or legacy NULL expiry) returns
+        False even if nobody has taken over yet.
+        """
         now = self._now()
         expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
@@ -500,6 +521,8 @@ class SlackBindingLedger:
                    SET claim_leased_at = ?, claim_expires_at = ?, updated_at = ?
                  WHERE job_id = ? AND claim_owner_token = ?
                    AND status IN (?, ?)
+                   AND claim_expires_at IS NOT NULL
+                   AND claim_expires_at > ?
                 """,
                 (
                     now,
@@ -509,6 +532,7 @@ class SlackBindingLedger:
                     owner_token,
                     SlackRootStatus.CLAIMED.value,
                     SlackRootStatus.RECOVERING.value,
+                    now,
                 ),
             )
             return cur.rowcount == 1
@@ -705,6 +729,86 @@ class SlackBindingLedger:
         assert row is not None
         return self._row_to_binding(row)
 
+    def bind_observed_delivery(
+        self,
+        job_id: str,
+        message_ts: str,
+        *,
+        status: SlackRootStatus,
+    ) -> SlackJobBinding:
+        """Bind a uniquely observed Slack message without a caller owner token.
+
+        In-flight ``post_root`` cannot be canceled. If the original owner is
+        fenced after heartbeat loss, this CAS still completes while the row is
+        CLAIMED/RECOVERING. Already-terminal rows are unchanged.
+        """
+        if status not in (SlackRootStatus.DELIVERED, SlackRootStatus.ADOPTED):
+            raise ValueError(
+                f"bind_observed_delivery status must be delivered/adopted, got {status}"
+            )
+        event_type = (
+            "slack_root_delivered"
+            if status is SlackRootStatus.DELIVERED
+            else "slack_root_adopted"
+        )
+        now = self._now()
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise BindingRequiredError(f"no Slack binding for {job_id}")
+            binding = self._row_to_binding(current)
+            if binding.status not in (
+                SlackRootStatus.CLAIMED,
+                SlackRootStatus.RECOVERING,
+            ):
+                return binding
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET status = ?, delivered_message_ts = ?, unknown_reason = NULL,
+                       updated_at = ?
+                 WHERE job_id = ? AND status IN (?, ?)
+                   AND (delivered_message_ts IS NULL OR delivered_message_ts = ?)
+                """,
+                (
+                    status.value,
+                    message_ts,
+                    now,
+                    job_id,
+                    SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
+                    message_ts,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                assert row is not None
+                return self._row_to_binding(row)
+            DurableJobStore._append_event(
+                conn,
+                job_id=job_id,
+                event_type=event_type,
+                payload={
+                    "status": status.value,
+                    "delivered_message_ts": message_ts,
+                    "unknown_reason": None,
+                    "outbound_client_msg_id": binding.outbound_client_msg_id,
+                },
+                idempotency_key=f"{event_type}:{job_id}",
+            )
+            row = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        assert row is not None
+        return self._row_to_binding(row)
+
     @staticmethod
     def _row_to_binding(row: sqlite3.Row) -> SlackJobBinding:
         keys = set(row.keys())
@@ -751,15 +855,18 @@ def deliver_slack_root(
     slack_port: SlackMessagePort,
     *,
     job_id: str,
+    owner_token: Optional[str] = None,
 ) -> SlackJobBinding:
     """Post at most one logical root. Binding + client_msg_id must already exist.
 
-    Atomic CLAIMED CAS happens before ``post_root``. A live foreign CLAIMED
-    is polled — concurrent losers do not post, lookup, or terminalize. The
-    winner renews the persisted lease while ``post_root`` is in flight. An
-    expired CLAIMED may be taken over; recovery looks up by the stable
-    ``client_msg_id`` and never blindly reposts. Empty lookup enters
-    RECOVERING until the recovery bound, then typed UNKNOWN.
+    Atomic CLAIMED CAS happens before ``post_root``. A live foreign
+    CLAIMED/RECOVERING is polled — concurrent losers do not post, lookup,
+    increment attempts, or terminalize. The winner renews the persisted
+    lease while ``post_root`` is in flight; renew False/exception is
+    observable and does not cancel that call. An expired CLAIMED/RECOVERING
+    may be taken over (new token); recovery looks up by the stable
+    ``client_msg_id`` and never blindly reposts. Empty lookup stays
+    RECOVERING until ``recovery_deadline``.
     """
     binding = ledger.get_binding(job_id)
     if binding is None:
@@ -771,14 +878,8 @@ def deliver_slack_root(
     ):
         return binding
     if binding.status is SlackRootStatus.RECOVERING:
-        token = binding.claim_owner_token
-        if not token:
-            taken = ledger.takeover_stale_delivery(job_id)
-            if not taken.won:
-                return taken.binding
-            token = taken.owner_token
-        return _lookup_slack_root(
-            ledger, slack_port, binding, owner_token=token
+        return _recover_or_poll_slack(
+            ledger, slack_port, binding, caller_token=owner_token
         )
     if binding.status is SlackRootStatus.CLAIMED:
         taken = ledger.takeover_stale_delivery(job_id)
@@ -793,12 +894,12 @@ def deliver_slack_root(
         return claimed.binding
 
     binding = claimed.binding
-    owner_token = claimed.owner_token
-    if not owner_token:
+    won_token = claimed.owner_token
+    if not won_token:
         return binding
     with owner_lease_heartbeat(
         renew_fn=lambda: ledger.renew_delivery(
-            job_id, owner_token=owner_token
+            job_id, owner_token=won_token
         ),
         now_fn=ledger._now_fn,
         lease_seconds=ledger._lease_seconds,
@@ -813,16 +914,77 @@ def deliver_slack_root(
     kind = getattr(result, "kind", None)
     message_ts = getattr(result, "message_ts", None)
     if kind == "accepted" and message_ts:
-        return ledger.mark_delivered(job_id, message_ts, owner_token=owner_token)
+        return _finish_observed_slack_delivery(
+            ledger,
+            job_id,
+            message_ts,
+            owner_token=won_token,
+            status=SlackRootStatus.DELIVERED,
+        )
     if kind == "ambiguous_response":
-        return ledger.mark_unknown(
+        unknown = ledger.mark_unknown(
             job_id,
             SlackUnknownReason.AMBIGUOUS_RESPONSE.value,
-            owner_token=owner_token,
+            owner_token=won_token,
         )
+        if unknown.status is SlackRootStatus.UNKNOWN:
+            return unknown
+        current = ledger.get_binding(job_id)
+        return current if current is not None else unknown
     return _lookup_slack_root(
-        ledger, slack_port, binding, owner_token=owner_token
+        ledger, slack_port, binding, owner_token=won_token
     )
+
+
+def _recover_or_poll_slack(
+    ledger: SlackBindingLedger,
+    slack_port: SlackMessagePort,
+    binding: SlackJobBinding,
+    *,
+    caller_token: Optional[str],
+) -> SlackJobBinding:
+    if caller_holds_live_lease(
+        caller_token=caller_token,
+        persisted_token=binding.claim_owner_token,
+        expires_at=binding.claim_expires_at,
+        now_iso=ledger._now(),
+        status=binding.status.value,
+        live_statuses=(SlackRootStatus.RECOVERING.value,),
+    ):
+        assert caller_token is not None
+        return _lookup_slack_root(
+            ledger, slack_port, binding, owner_token=caller_token
+        )
+    taken = ledger.takeover_stale_delivery(binding.job_id)
+    if not taken.won:
+        return taken.binding
+    return _lookup_slack_root(
+        ledger, slack_port, taken.binding, owner_token=taken.owner_token
+    )
+
+
+def _finish_observed_slack_delivery(
+    ledger: SlackBindingLedger,
+    job_id: str,
+    message_ts: str,
+    *,
+    owner_token: str,
+    status: SlackRootStatus,
+) -> SlackJobBinding:
+    if status is SlackRootStatus.DELIVERED:
+        completed = ledger.mark_delivered(
+            job_id, message_ts, owner_token=owner_token
+        )
+    else:
+        completed = ledger.adopt_delivery(
+            job_id, message_ts, owner_token=owner_token
+        )
+    if (
+        completed.status in (SlackRootStatus.DELIVERED, SlackRootStatus.ADOPTED)
+        and completed.delivered_message_ts == message_ts
+    ):
+        return completed
+    return ledger.bind_observed_delivery(job_id, message_ts, status=status)
 
 
 def _lookup_slack_root(
@@ -838,15 +1000,23 @@ def _lookup_slack_root(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )
     if len(matches) == 1:
-        return ledger.adopt_delivery(
-            binding.job_id, matches[0].message_ts, owner_token=owner_token
+        return _finish_observed_slack_delivery(
+            ledger,
+            binding.job_id,
+            matches[0].message_ts,
+            owner_token=owner_token,
+            status=SlackRootStatus.ADOPTED,
         )
     if len(matches) == 0:
         return ledger.note_empty_lookup(
             binding.job_id, owner_token=owner_token
         )
-    return ledger.mark_unknown(
+    unknown = ledger.mark_unknown(
         binding.job_id,
         SlackUnknownReason.AMBIGUOUS_LOOKUP.value,
         owner_token=owner_token,
     )
+    if unknown.status is SlackRootStatus.UNKNOWN:
+        return unknown
+    current = ledger.get_binding(binding.job_id)
+    return current if current is not None else unknown

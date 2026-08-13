@@ -338,7 +338,7 @@ def test_ambiguous_lookup_persists_typed_unknown_and_never_redispatches(tmp_path
 
 
 def test_empty_lookup_after_lost_create_recovers_then_unknown_without_redispatch(tmp_path):
-    from agent.durable_jobs.clock import DEFAULT_RECOVERY_MAX_ATTEMPTS
+    from agent.durable_jobs.clock import DEFAULT_RECOVERY_WINDOW_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -347,7 +347,8 @@ def test_empty_lookup_after_lost_create_recovers_then_unknown_without_redispatch
     )
 
     store, job = _make_job(tmp_path)
-    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path, now_fn=clock)
     provider = FakeCursorProvider(FakeCreateResult(kind="lost_response"), lookups=[])
     kwargs = dict(
         job_id=job.job_id,
@@ -361,9 +362,7 @@ def test_empty_lookup_after_lost_create_recovers_then_unknown_without_redispatch
     first = reconcile_cursor_create(ledger, provider, **kwargs)
     assert first.status is EffectStatus.RECOVERING
     assert first.unknown_reason is None
-    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 2):
-        mid = reconcile_cursor_create(ledger, provider, **kwargs)
-        assert mid.status is EffectStatus.RECOVERING
+    clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
     terminal = reconcile_cursor_create(ledger, provider, **kwargs)
     assert terminal.status is EffectStatus.UNKNOWN
     assert terminal.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
