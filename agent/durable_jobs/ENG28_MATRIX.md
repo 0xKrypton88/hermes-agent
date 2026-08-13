@@ -10,7 +10,29 @@ not live Cursor access, not gateway ingress, and not a production
 control plane.
 
 ENG-29 mandatory immutable-Go gating is preserved. Tests must not use
-`PYTEST_CURRENT_TEST` or any production auto-grant.
+`PYTEST_CURRENT_TEST` or any production auto-grant. Test-only Go grants
+live exclusively in `tests/agent/durable_jobs/authz_fixtures.py`.
+
+## Fault-injection instrumentation
+
+Production durable-jobs modules include **no-op fault-injection seams**.
+These are instrumentation, not authorization hooks. Default implementations
+return `None` and cannot grant Go, bypass ENG-29, ACK inbound actions, or
+mutate durable rows. Tests may replace them to abort an uncommitted write
+or widen a race window.
+
+| Seam | Module | Default |
+|---|---|---|
+| `after_job_rows_before_commit` | `store.py` | no-op |
+| `after_decision_rows_before_commit` | `decisions.py` | no-op |
+| `after_evidence_rows_before_commit` | `coordinator.py` | no-op |
+| `after_inbound_select_before_insert` | `coordinator.py` | no-op |
+| `after_in_transaction_adapter_go` | `eng29.py` | no-op |
+| `before_begin_immediate` | `eng29.py` | no-op |
+
+Do not read this list as "zero test-only production mechanisms." The seams
+exist in production code; they are disclosed here and proven unable to
+authorize or bypass behavior.
 
 ## Proof layers
 

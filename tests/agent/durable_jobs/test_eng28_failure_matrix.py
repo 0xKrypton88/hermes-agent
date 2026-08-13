@@ -398,10 +398,12 @@ def test_row05_timeout_unique_lookup_adopts_without_retry(tmp_path):
     assert first.provider_run_id == "run-t"
     second = reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
     assert second.status is EffectStatus.ADOPTED
+    assert provider.lookup_calls == [key]
     assert len(provider.create_calls) == 1
 
 
-def test_row05_http_5xx_busy_never_blind_retry(tmp_path):
+@pytest.mark.parametrize("kind", ("http_5xx", "busy"))
+def test_row05_http_5xx_busy_never_blind_retry(tmp_path, kind):
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -409,21 +411,23 @@ def test_row05_http_5xx_busy_never_blind_retry(tmp_path):
         reconcile_cursor_create,
     )
 
-    store, job = make_job(tmp_path, idempotency_key="idem-row05-5xx")
+    store, job = make_job(tmp_path, idempotency_key=f"idem-row05-{kind}")
     ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
-    key = provider_idempotency_key(job.job_id, "create_run")
-    for kind in ("http_5xx", "busy"):
-        provider = StatefulCursorProvider(
-            FakeCreateResult(kind=kind),
-            lookups=[FakeRun(f"run-{kind}", key)],
-        )
-        result = reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
-        assert result.status in (EffectStatus.ADOPTED, EffectStatus.ACCEPTED)
-        retry = reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
-        assert retry.status in (EffectStatus.ADOPTED, EffectStatus.ACCEPTED)
-        assert len(provider.create_calls) == 1
-        # same action_id: second kind would see terminal claim
-        break
+    kwargs = _provider_kwargs(job)
+    kwargs["action_id"] = f"create_run_{kind}"
+    key = provider_idempotency_key(job.job_id, kwargs["action_id"])
+    provider = StatefulCursorProvider(
+        FakeCreateResult(kind=kind),
+        lookups=[FakeRun(f"run-{kind}", key)],
+    )
+    result = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert result.status is EffectStatus.ADOPTED
+    assert result.provider_run_id == f"run-{kind}"
+    retry = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert retry.status is EffectStatus.ADOPTED
+    assert retry.provider_run_id == f"run-{kind}"
+    assert provider.lookup_calls == [key]
+    assert len(provider.create_calls) == 1
 
 
 def test_row05_multiple_lookup_is_provider_ambiguous(tmp_path):
@@ -924,6 +928,134 @@ def test_row13_crash_after_decision_before_ack_reacks(tmp_path):
     assert len(retry_port.acks) == 1
 
 
+def test_row13_idempotency_key_reuse_mismatch_rejects_without_ack_or_decision(
+    tmp_path,
+):
+    from agent.durable_jobs.coordinator import consume_inbound_action
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    store, job = make_job(tmp_path, authorize=False, idempotency_key="idem-row13-reuse")
+    _bind_policy(store, job)
+    ack = RecordingAckPort()
+    first = consume_inbound_action(
+        store.sqlite_path,
+        ack,
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        actor_id="U-alice",
+        decision_type="hold",
+        decision_idempotency_key="dec-bound-tuple",
+        policy_version="pol-1",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    assert first.ok is True
+    assert first.ack_status == "acked"
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    before = decisions.count_decisions(job.job_id)
+    inbound_before = _count_inbound(store.sqlite_path)
+    mismatch_ack = RecordingAckPort()
+    reuse = consume_inbound_action(
+        store.sqlite_path,
+        mismatch_ack,
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        actor_id="U-mallory",
+        decision_type="go",
+        decision_idempotency_key="dec-bound-tuple",
+        policy_version="pol-other",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    assert reuse.ok is False
+    assert reuse.ack_status == "rejected"
+    assert mismatch_ack.acks == []
+    assert decisions.count_decisions(job.job_id) == before
+    assert _count_inbound(store.sqlite_path) == inbound_before
+    latest = decisions.latest_accepted(job.job_id)
+    assert latest is not None
+    assert latest.decision_type.value == "hold"
+    assert latest.actor_id == "U-alice"
+
+
+def test_row13_two_processes_single_inbound_winner(tmp_path):
+    from agent.durable_jobs.decisions import DecisionLedger
+
+    store, job = make_job(
+        tmp_path, authorize=False, idempotency_key="idem-row13-proc"
+    )
+    _bind_policy(store, job)
+    key = "dec-inbound-race"
+    ack_log = tmp_path / "inbound-acks.log"
+    ack_log.write_text("", encoding="utf-8")
+    barrier = tmp_path / "inbound-barrier"
+    barrier.write_text("", encoding="utf-8")
+    integrity_log = tmp_path / "inbound-integrity.log"
+    integrity_log.write_text("", encoding="utf-8")
+    outs = _two_python(
+        _INBOUND_RACE,
+        store.sqlite_path,
+        job.job_id,
+        key,
+        str(ack_log),
+        str(barrier),
+        str(integrity_log),
+    )
+    assert all(code == 0 for code, _o, _e in outs), outs
+    payloads = [json.loads(out) for _code, out, _err in outs]
+    inbound_ids = {row["inbound_id"] for row in payloads}
+    decision_ids = {row["decision_id"] for row in payloads}
+    assert len(inbound_ids) == 1
+    assert len(decision_ids) == 1
+    assert all(row["ok"] is True for row in payloads)
+    assert all(row["ack_status"] in ("acked", "pending") for row in payloads)
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        (inbounds,) = conn.execute(
+            "SELECT COUNT(*) FROM job_inbound_actions WHERE decision_idempotency_key=?",
+            (key,),
+        ).fetchone()
+        (decisions,) = conn.execute(
+            "SELECT COUNT(*) FROM job_decisions WHERE decision_idempotency_key=?",
+            (key,),
+        ).fetchone()
+        ack_status = conn.execute(
+            "SELECT ack_status FROM job_inbound_actions WHERE decision_idempotency_key=?",
+            (key,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert int(inbounds) == 1
+    assert int(decisions) == 1
+    assert ack_status == "acked"
+    ack_lines = [line for line in ack_log.read_text(encoding="utf-8").splitlines() if line]
+    assert 1 <= len(ack_lines) <= 2
+    integrity_hits = [
+        line
+        for line in integrity_log.read_text(encoding="utf-8").splitlines()
+        if line == "inbound_unique"
+    ]
+    assert len(integrity_hits) >= 1
+    persisted_job = f"{next(iter(inbound_ids))}:{job.job_id}"
+    assert all(line == persisted_job for line in ack_lines)
+    latest = DecisionLedger(sqlite_path=store.sqlite_path).latest_accepted(job.job_id)
+    assert latest is not None
+    assert latest.decision_id == next(iter(decision_ids))
+
+
+def _count_inbound(path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        (n,) = conn.execute("SELECT COUNT(*) FROM job_inbound_actions").fetchone()
+        return int(n)
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Row 14 — terminal evidence
 # ---------------------------------------------------------------------------
@@ -1272,12 +1404,93 @@ _ENQUEUE_RACE = textwrap.dedent(
     """
 )
 
+_INBOUND_RACE = textwrap.dedent(
+    """
+    import json
+    import os
+    import sqlite3
+    import sys
+    import time
+    from pathlib import Path
 
-def _two_python(script: str, db, job_id: str):
+    flag = Path(sys.argv[5])
+    integrity_log = Path(sys.argv[6])
+    _orig_connect = sqlite3.connect
+
+    class TracingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            try:
+                return super().execute(sql, parameters)
+            except sqlite3.IntegrityError:
+                if "job_inbound_actions" in str(sql):
+                    with integrity_log.open("a", encoding="utf-8") as handle:
+                        handle.write("inbound_unique\\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                raise
+
+    def _connect(*args, **kwargs):
+        kwargs.setdefault("factory", TracingConnection)
+        return _orig_connect(*args, **kwargs)
+
+    sqlite3.connect = _connect
+
+    import agent.durable_jobs.coordinator as coordinator
+    from agent.durable_jobs.coordinator import consume_inbound_action
+
+    def _barrier():
+        with flag.open("a", encoding="utf-8") as handle:
+            handle.write("1")
+            handle.flush()
+            os.fsync(handle.fileno())
+        for _ in range(500):
+            if flag.read_text(encoding="utf-8").count("1") >= 2:
+                time.sleep(0.05)
+                return
+            time.sleep(0.01)
+        raise TimeoutError("inbound insert barrier")
+
+    coordinator.after_inbound_select_before_insert = _barrier
+
+    class FileAck:
+        def ack(self, *, inbound_id, job_id):
+            with open(sys.argv[4], "a", encoding="utf-8") as handle:
+                handle.write(f"{inbound_id}:{job_id}\\n")
+            return f"ack:{inbound_id}"
+
+    result = consume_inbound_action(
+        Path(sys.argv[1]),
+        FileAck(),
+        job_id=sys.argv[2],
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        actor_id="U-alice",
+        decision_type="hold",
+        decision_idempotency_key=sys.argv[3],
+        policy_version="pol-1",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    sys.stdout.write(
+        json.dumps(
+            {
+                "ok": result.ok,
+                "ack_status": result.ack_status,
+                "inbound_id": result.inbound_id,
+                "decision_id": result.decision_id,
+            }
+        )
+    )
+    """
+)
+
+
+def _two_python(script: str, db, job_id: str, *extra):
     env = child_env()
     procs = [
         subprocess.Popen(
-            [sys.executable, "-c", script, str(db), job_id],
+            [sys.executable, "-c", script, str(db), job_id, *extra],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1432,6 +1645,14 @@ def test_row20_crash_mid_transaction_rolls_back(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _sqlite_dump(path) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        return "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+
+
 def test_row21_unknown_schema_version_refuses_writes(tmp_path):
     from agent.durable_jobs.store import DurableJobStore, UnknownSchemaError
 
@@ -1445,8 +1666,92 @@ def test_row21_unknown_schema_version_refuses_writes(tmp_path):
         conn.commit()
     finally:
         conn.close()
+    before = _sqlite_dump(store.sqlite_path)
     with pytest.raises(UnknownSchemaError):
         DurableJobStore(sqlite_path=store.sqlite_path)
+    assert _sqlite_dump(store.sqlite_path) == before
+
+
+def test_row21_future_schema_version_refuses_writes_without_mutation(tmp_path):
+    from agent.durable_jobs.store import SCHEMA_VERSION, DurableJobStore, UnknownSchemaError
+
+    store = DurableJobStore(sqlite_path=db_path(tmp_path))
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            "UPDATE durable_jobs_meta SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION + 100),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = _sqlite_dump(store.sqlite_path)
+    with pytest.raises(UnknownSchemaError):
+        DurableJobStore(sqlite_path=store.sqlite_path)
+    assert _sqlite_dump(store.sqlite_path) == before
+
+
+def test_row21_missing_schema_marker_on_existing_db_fails_closed(tmp_path):
+    from agent.durable_jobs.store import DurableJobStore, UnknownSchemaError
+
+    store, job = make_job(
+        tmp_path, authorize=False, idempotency_key="idem-row21-marker"
+    )
+    job_id = job.job_id
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            "DELETE FROM durable_jobs_meta WHERE key='schema_version'"
+        )
+        conn.commit()
+        remaining = conn.execute(
+            "SELECT 1 FROM durable_jobs_meta WHERE key='schema_version'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert remaining is None
+    before = _sqlite_dump(store.sqlite_path)
+    with pytest.raises(UnknownSchemaError):
+        DurableJobStore(sqlite_path=store.sqlite_path)
+    after = _sqlite_dump(store.sqlite_path)
+    assert after == before
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM durable_jobs_meta WHERE key='schema_version'"
+        ).fetchone()
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM durable_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert marker is None
+    assert int(n) == 1
+
+
+def test_row21_empty_db_may_initialize(tmp_path):
+    from agent.durable_jobs.store import SCHEMA_VERSION, DurableJobStore
+
+    path = db_path(tmp_path)
+    assert not path.exists()
+    store = DurableJobStore(sqlite_path=path)
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM durable_jobs_meta WHERE key='schema_version'"
+        ).fetchone()
+        tables = {
+            name
+            for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    finally:
+        conn.close()
+    assert row is not None
+    assert int(row[0]) == SCHEMA_VERSION
+    assert "durable_jobs" in tables
 
 
 def test_row21_pruned_authorization_key_not_reused(tmp_path):
@@ -1542,4 +1847,45 @@ def test_row22_events_preserve_job_and_idempotency_correlation(tmp_path):
     assert created[0]["idempotency_key"] == f"create:{job.idempotency_key}"
 
 
+def test_fault_injection_seams_cannot_authorize_or_bypass(tmp_path):
+    from agent.durable_jobs.coordinator import after_evidence_rows_before_commit
+    from agent.durable_jobs.decisions import after_decision_rows_before_commit
+    from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        after_in_transaction_adapter_go,
+        before_begin_immediate,
+    )
+    from agent.durable_jobs.store import (
+        DurableJobStore,
+        after_job_rows_before_commit,
+    )
 
+    store = DurableJobStore(sqlite_path=db_path(tmp_path))
+    assert after_job_rows_before_commit() is None
+    assert after_decision_rows_before_commit() is None
+    assert after_evidence_rows_before_commit() is None
+    assert after_in_transaction_adapter_go() is None
+    assert before_begin_immediate() is None
+    from agent.durable_jobs.coordinator import after_inbound_select_before_insert
+
+    assert after_inbound_select_before_insert() is None
+    assert store.count_jobs() == 0
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="seam cannot grant",
+        repository_identity="github.com/example/repo",
+        idempotency_key="idem-seam",
+    )
+    _bind_policy(store, job)
+    after_job_rows_before_commit()
+    after_decision_rows_before_commit()
+    after_in_transaction_adapter_go()
+    before_begin_immediate()
+    effects = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    with pytest.raises(AuthorizationDenied):
+        effects.claim_effect(**_provider_kwargs(job))
+    assert effects.get_claim(job.job_id, "create_run") is None
+    assert effects.count_claims() == 0

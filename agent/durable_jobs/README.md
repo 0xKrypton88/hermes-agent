@@ -79,6 +79,10 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   succeeds so a lock wait cannot keep a pre-wait clock
 - Test fixtures that write default Go live under
   `tests/agent/durable_jobs/authz_fixtures.py`, not production agent modules
+- Production modules expose no-op fault-injection seams (`after_*_before_commit`,
+  `after_inbound_select_before_insert`, `after_in_transaction_adapter_go`,
+  `before_begin_immediate`). They are instrumentation: defaults return `None`
+  and cannot grant Go, bypass ENG-29, or ACK. See `ENG28_MATRIX.md`.
 - **Local policy-contract evidence only** — not Slack/live authorization,
   not gateway ingress, not PostgreSQL claims
 

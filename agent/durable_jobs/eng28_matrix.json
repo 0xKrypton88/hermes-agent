@@ -37,11 +37,12 @@
       "title": "before decision and Go persist/consume",
       "selectors": [
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_crash_before_go_commit_blocks_effect",
-        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_go_persist_then_consume_claim"
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_go_persist_then_consume_claim",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_fault_injection_seams_cannot_authorize_or_bypass"
       ],
       "proof_layer": "PROVEN_LOCAL",
       "status": "GREEN",
-      "notes": "after_decision_rows_before_commit. Uncommitted Go cannot be consumed; ENG-29 claim still requires accepted Go."
+      "notes": "after_decision_rows_before_commit. Uncommitted Go cannot be consumed; ENG-29 claim still requires accepted Go. Default no-op fault-injection seams cannot authorize or bypass."
     },
     {
       "id": 3,
@@ -75,7 +76,7 @@
       ],
       "proof_layer": "PROVEN_LOCAL",
       "status": "GREEN",
-      "notes": "Stateful fake provider only. Live Cursor timeout/5xx/busy is BLOCKED_EXTERNAL and is not counted GREEN."
+      "notes": "http_5xx and busy are parametrized on isolated temp job/action/store. Lookup-first; create_calls==1 each. Stateful fake only. Live Cursor timeout/5xx/busy is BLOCKED_EXTERNAL."
     },
     {
       "id": 6,
@@ -161,11 +162,13 @@
       "selectors": [
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_cross_job_action_rejected_without_ack",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_decision_commits_before_ack",
-        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_crash_after_decision_before_ack_reacks"
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_crash_after_decision_before_ack_reacks",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_idempotency_key_reuse_mismatch_rejects_without_ack_or_decision",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_two_processes_single_inbound_winner"
       ],
       "proof_layer": "PROVEN_LOCAL",
       "status": "GREEN",
-      "notes": "coordinator.consume_inbound_action is a local SQLite seam, not gateway Slack action routing."
+      "notes": "decision_idempotency_key reuse is bound to the persisted inbound tuple. Mismatch rejects with zero ACK/decision mutation. Two-process UNIQUE race reloads the winner. coordinator.consume_inbound_action is a local SQLite seam, not gateway Slack action routing."
     },
     {
       "id": 14,
@@ -253,11 +256,14 @@
       "selectors": [
         "tests/agent/durable_jobs/test_eng29_go_guard.py::test_unknown_unclassified_actions_default_deny_require_go",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_unknown_schema_version_refuses_writes",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_future_schema_version_refuses_writes_without_mutation",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_missing_schema_marker_on_existing_db_fails_closed",
+        "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_empty_db_may_initialize",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_pruned_authorization_key_not_reused"
       ],
       "proof_layer": "PROVEN_LOCAL",
       "status": "GREEN",
-      "notes": "UnknownSchemaError on unparseable/newer schema. prune_authorization_tuple retires the idempotency key. ENG-29 unknown actions still default-deny."
+      "notes": "Empty DB may initialize. Pre-existing durable-jobs schema/data missing schema_version raises UnknownSchemaError before DDL or stamp. Malformed/future versions also refuse without mutation. prune_authorization_tuple retires the idempotency key. ENG-29 unknown actions still default-deny."
     },
     {
       "id": 22,
