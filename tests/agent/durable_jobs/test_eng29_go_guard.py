@@ -903,8 +903,8 @@ def test_slack_post_with_exact_go_succeeds(tmp_path):
 def test_provider_create_rejects_unauthorized_candidate_identity(tmp_path):
     """Cross-candidate replay: default Go must not authorize a different candidate."""
     from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
-    from agent.durable_jobs.eng29 import (
-        AuthorizationDenied,
+    from agent.durable_jobs.eng29 import AuthorizationDenied
+    from tests.agent.durable_jobs.authz_fixtures import (
         install_default_adapter_authorization,
     )
 
@@ -1427,18 +1427,536 @@ def test_slack_recovery_lookup_zero_calls_when_live_policy_dead(tmp_path, defect
     assert _effect_event_types(store, job.job_id) == events_before
 
 
-def test_install_default_adapter_authorization_is_test_only(tmp_path, monkeypatch):
-    from agent.durable_jobs import eng29
+def test_production_modules_expose_no_auto_grant_even_when_pytest_is_spoofed(
+    tmp_path, monkeypatch
+):
+    """Spoofing PYTEST_CURRENT_TEST / pytest must not mint a production Go helper."""
+    import inspect
+    import sys
 
-    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-install-test-only")
-    monkeypatch.setattr(eng29, "_in_test_runtime", lambda: False)
-    with pytest.raises(RuntimeError, match="test-only"):
-        eng29.install_default_adapter_authorization(store.sqlite_path, job.job_id)
+    import agent.durable_jobs.decisions as decisions_mod
+    import agent.durable_jobs.effects as effects_mod
+    import agent.durable_jobs.eng29 as eng29_mod
+    import agent.durable_jobs.slack_contract as slack_mod
+    from agent.durable_jobs.effects import (
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+    from agent.durable_jobs.eng29 import AuthorizationDenied
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "spoofed::test_fake")
+    assert "pytest" in sys.modules
+
+    forbidden_needles = ("install_default", "auto_grant", "auto_auth")
+    for mod in (eng29_mod, effects_mod, slack_mod, decisions_mod):
+        assert not hasattr(mod, "install_default_adapter_authorization")
+        assert not hasattr(mod, "_in_test_runtime")
+        for name, _obj in inspect.getmembers(mod):
+            lowered = name.lower()
+            if any(needle in lowered for needle in forbidden_needles):
+                raise AssertionError(
+                    f"{mod.__name__}.{name} looks like a production auto-grant path"
+                )
+
+    store, job = _make_job(
+        tmp_path, idempotency_key="idem-eng29-spoof-no-auto-grant"
+    )
+    _bind_and_policy(store, job)
+    provider = CountingProvider()
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(ledger, provider, **_provider_kwargs(job))
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert ledger.get_claim(job.job_id, "create_run") is None
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+    slack = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    port = CountingPort()
+    caught.clear()
+    try:
+        deliver_slack_root(slack, port, job_id=job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+    assert port.posts == []
+    assert port.lookup_calls == []
+    persisted = slack.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.BOUND
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+
+# ---------------------------------------------------------------------------
+# Strict allowed_actors_json parsing
+# ---------------------------------------------------------------------------
+
+VALID_ALLOWED_ACTORS = (
+    ('["U-alice"]', ("U-alice",)),
+    ('["  U-alice  "]', ("U-alice",)),
+    ('["U-alice", "U-bob"]', ("U-alice", "U-bob")),
+    ('["U-alice", "  U-bob  "]', ("U-alice", "U-bob")),
+    ("[]", ()),
+)
+
+INVALID_ALLOWED_ACTORS = (
+    1,
+    1.5,
+    True,
+    False,
+    None,
+    ["U-alice"],
+    {"U-alice": True},
+    "",
+    "   ",
+    "1",
+    "1.5",
+    "true",
+    "false",
+    "null",
+    '"U-alice"',
+    '{"U-alice": true}',
+    "[1]",
+    "[1.5]",
+    "[true]",
+    "[false]",
+    "[null]",
+    "[{}]",
+    "[[]]",
+    "not-json",
+    '[""]',
+    '["  "]',
+    '["U-alice", 1]',
+    '["U-alice", true]',
+    '["U-alice", null]',
+    '["U-alice", ""]',
+    '["U-alice", "  "]',
+)
+
+
+@pytest.mark.parametrize("raw,expected", VALID_ALLOWED_ACTORS)
+def test_parse_allowed_actors_accepts_strict_string_lists(raw, expected):
+    from agent.durable_jobs.eng29 import parse_allowed_actors
+
+    assert parse_allowed_actors(raw) == expected
+
+
+@pytest.mark.parametrize("raw", INVALID_ALLOWED_ACTORS)
+def test_parse_allowed_actors_rejects_malformed_elements(raw):
+    from agent.durable_jobs.eng29 import parse_allowed_actors
+
+    assert parse_allowed_actors(raw) is None
+
+
+def test_live_policy_numeric_actor_is_never_stringified(tmp_path):
+    import sqlite3
+
+    from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        PROVIDER_CREATE_TARGET_ACTION,
+        evaluate_authorization,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-actor-numeric")
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            """
+            UPDATE job_authz_policies
+               SET allowed_actors_json = '[1]'
+             WHERE job_id = ?
+            """,
+            (job.job_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    denied = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job)
+    )
+    assert denied.ok is False
+    assert "unauthorized" in denied.reason_codes
+    as_string = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job, actor_id="1")
+    )
+    assert as_string.ok is False
+    assert "unauthorized" in as_string.reason_codes or "mismatch" in as_string.reason_codes
+
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    with pytest.raises(AuthorizationDenied):
+        ledger.claim_effect(**_provider_kwargs(job))
+    assert ledger.get_claim(job.job_id, "create_run") is None
+
+
+def test_live_policy_whitespace_actor_matches_stripped_request(tmp_path):
+    import sqlite3
+
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        evaluate_authorization,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-actor-strip")
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            """
+            UPDATE job_authz_policies
+               SET allowed_actors_json = ?
+             WHERE job_id = ?
+            """,
+            ('["  U-alice  "]', job.job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    allowed = evaluate_authorization(
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job)
+    )
+    assert allowed.ok is True
+
+
+def test_evaluate_authorization_on_conn_sees_uncommitted_policy_delete(tmp_path):
+    import sqlite3
+
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        evaluate_authorization,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-conn-snapshot")
+    decisions = _bind_and_policy(store, job)
+    kwargs = _guard_kwargs(job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    assert evaluate_authorization(sqlite_path=store.sqlite_path, **kwargs).ok is True
+
+    conn = sqlite3.connect(store.sqlite_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.isolation_level = "IMMEDIATE"
+    try:
+        conn.execute(
+            "DELETE FROM job_authz_policies WHERE job_id = ?", (job.job_id,)
+        )
+        denied = evaluate_authorization(conn=conn, **kwargs)
+        assert denied.ok is False
+        assert "unauthorized" in denied.reason_codes
+        still_committed = evaluate_authorization(
+            sqlite_path=store.sqlite_path, **kwargs
+        )
+        assert still_committed.ok is True
+        conn.rollback()
+    finally:
+        conn.close()
+    assert evaluate_authorization(sqlite_path=store.sqlite_path, **kwargs).ok is True
+
+
+# ---------------------------------------------------------------------------
+# Two-connection TOCTOU: validation and mutation share the write lock
+# ---------------------------------------------------------------------------
+
+_TOCTOU_CASES = (
+    ("provider", "claim"),
+    ("provider", "takeover"),
+    ("slack", "claim"),
+    ("slack", "takeover"),
+)
+_POLICY_MUTATIONS = ("delete", "revoke", "change")
+
+
+def _attempt_concurrent_policy_write(
+    sqlite_path, job_id: str, kind: str, *, timeout_s: float = 0.25
+):
+    import sqlite3
+
+    conn = sqlite3.connect(str(sqlite_path), timeout=timeout_s)
+    try:
+        conn.isolation_level = None
+        conn.execute(f"PRAGMA busy_timeout = {int(timeout_s * 1000)}")
+        conn.execute("BEGIN IMMEDIATE")
+        if kind == "delete":
+            conn.execute(
+                "DELETE FROM job_authz_policies WHERE job_id = ?", (job_id,)
+            )
+        elif kind == "revoke":
+            conn.execute(
+                """
+                UPDATE job_authz_policies
+                   SET allowed_actors_json = '[]'
+                 WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+        elif kind == "change":
+            conn.execute(
+                """
+                UPDATE job_authz_policies
+                   SET allowed_actors_json = ?
+                 WHERE job_id = ?
+                """,
+                ('["U-intruder"]', job_id),
+            )
+        else:
+            raise AssertionError(f"unknown policy mutation {kind}")
+        conn.execute("COMMIT")
+        return None
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        return exc
+    finally:
+        conn.close()
+
+
+def _live_policy_actors_json(sqlite_path, job_id: str):
+    import sqlite3
+
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        row = conn.execute(
+            "SELECT allowed_actors_json FROM job_authz_policies WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def _prepare_toctou_path(tmp_path, *, adapter: str, phase: str, suffix: str):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-toctou-{suffix}"
+    )
+    target = (
+        PROVIDER_CREATE_TARGET_ACTION
+        if adapter == "provider"
+        else SLACK_POST_ROOT_TARGET_ACTION
+    )
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(store, job, decisions, target_action=target)
+    clock = FrozenClock()
+    if adapter == "provider":
+        ledger = ProviderEffectLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        )
+        if phase == "takeover":
+            first = ledger.claim_effect(**_provider_kwargs(job))
+            assert first.won is True
+            clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+
+        def run():
+            if phase == "claim":
+                return ledger.claim_effect(**_provider_kwargs(job))
+            return ledger.takeover_stale_claim(job.job_id, "create_run")
+
+        won_event = (
+            "provider_effect_claimed"
+            if phase == "claim"
+            else "provider_effect_claim_taken"
+        )
+    else:
+        ledger = SlackBindingLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        )
+        if phase == "takeover":
+            first = ledger.claim_delivery(job.job_id)
+            assert first.won is True
+            clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+
+        def run():
+            if phase == "claim":
+                return ledger.claim_delivery(job.job_id)
+            return ledger.takeover_stale_delivery(job.job_id)
+
+        won_event = (
+            "slack_root_claimed" if phase == "claim" else "slack_root_claim_taken"
+        )
+    return store, job, ledger, run, won_event
+
+
+def _pause_after_in_transaction_go(monkeypatch):
+    import threading
+
+    from agent.durable_jobs import eng29 as eng29_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def seam():
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("in-transaction Go seam wait exceeded")
+
+    monkeypatch.setattr(eng29_mod, "after_in_transaction_adapter_go", seam)
+    return entered, release
+
+
+@pytest.mark.parametrize("adapter,phase", _TOCTOU_CASES)
+@pytest.mark.parametrize("mutation", _POLICY_MUTATIONS)
+def test_in_transaction_go_blocks_concurrent_policy_mutation(
+    tmp_path, monkeypatch, adapter, phase, mutation
+):
+    import threading
+
+    store, job, ledger, run, won_event = _prepare_toctou_path(
+        tmp_path,
+        adapter=adapter,
+        phase=phase,
+        suffix=f"{adapter}-{phase}-{mutation}",
+    )
+    entered, release = _pause_after_in_transaction_go(monkeypatch)
+    outcome: list[tuple[str, object]] = []
+
+    def worker():
+        try:
+            outcome.append(("ok", run()))
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(("err", exc))
+
+    thread = threading.Thread(target=worker, name="eng29-toctou-worker")
+    thread.start()
+    try:
+        assert entered.wait(timeout=5), "worker never reached in-transaction seam"
+        busy = _attempt_concurrent_policy_write(
+            store.sqlite_path, job.job_id, mutation, timeout_s=0.25
+        )
+        assert busy is not None, "concurrent policy write committed during claim txn"
+        text = str(busy).lower()
+        assert "locked" in text or "busy" in text
+        actors_during = _live_policy_actors_json(store.sqlite_path, job.job_id)
+        assert actors_during is not None
+        assert "U-alice" in actors_during
+        assert "U-intruder" not in actors_during
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive(), "worker deadlocked after seam release"
+    assert outcome and outcome[0][0] == "ok", outcome
+    result = outcome[0][1]
+    assert result.won is True
+    assert won_event in _effect_event_types(store, job.job_id)
+    after_busy = _attempt_concurrent_policy_write(
+        store.sqlite_path, job.job_id, mutation, timeout_s=2.0
+    )
+    assert after_busy is None
+
+
+@pytest.mark.parametrize("adapter,phase", _TOCTOU_CASES)
+def test_in_transaction_go_rollback_persists_no_mutation_or_event(
+    tmp_path, monkeypatch, adapter, phase
+):
+    from agent.durable_jobs import eng29 as eng29_mod
+
+    store, job, ledger, run, won_event = _prepare_toctou_path(
+        tmp_path,
+        adapter=adapter,
+        phase=phase,
+        suffix=f"{adapter}-{phase}-rollback",
+    )
+    events_before = _effect_event_types(store, job.job_id)
+
+    def boom():
+        raise RuntimeError("injected post-validation failure")
+
+    monkeypatch.setattr(eng29_mod, "after_in_transaction_adapter_go", boom)
+    with pytest.raises(RuntimeError, match="injected post-validation failure"):
+        run()
+
+    assert won_event not in _effect_event_types(store, job.job_id)
+    assert _effect_event_types(store, job.job_id) == events_before
+    if adapter == "provider":
+        claim = ledger.get_claim(job.job_id, "create_run")
+        if phase == "claim":
+            assert claim is None
+        else:
+            assert claim is not None
+            assert claim.claim_generation == 1
+    else:
+        binding = ledger.get_binding(job.job_id)
+        assert binding is not None
+        if phase == "claim":
+            from agent.durable_jobs.slack_contract import SlackRootStatus
+
+            assert binding.status is SlackRootStatus.BOUND
+            assert binding.claim_generation == 0
+        else:
+            assert binding.claim_generation == 1
+
+
+@pytest.mark.parametrize("adapter,phase", _TOCTOU_CASES)
+def test_policy_revoke_before_claim_or_takeover_is_denied(
+    tmp_path, adapter, phase
+):
+    import sqlite3
+
+    from agent.durable_jobs.eng29 import AuthorizationDenied
+
+    store, job, ledger, run, won_event = _prepare_toctou_path(
+        tmp_path,
+        adapter=adapter,
+        phase=phase,
+        suffix=f"{adapter}-{phase}-revoke-first",
+    )
+    events_before = _effect_event_types(store, job.job_id)
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            "DELETE FROM job_authz_policies WHERE job_id = ?", (job.job_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(AuthorizationDenied):
+        run()
+    assert won_event not in _effect_event_types(store, job.job_id)
+    assert _effect_event_types(store, job.job_id) == events_before
+    if adapter == "provider" and phase == "claim":
+        assert ledger.get_claim(job.job_id, "create_run") is None
+    if adapter == "slack" and phase == "claim":
+        from agent.durable_jobs.slack_contract import SlackRootStatus
+
+        binding = ledger.get_binding(job.job_id)
+        assert binding is not None
+        assert binding.status is SlackRootStatus.BOUND
 
 
 # ---------------------------------------------------------------------------
 # Schema v7: pre-v7 ENG-29 tuples migrate to blank candidate identity
 # ---------------------------------------------------------------------------
+
 
 _PRE_V7_ENG29_SCHEMA = """
 CREATE TABLE durable_jobs_meta (

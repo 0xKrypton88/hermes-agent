@@ -67,8 +67,15 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   unknown/unclassified default deny
 - Immutable authorization tuple (job, source package/version, candidate SHA,
   environment, target action, actor, expiry, policy/matrix version, replay key)
-- Guard runs before provider/Slack effect claim, recovery lookup, `create_run`,
-  and `post_root`. No deploy/restart adapters are invented
+- Guard runs before provider/Slack effect claim, stale takeover, recovery
+  lookup, `create_run`, and `post_root`. Claim/takeover validation shares the
+  write connection with the mutation; `create_run` / `post_root` / lookup
+  re-check a latest-safe snapshot immediately before the adapter RPC (not
+  atomic with the network call). No deploy/restart adapters are invented
+- `allowed_actors_json` is a JSON list of non-empty strings only (stripped;
+  malformed elements are never stringified)
+- Test fixtures that write default Go live under
+  `tests/agent/durable_jobs/authz_fixtures.py`, not production agent modules
 - **Local policy-contract evidence only** — not Slack/live authorization,
   not gateway ingress, not PostgreSQL claims
 

@@ -72,5 +72,24 @@ Go**. Hold, Cancel, tuple mismatch, expiry, missing prerequisites, or
 unresolved provider ambiguity fail closed: zero new claim persistence and
 zero injected adapter calls.
 
+**Claim / stale takeover atomicity.** Live mandatory-Go validation and the
+durable initial-claim or stale-takeover mutation/event share the caller's
+active SQLite connection (IMMEDIATE write transaction). A concurrent policy
+delete, revoke, expiry, version, or actor change cannot commit between
+validation and the claim/takeover write. Cancellation checks, CAS, exact
+tuple binding, default-deny, and event atomicity are preserved.
+
+**External-call boundary (not atomic).** Recovery lookup, injected
+`create_run`, and injected `post_root` re-run the latest-safe guard on a
+private connection immediately before the adapter call. A SQLite transaction
+cannot be atomic with a network RPC. A policy revoke or Cancel that commits
+after that snapshot may still race an in-flight adapter call; adapters cannot
+abort an outstanding RPC. Bind stays fail-closed.
+
+**Actors.** `allowed_actors_json` must be a JSON list of non-empty strings.
+Each element is stripped; empty or whitespace-only strings, numbers, objects,
+nested arrays, booleans, null, non-list JSON, and malformed JSON default-deny.
+Malformed elements are never stringified.
+
 Terminal Cancel remains authoritative. Existing owner-token / lease / inflight
 fencing is unchanged. This SQLite path does not claim distributed isolation.

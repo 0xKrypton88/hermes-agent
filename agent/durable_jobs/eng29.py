@@ -9,9 +9,7 @@ implemented — those categories are enforced by the classifier and guard.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -445,8 +443,9 @@ def _required_identity_missing(
 
 
 def evaluate_authorization(
-    sqlite_path: SqlitePath,
+    sqlite_path: Optional[SqlitePath] = None,
     *,
+    conn: Optional[sqlite3.Connection] = None,
     job_id: str,
     source_package_id: str,
     source_package_version: str,
@@ -460,7 +459,17 @@ def evaluate_authorization(
     matrix_version: str,
     now_iso: Optional[str] = None,
 ) -> GuardResult:
-    """Exact matching, unexpired ACCEPTED Go. Fail closed otherwise."""
+    """Exact matching, unexpired ACCEPTED Go. Fail closed otherwise.
+
+    When ``conn`` is provided, live policy, tuple, Go, and Cancel checks run
+    on that connection and do not open another. Claim/takeover callers must
+    pass their active write connection so validation and the subsequent
+    mutation share one snapshot. This function never commits, rolls back, or
+    closes a caller-supplied connection.
+
+    ``sqlite_path`` without ``conn`` opens a private connection against the
+    latest committed snapshot. That is not atomic with a later network RPC.
+    """
     if _required_identity_missing(
         job_id=job_id,
         source_package_id=source_package_id,
@@ -475,134 +484,175 @@ def evaluate_authorization(
     ):
         return GuardResult(ok=False, reason_codes=("unauthorized",))
 
-    path = _ensure_store(sqlite_path)
     now = now_iso or utcnow_iso()
     classified = classify_target_action(target_action)
+    kwargs = dict(
+        job_id=job_id,
+        source_package_id=source_package_id,
+        source_package_version=source_package_version,
+        candidate_sha=candidate_sha,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
+        target_environment=target_environment,
+        target_action=target_action,
+        actor_id=actor_id,
+        policy_version=policy_version,
+        matrix_version=matrix_version,
+        now=now,
+        classified=classified,
+    )
+    if conn is not None:
+        result = _evaluate_authorization_on_conn(conn, **kwargs)
+    else:
+        if sqlite_path is None:
+            raise TypeError("evaluate_authorization requires sqlite_path or conn")
+        path = _ensure_store(sqlite_path)
+        with _connect(path) as owned:
+            result = _evaluate_authorization_on_conn(owned, **kwargs)
+    if result.ok:
+        _ = classified.require_go  # unknown/mandatory always require Go
+    return result
 
-    with _connect(path) as conn:
-        job_row = conn.execute(
-            "SELECT 1 FROM durable_jobs WHERE job_id = ?",
-            (job_id,),
-        ).fetchone()
-        if job_row is None:
-            return GuardResult(ok=False, reason_codes=("unauthorized",))
 
-        canceled = conn.execute(
+def _evaluate_authorization_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    source_package_id: str,
+    source_package_version: str,
+    candidate_sha: str,
+    candidate_id: str,
+    candidate_version: str,
+    target_environment: str,
+    target_action: str,
+    actor_id: str,
+    policy_version: str,
+    matrix_version: str,
+    now: str,
+    classified: Classification,
+) -> GuardResult:
+    job_row = conn.execute(
+        "SELECT 1 FROM durable_jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    if job_row is None:
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+
+    canceled = conn.execute(
+        """
+        SELECT 1 FROM job_decisions
+         WHERE job_id = ? AND decision_type = 'cancel'
+           AND status IN ('accepted', 'duplicate')
+         LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    if canceled is not None:
+        return GuardResult(ok=False, reason_codes=("canceled",))
+
+    latest = conn.execute(
+        """
+        SELECT * FROM job_decisions
+         WHERE job_id = ? AND status = 'accepted'
+         ORDER BY created_at DESC, decision_id DESC
+         LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    if latest is not None and latest["decision_type"] == DecisionType.HOLD.value:
+        return GuardResult(ok=False, reason_codes=("hold",))
+
+    live_denial = _live_policy_denial(
+        _load_live_policy_row(conn, job_id),
+        actor_id=actor_id,
+        policy_version=policy_version,
+        now=now,
+    )
+    if live_denial is not None:
+        return live_denial
+
+    tup = _fetch_tuple_by_job_action(conn, job_id, target_action)
+    if tup is None:
+        any_tuple = conn.execute(
             """
-            SELECT 1 FROM job_decisions
-             WHERE job_id = ? AND decision_type = 'cancel'
-               AND status IN ('accepted', 'duplicate')
-             LIMIT 1
+            SELECT 1 FROM job_authorization_tuples
+             WHERE job_id = ? LIMIT 1
             """,
             (job_id,),
         ).fetchone()
-        if canceled is not None:
-            return GuardResult(ok=False, reason_codes=("canceled",))
-
-        latest = conn.execute(
-            """
-            SELECT * FROM job_decisions
-             WHERE job_id = ? AND status = 'accepted'
-             ORDER BY created_at DESC, decision_id DESC
-             LIMIT 1
-            """,
-            (job_id,),
-        ).fetchone()
-        if latest is not None and latest["decision_type"] == DecisionType.HOLD.value:
-            return GuardResult(ok=False, reason_codes=("hold",))
-
-        live_denial = _live_policy_denial(
-            _load_live_policy_row(conn, job_id),
-            actor_id=actor_id,
-            policy_version=policy_version,
-            now=now,
-        )
-        if live_denial is not None:
-            return live_denial
-
-        tup = _fetch_tuple_by_job_action(conn, job_id, target_action)
-        if tup is None:
-            any_tuple = conn.execute(
-                """
-                SELECT 1 FROM job_authorization_tuples
-                 WHERE job_id = ? LIMIT 1
-                """,
-                (job_id,),
-            ).fetchone()
-            if any_tuple is not None:
-                return GuardResult(ok=False, reason_codes=("mismatch",))
-            return GuardResult(ok=False, reason_codes=("no_go",))
-
-        mismatches = (
-            tup.source_package_id != source_package_id,
-            tup.source_package_version != source_package_version,
-            tup.candidate_sha != candidate_sha,
-            tup.candidate_id != candidate_id,
-            tup.candidate_version != candidate_version,
-            tup.target_environment != target_environment,
-            tup.target_action != target_action,
-            tup.authorized_actor != actor_id,
-            tup.policy_version != policy_version,
-            tup.matrix_version != matrix_version,
-        )
-        if any(mismatches):
+        if any_tuple is not None:
             return GuardResult(ok=False, reason_codes=("mismatch",))
+        return GuardResult(ok=False, reason_codes=("no_go",))
 
-        try:
-            if parse_iso(tup.expires_at) <= parse_iso(now):
-                return GuardResult(ok=False, reason_codes=("expired",))
-        except ValueError:
+    mismatches = (
+        tup.source_package_id != source_package_id,
+        tup.source_package_version != source_package_version,
+        tup.candidate_sha != candidate_sha,
+        tup.candidate_id != candidate_id,
+        tup.candidate_version != candidate_version,
+        tup.target_environment != target_environment,
+        tup.target_action != target_action,
+        tup.authorized_actor != actor_id,
+        tup.policy_version != policy_version,
+        tup.matrix_version != matrix_version,
+    )
+    if any(mismatches):
+        return GuardResult(ok=False, reason_codes=("mismatch",))
+
+    try:
+        if parse_iso(tup.expires_at) <= parse_iso(now):
             return GuardResult(ok=False, reason_codes=("expired",))
+    except ValueError:
+        return GuardResult(ok=False, reason_codes=("expired",))
 
-        if classified.category == "missing_prerequisites" and not (
-            tup.prerequisites_satisfied
+    if classified.category == "missing_prerequisites" and not (
+        tup.prerequisites_satisfied
+    ):
+        return GuardResult(
+            ok=False, reason_codes=("missing_prerequisites",)
+        )
+    if classified.category == "unresolved_provider_ambiguity" and not (
+        tup.provider_ambiguity_resolved
+    ):
+        return GuardResult(
+            ok=False, reason_codes=("unresolved_provider_ambiguity",)
+        )
+
+    go_rows = conn.execute(
+        """
+        SELECT * FROM job_decisions
+         WHERE job_id = ? AND decision_type = 'go' AND status = 'accepted'
+         ORDER BY created_at DESC, decision_id DESC
+        """,
+        (job_id,),
+    ).fetchall()
+    matching_go = False
+    for row in go_rows:
+        if (
+            row["actor_id"] == actor_id
+            and row["policy_version"] == policy_version
+            and _optional_text(row, "source_package_id") == source_package_id
+            and _optional_text(row, "source_package_version")
+            == source_package_version
+            and _optional_text(row, "candidate_sha") == candidate_sha
+            and _optional_text(row, "candidate_id") == candidate_id
+            and _optional_text(row, "candidate_version") == candidate_version
+            and _optional_text(row, "target_environment")
+            == target_environment
+            and _optional_text(row, "target_action") == target_action
+            and _optional_text(row, "matrix_version") == matrix_version
         ):
-            return GuardResult(
-                ok=False, reason_codes=("missing_prerequisites",)
-            )
-        if classified.category == "unresolved_provider_ambiguity" and not (
-            tup.provider_ambiguity_resolved
-        ):
-            return GuardResult(
-                ok=False, reason_codes=("unresolved_provider_ambiguity",)
-            )
-
-        go_rows = conn.execute(
-            """
-            SELECT * FROM job_decisions
-             WHERE job_id = ? AND decision_type = 'go' AND status = 'accepted'
-             ORDER BY created_at DESC, decision_id DESC
-            """,
-            (job_id,),
-        ).fetchall()
-        matching_go = False
-        for row in go_rows:
-            if (
-                row["actor_id"] == actor_id
-                and row["policy_version"] == policy_version
-                and _optional_text(row, "source_package_id") == source_package_id
-                and _optional_text(row, "source_package_version")
-                == source_package_version
-                and _optional_text(row, "candidate_sha") == candidate_sha
-                and _optional_text(row, "candidate_id") == candidate_id
-                and _optional_text(row, "candidate_version") == candidate_version
-                and _optional_text(row, "target_environment")
-                == target_environment
-                and _optional_text(row, "target_action") == target_action
-                and _optional_text(row, "matrix_version") == matrix_version
-            ):
-                matching_go = True
-                break
-        if not matching_go:
-            return GuardResult(ok=False, reason_codes=("no_go",))
-
-    _ = classified.require_go  # unknown/mandatory always require Go
+            matching_go = True
+            break
+    if not matching_go:
+        return GuardResult(ok=False, reason_codes=("no_go",))
     return GuardResult(ok=True, reason_codes=())
 
 
 def raise_unless_authorized_go(
-    sqlite_path: SqlitePath,
+    sqlite_path: Optional[SqlitePath] = None,
     *,
+    conn: Optional[sqlite3.Connection] = None,
     job_id: str,
     source_package_id: str,
     source_package_version: str,
@@ -619,6 +669,7 @@ def raise_unless_authorized_go(
 ) -> GuardResult:
     result = evaluate_authorization(
         sqlite_path,
+        conn=conn,
         job_id=job_id,
         source_package_id=source_package_id,
         source_package_version=source_package_version,
@@ -650,14 +701,34 @@ def _load_live_policy_row(
     ).fetchone()
 
 
-def _parse_allowed_actors(raw: object) -> Optional[tuple[str, ...]]:
+def parse_allowed_actors(raw: object) -> Optional[tuple[str, ...]]:
+    """Parse ``allowed_actors_json`` as a JSON list of non-empty strings.
+
+    Whitespace: each element must be a JSON string; it is stripped. Empty or
+    whitespace-only strings are malformed. Numbers, objects, nested arrays,
+    booleans, and null are malformed and are never stringified. ``raw`` itself
+    must be a ``str``; malformed JSON or a non-list JSON value is malformed.
+
+    A well-formed empty list ``[]`` parses to ``()`` (authorizes nobody).
+    Returns ``None`` when malformed.
+    """
+    if not isinstance(raw, str):
+        return None
     try:
-        actors = json.loads(raw or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
+        actors = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
         return None
     if not isinstance(actors, list):
         return None
-    return tuple("" if item is None else str(item) for item in actors)
+    parsed: list[str] = []
+    for item in actors:
+        if not isinstance(item, str):
+            return None
+        stripped = item.strip()
+        if not stripped:
+            return None
+        parsed.append(stripped)
+    return tuple(parsed)
 
 
 def _live_policy_denial(
@@ -687,15 +758,14 @@ def _live_policy_denial(
     if live_version != str(policy_version).strip():
         return GuardResult(ok=False, reason_codes=("mismatch",))
 
-    actors = _parse_allowed_actors(
+    actors = parse_allowed_actors(
         row["allowed_actors_json"] if "allowed_actors_json" in row.keys() else None
     )
     if actors is None:
         return GuardResult(ok=False, reason_codes=("unauthorized",))
-    allowed = tuple(actor for actor in actors if str(actor).strip())
-    if not allowed:
+    if not actors:
         return GuardResult(ok=False, reason_codes=("unauthorized",))
-    if actor_id not in allowed:
+    if str(actor_id).strip() not in actors:
         return GuardResult(ok=False, reason_codes=("unauthorized",))
 
     expires_at = row["expires_at"] if "expires_at" in row.keys() else None
@@ -716,23 +786,28 @@ def _live_policy_actor(
     if row is None:
         return "", ""
     policy_version = str(row["policy_version"] or "")
-    actors = _parse_allowed_actors(
+    actors = parse_allowed_actors(
         row["allowed_actors_json"] if "allowed_actors_json" in row.keys() else None
     )
     if actors is None or not actors:
         return "", policy_version
-    return str(actors[0] or ""), policy_version
+    return actors[0], policy_version
 
 
-def _in_test_runtime() -> bool:
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        return True
-    return "pytest" in sys.modules
+def after_in_transaction_adapter_go() -> None:
+    """Test seam after in-transaction Go validation, before claim mutation.
+
+    Production is a no-op. Claim and stale-takeover callers invoke this while
+    still holding the write connection so tests can prove a concurrent policy
+    revoke/delete/change cannot commit between validation and mutation.
+    """
+    return None
 
 
 def raise_unless_adapter_go(
-    sqlite_path: SqlitePath,
+    sqlite_path: Optional[SqlitePath] = None,
     *,
+    conn: Optional[sqlite3.Connection] = None,
     job_id: str,
     target_action: str,
     candidate_id: str,
@@ -745,6 +820,18 @@ def raise_unless_adapter_go(
     Identity is derived from the job row, live policy, and the caller-supplied
     candidate/version. Hardcoded DEFAULT_* values and the stored tuple actor
     are never used as the requested identity.
+
+    When ``conn`` is provided, identity load and live Go validation run on
+    that connection and do not open another, call ``_ensure_store``, commit,
+    or close it. Durable initial claim and stale takeover must pass their
+    active IMMEDIATE write connection so validation and the subsequent
+    mutation/event share one snapshot and one write lock.
+
+    When only ``sqlite_path`` is provided, this function opens its own
+    connection and checks the latest committed snapshot. That check is not
+    atomic with a subsequent network RPC (injected ``create_run``,
+    ``post_root``, or recovery lookup). A SQLite transaction cannot span
+    that boundary.
     """
     denied = GuardResult(ok=False, reason_codes=("unauthorized",))
     if not (
@@ -755,25 +842,58 @@ def raise_unless_adapter_go(
     ):
         raise AuthorizationDenied(denied.reason_codes)
 
-    path = _ensure_store(sqlite_path)
-    with _connect(path) as conn:
-        job_row = conn.execute(
-            "SELECT * FROM durable_jobs WHERE job_id = ?",
-            (job_id,),
-        ).fetchone()
-        if job_row is None:
-            raise AuthorizationDenied(denied.reason_codes)
-        source_package_id = str(job_row["repository_identity"] or "")
-        candidate_sha = (
-            ""
-            if job_row["frozen_baseline_sha"] is None
-            else str(job_row["frozen_baseline_sha"])
+    if conn is not None:
+        return _raise_unless_adapter_go_on_conn(
+            conn,
+            job_id=job_id,
+            target_action=target_action,
+            candidate_id=candidate_id,
+            candidate_version=candidate_version,
+            now_iso=now_iso,
+            action=action,
         )
-        target_environment = str(job_row["origin_platform"] or "")
-        actor_id, policy_version = _live_policy_actor(conn, job_id)
+    if sqlite_path is None:
+        raise TypeError("raise_unless_adapter_go requires sqlite_path or conn")
+    path = _ensure_store(sqlite_path)
+    with _connect(path) as owned:
+        return _raise_unless_adapter_go_on_conn(
+            owned,
+            job_id=job_id,
+            target_action=target_action,
+            candidate_id=candidate_id,
+            candidate_version=candidate_version,
+            now_iso=now_iso,
+            action=action,
+        )
 
+
+def _raise_unless_adapter_go_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    target_action: str,
+    candidate_id: str,
+    candidate_version: str,
+    now_iso: Optional[str],
+    action: str,
+) -> GuardResult:
+    denied = GuardResult(ok=False, reason_codes=("unauthorized",))
+    job_row = conn.execute(
+        "SELECT * FROM durable_jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    if job_row is None:
+        raise AuthorizationDenied(denied.reason_codes)
+    source_package_id = str(job_row["repository_identity"] or "")
+    candidate_sha = (
+        ""
+        if job_row["frozen_baseline_sha"] is None
+        else str(job_row["frozen_baseline_sha"])
+    )
+    target_environment = str(job_row["origin_platform"] or "")
+    actor_id, policy_version = _live_policy_actor(conn, job_id)
     return raise_unless_authorized_go(
-        path,
+        conn=conn,
         job_id=job_id,
         source_package_id=source_package_id,
         source_package_version=str(candidate_version).strip(),
@@ -788,105 +908,3 @@ def raise_unless_adapter_go(
         now_iso=now_iso,
         action=action,
     )
-
-
-def install_default_adapter_authorization(
-    sqlite_path: SqlitePath, job_id: str
-) -> None:
-    """Grant exact Go for provider create + Slack post_root from job+binding.
-
-    Used by existing effect/fencing fixtures so they keep exercising claim
-    fencing after ENG-29. Derives the immutable tuple from the job row and
-    Slack binding (or binds cand-1/v1 when none exists). ENG-29 no-Go tests
-    must not call this. Production adapter paths never call this helper;
-    it is test-only and raises outside a pytest runtime.
-    """
-    if not _in_test_runtime():
-        raise RuntimeError(
-            "install_default_adapter_authorization is test-only and "
-            "unreachable in production runtime"
-        )
-    from agent.durable_jobs.decisions import DecisionLedger
-    from agent.durable_jobs.slack_contract import BindingConflict, SlackBindingLedger
-
-    path = _ensure_store(sqlite_path)
-    jobs = DurableJobStore(sqlite_path=path)
-    job = jobs.get_job(job_id)
-    if job is None:
-        return
-
-    slack = SlackBindingLedger(sqlite_path=path)
-    bound = slack.get_binding(job_id)
-    if bound is None:
-        try:
-            slack.bind(
-                job_id=job_id,
-                workspace_id="T1",
-                channel_id="C123",
-                root_thread_ts="111.222",
-                candidate_id="cand-1",
-                candidate_version="v1",
-            )
-        except BindingConflict:
-            return
-        bound = slack.get_binding(job_id)
-    if bound is None:
-        return
-
-    decisions = DecisionLedger(sqlite_path=path)
-    with _connect(path) as conn:
-        policy_row = conn.execute(
-            "SELECT 1 FROM job_authz_policies WHERE job_id = ?",
-            (job_id,),
-        ).fetchone()
-    if policy_row is None:
-        decisions.set_policy(
-            job_id=job_id,
-            policy_version="pol-1",
-            allowed_actors=("U-alice",),
-            expires_at="2099-01-01T00:00:00+00:00",
-        )
-
-    with _connect(path) as conn:
-        actor_id, policy_version = _live_policy_actor(conn, job_id)
-    if not str(actor_id).strip() or not str(policy_version).strip():
-        return
-
-    expires_at = "2099-01-01T00:00:00+00:00"
-    for target_action in (
-        PROVIDER_CREATE_TARGET_ACTION,
-        SLACK_POST_ROOT_TARGET_ACTION,
-    ):
-        register_authorization_tuple(
-            path,
-            job_id=job_id,
-            source_package_id=job.repository_identity,
-            source_package_version=bound.candidate_version,
-            candidate_sha=job.frozen_baseline_sha,
-            candidate_id=bound.candidate_id,
-            candidate_version=bound.candidate_version,
-            target_environment=job.origin_platform,
-            target_action=target_action,
-            authorized_actor=actor_id,
-            expires_at=expires_at,
-            policy_version=policy_version,
-            matrix_version=MATRIX_VERSION,
-            authorization_idempotency_key=f"tuple:{job_id}:{target_action}",
-            prerequisites_satisfied=True,
-            provider_ambiguity_resolved=True,
-        )
-        decisions.record_decision(
-            job_id=job_id,
-            decision_type="go",
-            candidate_id=bound.candidate_id,
-            candidate_version=bound.candidate_version,
-            actor_id=actor_id,
-            policy_version=policy_version,
-            decision_idempotency_key=f"go:{job_id}:{target_action}",
-            source_package_id=job.repository_identity,
-            source_package_version=bound.candidate_version,
-            candidate_sha=job.frozen_baseline_sha,
-            target_environment=job.origin_platform,
-            target_action=target_action,
-            matrix_version=MATRIX_VERSION,
-        )

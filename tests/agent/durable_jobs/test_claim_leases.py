@@ -38,7 +38,9 @@ def _make_job(tmp_path: Path, *, idempotency_key: str = "idem-lease"):
         repository_identity="github.com/example/repo",
         idempotency_key=idempotency_key,
     )
-    from agent.durable_jobs.eng29 import install_default_adapter_authorization
+    from tests.agent.durable_jobs.authz_fixtures import (
+        install_default_adapter_authorization,
+    )
 
     install_default_adapter_authorization(store.sqlite_path, job.job_id)
     return store, job
@@ -638,7 +640,9 @@ def test_reopen_candidate_v2_db_evolves_lease_columns_null_expiry_is_stale(tmp_p
     assert "claim_owner_token" not in before
 
     DurableJobStore(sqlite_path=path)
-    from agent.durable_jobs.eng29 import install_default_adapter_authorization
+    from tests.agent.durable_jobs.authz_fixtures import (
+        install_default_adapter_authorization,
+    )
 
     install_default_adapter_authorization(path, "dj_v2legacy")
     after_provider = _table_columns(path, "provider_effect_claims")

@@ -184,21 +184,6 @@ class ProviderEffectLedger:
         )
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
-        if self.get_claim(job_id, action_id) is None:
-            from agent.durable_jobs.eng29 import (
-                PROVIDER_CREATE_TARGET_ACTION,
-                raise_unless_adapter_go,
-            )
-
-            raise_unless_adapter_go(
-                self.sqlite_path,
-                job_id=job_id,
-                target_action=PROVIDER_CREATE_TARGET_ACTION,
-                candidate_id=candidate_id,
-                candidate_version=candidate_version,
-                now_iso=now,
-                action="provider claim",
-            )
         with self._connect() as conn:
             existing = conn.execute(
                 """
@@ -220,6 +205,23 @@ class ProviderEffectLedger:
                 raise JobCanceledError(
                     f"job {job_id} is canceled; refusing provider claim {action_id}"
                 )
+
+            from agent.durable_jobs.eng29 import (
+                PROVIDER_CREATE_TARGET_ACTION,
+                after_in_transaction_adapter_go,
+                raise_unless_adapter_go,
+            )
+
+            raise_unless_adapter_go(
+                conn=conn,
+                job_id=job_id,
+                target_action=PROVIDER_CREATE_TARGET_ACTION,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
+                now_iso=now,
+                action="provider claim",
+            )
+            after_in_transaction_adapter_go()
 
             mapping = conn.execute(
                 "SELECT * FROM provider_job_mappings WHERE job_id = ?",
@@ -343,11 +345,12 @@ class ProviderEffectLedger:
                 return ClaimResult(claim=claim, won=False)
             from agent.durable_jobs.eng29 import (
                 PROVIDER_CREATE_TARGET_ACTION,
+                after_in_transaction_adapter_go,
                 raise_unless_adapter_go,
             )
 
             raise_unless_adapter_go(
-                self.sqlite_path,
+                conn=conn,
                 job_id=job_id,
                 target_action=PROVIDER_CREATE_TARGET_ACTION,
                 candidate_id=claim.candidate_id,
@@ -355,6 +358,7 @@ class ProviderEffectLedger:
                 now_iso=now,
                 action="provider stale takeover",
             )
+            after_in_transaction_adapter_go()
             cur = conn.execute(
                 """
                 UPDATE provider_effect_claims
@@ -1104,9 +1108,11 @@ def reconcile_cursor_create(
         return current if current is not None else claim
 
     try:
-        # Latest committed-Cancel SELECT before the adapter call. If Cancel
-        # commits after this check, create_run may still execute; adapters
-        # cannot abort an outstanding RPC. Bind stays fail-closed.
+        # Latest-safe Cancel + Go SELECT before the adapter RPC. A Cancel
+        # or policy revoke that commits after this check may still race the
+        # in-flight create_run; a SQLite transaction cannot be atomic with a
+        # network call. Claim/takeover validation stays on the write
+        # connection. Bind stays fail-closed.
         raise_if_job_canceled(
             ledger.sqlite_path, job_id, action="provider create_run"
         )
@@ -1265,6 +1271,8 @@ def _recover_claimed_provider(
         raise_unless_adapter_go,
     )
 
+    # Latest-safe Go snapshot before recovery lookup. Not atomic with the
+    # subsequent adapter RPC.
     raise_unless_adapter_go(
         ledger.sqlite_path,
         job_id=claim.job_id,

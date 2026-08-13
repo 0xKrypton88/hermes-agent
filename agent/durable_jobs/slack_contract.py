@@ -377,20 +377,6 @@ class SlackBindingLedger:
             raise BindingRequiredError(f"no Slack binding for {job_id}")
         if peeked.status is not SlackRootStatus.BOUND:
             return DeliveryClaimResult(binding=peeked, won=False)
-        from agent.durable_jobs.eng29 import (
-            SLACK_POST_ROOT_TARGET_ACTION,
-            raise_unless_adapter_go,
-        )
-
-        raise_unless_adapter_go(
-            self.sqlite_path,
-            job_id=job_id,
-            target_action=SLACK_POST_ROOT_TARGET_ACTION,
-            candidate_id=peeked.candidate_id,
-            candidate_version=peeked.candidate_version,
-            now_iso=now,
-            action="slack delivery claim",
-        )
         with self._connect() as conn:
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
@@ -410,6 +396,22 @@ class SlackBindingLedger:
                 raise JobCanceledError(
                     f"job {job_id} is canceled; refusing Slack delivery claim"
                 )
+            from agent.durable_jobs.eng29 import (
+                SLACK_POST_ROOT_TARGET_ACTION,
+                after_in_transaction_adapter_go,
+                raise_unless_adapter_go,
+            )
+
+            raise_unless_adapter_go(
+                conn=conn,
+                job_id=job_id,
+                target_action=SLACK_POST_ROOT_TARGET_ACTION,
+                candidate_id=binding.candidate_id,
+                candidate_version=binding.candidate_version,
+                now_iso=now,
+                action="slack delivery claim",
+            )
+            after_in_transaction_adapter_go()
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
@@ -488,11 +490,12 @@ class SlackBindingLedger:
                 return DeliveryClaimResult(binding=binding, won=False)
             from agent.durable_jobs.eng29 import (
                 SLACK_POST_ROOT_TARGET_ACTION,
+                after_in_transaction_adapter_go,
                 raise_unless_adapter_go,
             )
 
             raise_unless_adapter_go(
-                self.sqlite_path,
+                conn=conn,
                 job_id=job_id,
                 target_action=SLACK_POST_ROOT_TARGET_ACTION,
                 candidate_id=binding.candidate_id,
@@ -500,6 +503,7 @@ class SlackBindingLedger:
                 now_iso=now,
                 action="slack stale takeover",
             )
+            after_in_transaction_adapter_go()
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
@@ -1095,9 +1099,11 @@ def deliver_slack_root(
         return current if current is not None else binding
 
     try:
-        # Latest committed-Cancel SELECT before the adapter call. If Cancel
-        # commits after this check, post_root may still execute; adapters
-        # cannot abort an outstanding RPC. Bind stays fail-closed.
+        # Latest-safe Cancel + Go SELECT before the adapter RPC. A Cancel
+        # or policy revoke that commits after this check may still race the
+        # in-flight post_root; a SQLite transaction cannot be atomic with a
+        # network call. Claim/takeover validation stays on the write
+        # connection. Bind stays fail-closed.
         raise_if_job_canceled(
             ledger.sqlite_path, job_id, action="slack post_root"
         )
@@ -1225,6 +1231,8 @@ def _lookup_slack_root(
         raise_unless_adapter_go,
     )
 
+    # Latest-safe Go snapshot before recovery lookup. Not atomic with the
+    # subsequent adapter RPC.
     raise_unless_adapter_go(
         ledger.sqlite_path,
         job_id=binding.job_id,

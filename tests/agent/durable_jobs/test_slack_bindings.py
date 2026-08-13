@@ -33,7 +33,9 @@ def _make_job(
         idempotency_key=idempotency_key,
     )
     if authorize:
-        from agent.durable_jobs.eng29 import install_default_adapter_authorization
+        from tests.agent.durable_jobs.authz_fixtures import (
+            install_default_adapter_authorization,
+        )
 
         install_default_adapter_authorization(store.sqlite_path, job.job_id)
     return store, job
