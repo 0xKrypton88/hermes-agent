@@ -76,10 +76,21 @@ zero injected adapter calls.
 durable initial-claim or stale-takeover mutation/event share the caller's
 active SQLite connection. Callers issue `BEGIN IMMEDIATE` before validation
 because Python's sqlite3 module does not open an IMMEDIATE transaction on
-SELECT. The write lock is therefore held across live Go checks and the
-claim/takeover mutation, so a concurrent policy delete, revoke, expiry,
-version, or actor change cannot commit between them. Cancellation checks,
-CAS, exact tuple binding, default-deny, and event atomicity are preserved.
+SELECT. Authorization and lease `now` is sampled only after that lock
+acquisition succeeds, so a `busy_timeout` wait cannot keep a pre-wait
+clock that would authorize an already-expired live policy or tuple.
+The write lock is held across live Go checks and the claim/takeover
+mutation, so a concurrent policy delete, revoke, expiry, version, or actor
+change cannot commit between them. Cancellation checks, CAS, exact tuple
+binding, default-deny, and event atomicity are preserved.
+
+**Actors.** `allowed_actors_json` must be a JSON list of non-empty strings.
+Each element is stripped; empty or whitespace-only strings, numbers, objects,
+nested arrays, booleans, null, non-list JSON, and malformed JSON default-deny.
+Malformed elements are never stringified. `DecisionLedger.set_policy`
+rejects the same malformed containers and members at writer ingress
+(`InvalidAllowedActorsError`) before any policy row or `job_authz_policy_set`
+event. Stored actor strings are stripped so writer and parser agree.
 
 **External-call boundary (not atomic).** Recovery lookup, injected
 `create_run`, and injected `post_root` re-run the latest-safe guard on a
@@ -87,11 +98,6 @@ private connection immediately before the adapter call. A SQLite transaction
 cannot be atomic with a network RPC. A policy revoke or Cancel that commits
 after that snapshot may still race an in-flight adapter call; adapters cannot
 abort an outstanding RPC. Bind stays fail-closed.
-
-**Actors.** `allowed_actors_json` must be a JSON list of non-empty strings.
-Each element is stripped; empty or whitespace-only strings, numbers, objects,
-nested arrays, booleans, null, non-list JSON, and malformed JSON default-deny.
-Malformed elements are never stringified.
 
 Terminal Cancel remains authoritative. Existing owner-token / lease / inflight
 fencing is unchanged. This SQLite path does not claim distributed isolation.

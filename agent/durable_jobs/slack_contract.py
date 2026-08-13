@@ -369,19 +369,20 @@ class SlackBindingLedger:
 
     def claim_delivery(self, job_id: str) -> DeliveryClaimResult:
         """CAS BOUND → CLAIMED with owner token + lease. Concurrent losers must not post."""
-        now = self._now()
         owner_token = uuid.uuid4().hex
-        expires_at = add_seconds_iso(now, self._lease_seconds)
         peeked = self.get_binding(job_id)
         if peeked is None:
             raise BindingRequiredError(f"no Slack binding for {job_id}")
         if peeked.status is not SlackRootStatus.BOUND:
             return DeliveryClaimResult(binding=peeked, won=False)
         with self._connect() as conn:
+            from agent.durable_jobs.eng29 import begin_immediate_write
+
             # Python sqlite3 does not BEGIN on SELECT. Take the write lock
-            # before live Go validation so a concurrent policy change cannot
-            # commit between check and mutation.
-            conn.execute("BEGIN IMMEDIATE")
+            # before sampling now so expiry cannot race a busy_timeout wait.
+            begin_immediate_write(conn)
+            now = self._now()
+            expires_at = add_seconds_iso(now, self._lease_seconds)
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
                 (job_id,),
@@ -470,14 +471,15 @@ class SlackBindingLedger:
         Mints a new owner token. Unexpired → poll. RECOVERING keeps its
         recovery window; the new owner starts attempt bookkeeping at 0.
         """
-        now = self._now()
         owner_token = uuid.uuid4().hex
-        expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            from agent.durable_jobs.eng29 import begin_immediate_write
+
             # Python sqlite3 does not BEGIN on SELECT. Take the write lock
-            # before live Go validation so a concurrent policy change cannot
-            # commit between check and mutation.
-            conn.execute("BEGIN IMMEDIATE")
+            # before sampling now so expiry cannot race a busy_timeout wait.
+            begin_immediate_write(conn)
+            now = self._now()
+            expires_at = add_seconds_iso(now, self._lease_seconds)
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
                 (job_id,),

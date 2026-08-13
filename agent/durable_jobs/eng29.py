@@ -804,6 +804,26 @@ def after_in_transaction_adapter_go() -> None:
     return None
 
 
+def before_begin_immediate() -> None:
+    """Test seam immediately before BEGIN IMMEDIATE on claim/takeover.
+
+    Production is a no-op. Tests use it to prove a waiter reached pre-lock
+    timing while authorization was still valid, then expire policy/tuple
+    during the lock wait.
+    """
+    return None
+
+
+def begin_immediate_write(conn: sqlite3.Connection) -> None:
+    """Acquire the SQLite write lock for claim/takeover.
+
+    Python sqlite3 does not BEGIN on SELECT. Callers must sample
+    authorization and lease time only after this returns.
+    """
+    before_begin_immediate()
+    conn.execute("BEGIN IMMEDIATE")
+
+
 def raise_unless_adapter_go(
     sqlite_path: Optional[SqlitePath] = None,
     *,

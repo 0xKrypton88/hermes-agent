@@ -173,7 +173,6 @@ class ProviderEffectLedger:
         job = self._jobs.get_job(job_id)
         if job is None:
             raise KeyError(f"unknown job_id: {job_id}")
-        now = self._now()
         key = provider_idempotency_key(job_id, action_id)
         snapshot = (
             origin_platform,
@@ -183,12 +182,14 @@ class ProviderEffectLedger:
             candidate_version,
         )
         owner_token = uuid.uuid4().hex
-        expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            from agent.durable_jobs.eng29 import begin_immediate_write
+
             # Python sqlite3 does not BEGIN on SELECT. Take the write lock
-            # before live Go validation so a concurrent policy change cannot
-            # commit between check and mutation.
-            conn.execute("BEGIN IMMEDIATE")
+            # before sampling now so expiry cannot race a busy_timeout wait.
+            begin_immediate_write(conn)
+            now = self._now()
+            expires_at = add_seconds_iso(now, self._lease_seconds)
             existing = conn.execute(
                 """
                 SELECT * FROM provider_effect_claims
@@ -325,14 +326,15 @@ class ProviderEffectLedger:
         Mints a new owner token. Unexpired → poll. RECOVERING keeps its
         recovery window; the new owner starts attempt bookkeeping at 0.
         """
-        now = self._now()
         owner_token = uuid.uuid4().hex
-        expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            from agent.durable_jobs.eng29 import begin_immediate_write
+
             # Python sqlite3 does not BEGIN on SELECT. Take the write lock
-            # before live Go validation so a concurrent policy change cannot
-            # commit between check and mutation.
-            conn.execute("BEGIN IMMEDIATE")
+            # before sampling now so expiry cannot race a busy_timeout wait.
+            begin_immediate_write(conn)
+            now = self._now()
+            expires_at = add_seconds_iso(now, self._lease_seconds)
             current = conn.execute(
                 """
                 SELECT * FROM provider_effect_claims

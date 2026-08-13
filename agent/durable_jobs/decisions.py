@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -90,6 +91,65 @@ class JobCanceledError(RuntimeError):
     """
 
 
+class InvalidAllowedActorsError(ValueError):
+    """Writer ingress rejected allowed_actors; no policy row or event is stored."""
+
+
+def normalize_allowed_actors(allowed_actors: object) -> tuple[str, ...]:
+    """Require a non-string sequence of non-empty strings; store stripped forms.
+
+    ``str`` / ``bytes`` / ``bytearray`` are rejected as the container (a
+    string is a sequence of characters). Every member must be a ``str``.
+    Numbers, bools, ``None``, mappings, nested sequences, bytes, and
+    empty or whitespace-only strings are rejected and never coerced with
+    ``str()``. A well-formed empty sequence stores ``()`` (authorizes
+    nobody). Members are stripped so writer storage matches
+    ``parse_allowed_actors``.
+    """
+    if isinstance(allowed_actors, (str, bytes, bytearray)):
+        raise InvalidAllowedActorsError(
+            "allowed_actors must be a sequence of non-empty strings"
+        )
+    if not isinstance(allowed_actors, AbcSequence):
+        raise InvalidAllowedActorsError(
+            "allowed_actors must be a sequence of non-empty strings"
+        )
+    parsed: list[str] = []
+    for item in allowed_actors:
+        if not isinstance(item, str):
+            raise InvalidAllowedActorsError(
+                "allowed_actors members must be non-empty strings"
+            )
+        stripped = item.strip()
+        if not stripped:
+            raise InvalidAllowedActorsError(
+                "allowed_actors members must be non-empty strings"
+            )
+        parsed.append(stripped)
+    return tuple(parsed)
+
+
+def _actors_from_policy_json(raw: object) -> tuple[str, ...]:
+    """Read stored allowed_actors_json without coercing malformed members."""
+    if not isinstance(raw, str):
+        return ()
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(data, list):
+        return ()
+    actors: list[str] = []
+    for item in data:
+        if not isinstance(item, str):
+            return ()
+        stripped = item.strip()
+        if not stripped:
+            return ()
+        actors.append(stripped)
+    return tuple(actors)
+
+
 _CANCEL_FENCE_TABLES = frozenset(
     {"provider_effect_claims", "slack_job_bindings"}
 )
@@ -143,10 +203,10 @@ class DecisionLedger:
         allowed_actors: Sequence[str],
         expires_at: Optional[str] = None,
     ) -> JobAuthzPolicy:
+        actors = normalize_allowed_actors(allowed_actors)
         job = self._jobs.get_job(job_id)
         if job is None:
             raise KeyError(f"unknown job_id: {job_id}")
-        actors = tuple(str(a) for a in allowed_actors)
         now = self._now()
         payload = json.dumps(list(actors), sort_keys=True)
         with self._connect() as conn:
@@ -432,7 +492,7 @@ class DecisionLedger:
 
     @staticmethod
     def _row_to_policy(row: sqlite3.Row) -> JobAuthzPolicy:
-        actors = tuple(json.loads(row["allowed_actors_json"]))
+        actors = _actors_from_policy_json(row["allowed_actors_json"])
         return JobAuthzPolicy(
             job_id=row["job_id"],
             policy_version=row["policy_version"],

@@ -276,3 +276,134 @@ def test_decision_paths_rejected_when_pilot_disabled(tmp_path):
             policy_version="pol-1",
             allowed_actors=("U-alice",),
         )
+
+
+MALFORMED_ALLOWED_ACTORS = (
+    "U-alice",
+    b"U-alice",
+    bytearray(b"U-alice"),
+    None,
+    1,
+    True,
+    {"U-alice": True},
+    (1,),
+    (True,),
+    (None,),
+    (object(),),
+    ({"U-alice": True},),
+    (["U-alice"],),
+    (("U-alice",),),
+    (b"U-alice",),
+    ("",),
+    ("   ",),
+    ("U-alice", 1),
+    ("U-alice", ""),
+)
+
+
+def test_set_policy_accepts_stripped_string_sequence(tmp_path):
+    import sqlite3
+
+    store, job, ledger = _ready_job(tmp_path, idempotency_key="idem-dec-strip")
+    policy = ledger.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-2",
+        allowed_actors=("  U-alice  ", "U-bob"),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert policy.allowed_actors == ("U-alice", "U-bob")
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        (raw,) = conn.execute(
+            "SELECT allowed_actors_json FROM job_authz_policies WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert "  U-alice  " not in raw
+    assert "U-alice" in raw
+
+
+@pytest.mark.parametrize("allowed_actors", MALFORMED_ALLOWED_ACTORS)
+def test_set_policy_rejects_malformed_actors_with_zero_mutation(
+    tmp_path, allowed_actors
+):
+    import sqlite3
+
+    from agent.durable_jobs.decisions import (
+        DecisionLedger,
+        InvalidAllowedActorsError,
+    )
+    from agent.durable_jobs.store import DurableJobStore
+
+    store = DurableJobStore(sqlite_path=_db(tmp_path))
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="ENG-27 malformed actors",
+        repository_identity="github.com/example/repo",
+        idempotency_key="idem-dec-malformed",
+    )
+    ledger = DecisionLedger(sqlite_path=store.sqlite_path)
+    events_before = [
+        event["event_type"]
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "job_authz_policy_set"
+    ]
+    with pytest.raises(InvalidAllowedActorsError):
+        ledger.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-1",
+            allowed_actors=allowed_actors,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM job_authz_policies WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is None
+    events_after = [
+        event["event_type"]
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "job_authz_policy_set"
+    ]
+    assert events_after == events_before
+
+
+def test_set_policy_malformed_update_does_not_clobber_existing(tmp_path):
+    store, job, ledger = _ready_job(tmp_path, idempotency_key="idem-dec-noclobber")
+    from agent.durable_jobs.decisions import InvalidAllowedActorsError
+
+    with pytest.raises(InvalidAllowedActorsError):
+        ledger.set_policy(
+            job_id=job.job_id,
+            policy_version="pol-evil",
+            allowed_actors=(1,),
+            expires_at="2020-01-01T00:00:00+00:00",
+        )
+    import sqlite3
+
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT policy_version, allowed_actors_json, expires_at
+              FROM job_authz_policies WHERE job_id = ?
+            """,
+            (job.job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "pol-1"
+    assert "U-alice" in row[1]
+    assert row[2] == "2099-01-01T00:00:00+00:00"
+    assert all(
+        "pol-evil" not in (event.get("payload_json") or "")
+        for event in store.list_events(job.job_id)
+    )

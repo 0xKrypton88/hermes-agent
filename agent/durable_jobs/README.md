@@ -73,7 +73,10 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   re-check a latest-safe snapshot immediately before the adapter RPC (not
   atomic with the network call). No deploy/restart adapters are invented
 - `allowed_actors_json` is a JSON list of non-empty strings only (stripped;
-  malformed elements are never stringified)
+  malformed elements are never stringified). `set_policy` rejects coerced
+  members at writer ingress before any policy row or event
+- Claim/takeover sample authorization `now` only after `BEGIN IMMEDIATE`
+  succeeds so a lock wait cannot keep a pre-wait clock
 - Test fixtures that write default Go live under
   `tests/agent/durable_jobs/authz_fixtures.py`, not production agent modules
 - **Local policy-contract evidence only** — not Slack/live authorization,

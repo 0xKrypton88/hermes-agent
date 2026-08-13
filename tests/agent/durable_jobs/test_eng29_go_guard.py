@@ -353,12 +353,19 @@ def _apply_live_policy_defect(store, job, defect: str) -> None:
         )
         return
     if defect == "inactive":
-        decisions.set_policy(
-            job_id=job.job_id,
-            policy_version="pol-1",
-            allowed_actors=("",),
-            expires_at="2099-01-01T00:00:00+00:00",
-        )
+        conn = sqlite3.connect(store.sqlite_path)
+        try:
+            conn.execute(
+                """
+                UPDATE job_authz_policies
+                   SET allowed_actors_json = '[""]'
+                 WHERE job_id = ?
+                """,
+                (job.job_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return
     if defect == "actor_mismatch":
         decisions.set_policy(
@@ -1954,6 +1961,188 @@ def test_policy_revoke_before_claim_or_takeover_is_denied(
         binding = ledger.get_binding(job.job_id)
         assert binding is not None
         assert binding.status is SlackRootStatus.BOUND
+
+
+# ---------------------------------------------------------------------------
+# Post-lock authorization clock: expiry during BEGIN IMMEDIATE wait
+# ---------------------------------------------------------------------------
+
+
+def _prepare_lock_wait_expiry(tmp_path, *, adapter: str, phase: str):
+    from agent.durable_jobs.clock import (
+        DEFAULT_CLAIM_LEASE_SECONDS,
+        FrozenClock,
+        add_seconds_iso,
+    )
+    from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(
+        tmp_path, idempotency_key=f"idem-eng29-lockwait-{adapter}-{phase}"
+    )
+    clock = FrozenClock()
+    t0 = clock()
+    target = (
+        PROVIDER_CREATE_TARGET_ACTION
+        if adapter == "provider"
+        else SLACK_POST_ROOT_TARGET_ACTION
+    )
+    if phase == "claim":
+        expires_at = add_seconds_iso(t0, 10)
+        expire_advance = 15
+    else:
+        expires_at = add_seconds_iso(t0, 45)
+        expire_advance = 20
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(store, job, decisions, target_action=target)
+    import sqlite3
+
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            """
+            UPDATE job_authz_policies
+               SET expires_at = ?
+             WHERE job_id = ?
+            """,
+            (expires_at, job.job_id),
+        )
+        conn.execute(
+            """
+            UPDATE job_authorization_tuples
+               SET expires_at = ?
+             WHERE job_id = ? AND target_action = ?
+            """,
+            (expires_at, job.job_id, target),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if adapter == "provider":
+        ledger = ProviderEffectLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        )
+        if phase == "takeover":
+            first = ledger.claim_effect(**_provider_kwargs(job))
+            assert first.won is True
+            clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+
+        def run():
+            if phase == "claim":
+                return ledger.claim_effect(**_provider_kwargs(job))
+            return ledger.takeover_stale_claim(job.job_id, "create_run")
+
+        won_event = (
+            "provider_effect_claimed"
+            if phase == "claim"
+            else "provider_effect_claim_taken"
+        )
+    else:
+        ledger = SlackBindingLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        )
+        if phase == "takeover":
+            first = ledger.claim_delivery(job.job_id)
+            assert first.won is True
+            clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+
+        def run():
+            if phase == "claim":
+                return ledger.claim_delivery(job.job_id)
+            return ledger.takeover_stale_delivery(job.job_id)
+
+        won_event = (
+            "slack_root_claimed" if phase == "claim" else "slack_root_claim_taken"
+        )
+    return store, job, ledger, run, won_event, clock, expires_at, expire_advance
+
+
+@pytest.mark.parametrize("adapter,phase", _TOCTOU_CASES)
+def test_policy_tuple_expiry_during_begin_immediate_wait_is_denied(
+    tmp_path, monkeypatch, adapter, phase
+):
+    """Connection A holds the write lock; B blocks on BEGIN IMMEDIATE.
+
+    Live policy/tuple expire while B waits. After A releases, B must deny
+    with zero claim/takeover mutation or event. Pre-lock timing is proven
+    by the production ``before_begin_immediate`` seam firing while the
+    frozen clock is still unexpired.
+    """
+    import sqlite3
+    import threading
+
+    from agent.durable_jobs import eng29 as eng29_mod
+    from agent.durable_jobs.clock import parse_iso
+    from agent.durable_jobs.eng29 import AuthorizationDenied
+
+    store, job, ledger, run, won_event, clock, expires_at, expire_advance = (
+        _prepare_lock_wait_expiry(tmp_path, adapter=adapter, phase=phase)
+    )
+    events_before = _effect_event_types(store, job.job_id)
+    entered = threading.Event()
+
+    def seam():
+        entered.set()
+
+    monkeypatch.setattr(eng29_mod, "before_begin_immediate", seam)
+
+    holder = sqlite3.connect(str(store.sqlite_path), timeout=5)
+    holder.isolation_level = None
+    holder.execute("BEGIN IMMEDIATE")
+    outcome: list[tuple[str, object]] = []
+
+    def worker():
+        try:
+            outcome.append(("ok", run()))
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(("err", exc))
+
+    thread = threading.Thread(target=worker, name="eng29-lockwait-worker")
+    try:
+        thread.start()
+        assert entered.wait(timeout=5), "worker never reached pre-lock seam"
+        assert parse_iso(clock()) < parse_iso(expires_at)
+        assert outcome == []
+        clock.advance(expire_advance)
+        assert parse_iso(clock()) >= parse_iso(expires_at)
+        assert outcome == []
+    finally:
+        try:
+            holder.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        holder.close()
+        thread.join(timeout=5)
+    assert not thread.is_alive(), "worker deadlocked after lock holder released"
+    assert outcome and outcome[0][0] == "err", outcome
+    assert isinstance(outcome[0][1], AuthorizationDenied)
+    assert won_event not in _effect_event_types(store, job.job_id)
+    assert _effect_event_types(store, job.job_id) == events_before
+    if adapter == "provider":
+        claim = ledger.get_claim(job.job_id, "create_run")
+        if phase == "claim":
+            assert claim is None
+        else:
+            assert claim is not None
+            assert claim.claim_generation == 1
+    else:
+        from agent.durable_jobs.slack_contract import SlackRootStatus
+
+        binding = ledger.get_binding(job.job_id)
+        assert binding is not None
+        if phase == "claim":
+            assert binding.status is SlackRootStatus.BOUND
+            assert binding.claim_generation == 0
+        else:
+            assert binding.claim_generation == 1
 
 
 # ---------------------------------------------------------------------------
