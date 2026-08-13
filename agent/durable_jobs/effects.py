@@ -23,6 +23,10 @@ from typing import Any, Optional, Protocol
 
 from agent.durable_jobs.store import DurableJobStore
 
+# Process-local in-flight create: concurrent claim losers must not lookup-empty
+# a live winner into UNKNOWN. Real process restart clears this set.
+_IN_FLIGHT_PROVIDER_CLAIMS: set[tuple[str, str]] = set()
+
 
 class EffectStatus(str, Enum):
     CLAIMED = "claimed"
@@ -431,7 +435,18 @@ def reconcile_cursor_create(
 
     UNKNOWN / ACCEPTED / ADOPTED claims do not call ``create_run`` again.
     Concurrent claim losers also skip create.
+    Existing CLAIMED after restart looks up by the stable idempotency key and
+    never blindly calls ``create_run``.
     """
+    origin_platform, origin_chat_id, origin_root_thread_id = (
+        _authoritative_origin_from_slack_binding(
+            ledger,
+            job_id,
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
+            origin_root_thread_id=origin_root_thread_id,
+        )
+    )
     claimed = ledger.claim_effect(
         job_id=job_id,
         action_id=action_id,
@@ -449,28 +464,74 @@ def reconcile_cursor_create(
     ):
         return claim
     if not claimed.won:
+        if claim.status is EffectStatus.CLAIMED:
+            if (job_id, action_id) in _IN_FLIGHT_PROVIDER_CLAIMS:
+                return claim
+            return _recover_claimed_provider(ledger, provider, claim)
         return claim
 
-    result = provider.create_run(
-        idempotency_key=claim.provider_idempotency_key,
-        job_id=job_id,
-    )
-    kind = getattr(result, "kind", None)
-    run = getattr(result, "run", None)
-    if kind == "accepted" and run is not None:
-        return ledger.mark_accepted(job_id, action_id, provider_run_id=run.run_id)
-    if kind == "ambiguous_response":
-        return ledger.mark_unknown(
-            job_id, action_id, UnknownReason.AMBIGUOUS_RESPONSE.value
+    inflight_key = (job_id, action_id)
+    _IN_FLIGHT_PROVIDER_CLAIMS.add(inflight_key)
+    try:
+        result = provider.create_run(
+            idempotency_key=claim.provider_idempotency_key,
+            job_id=job_id,
         )
+        kind = getattr(result, "kind", None)
+        run = getattr(result, "run", None)
+        if kind == "accepted" and run is not None:
+            return ledger.mark_accepted(
+                job_id, action_id, provider_run_id=run.run_id
+            )
+        if kind == "ambiguous_response":
+            return ledger.mark_unknown(
+                job_id, action_id, UnknownReason.AMBIGUOUS_RESPONSE.value
+            )
+        return _recover_claimed_provider(ledger, provider, claim)
+    finally:
+        _IN_FLIGHT_PROVIDER_CLAIMS.discard(inflight_key)
 
-    matches = list(provider.lookup_runs(idempotency_key=claim.provider_idempotency_key))
+
+def _authoritative_origin_from_slack_binding(
+    ledger: ProviderEffectLedger,
+    job_id: str,
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    origin_root_thread_id: str,
+) -> tuple[str, str, str]:
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        resolve_provider_origin,
+    )
+
+    binding = SlackBindingLedger(sqlite_path=ledger.sqlite_path).get_binding(job_id)
+    if binding is None:
+        return origin_platform, origin_chat_id, origin_root_thread_id
+    return resolve_provider_origin(
+        binding,
+        origin_platform=origin_platform,
+        origin_chat_id=origin_chat_id,
+        origin_root_thread_id=origin_root_thread_id,
+    )
+
+
+def _recover_claimed_provider(
+    ledger: ProviderEffectLedger,
+    provider: CursorProviderPort,
+    claim: ProviderEffectClaim,
+) -> ProviderEffectClaim:
+    matches = list(
+        provider.lookup_runs(idempotency_key=claim.provider_idempotency_key)
+    )
     if len(matches) == 1:
-        return ledger.adopt_run(job_id, action_id, provider_run_id=matches[0].run_id)
+        return ledger.adopt_run(
+            claim.job_id, claim.action_id, provider_run_id=matches[0].run_id
+        )
     if len(matches) == 0:
         return ledger.mark_unknown(
-            job_id, action_id, UnknownReason.EMPTY_LOOKUP.value
+            claim.job_id, claim.action_id, UnknownReason.EMPTY_LOOKUP.value
         )
     return ledger.mark_unknown(
-        job_id, action_id, UnknownReason.AMBIGUOUS_LOOKUP.value
+        claim.job_id, claim.action_id, UnknownReason.AMBIGUOUS_LOOKUP.value
     )

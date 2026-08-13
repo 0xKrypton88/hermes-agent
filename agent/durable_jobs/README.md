@@ -22,19 +22,25 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - Stable provider idempotency key `cursor:{job_id}:{action_id}`
 - Explicit mapping `job_id == langgraph_thread_id` plus frozen origin Slack
   binding / candidate / version (not LangGraph context)
-- Lost-create recovery: unique lookup is adopted; empty/ambiguous lookup or
-  ambiguous create persists typed `unknown` and never redispatches
+- Origin platform/chat/root is derived from the durable Slack binding;
+  a supplied mismatch is rejected before the effect claim
+- Lost-create / existing-CLAIMED recovery: unique lookup is adopted;
+  empty/ambiguous lookup or ambiguous create persists typed `unknown` and
+  never redispatches / never blindly `create_run`
 
 ### ENG-27 — Slack job-thread + Go/Hold/Cancel (default-off)
 
 - Immutable job ↔ workspace/channel/root-thread ↔ candidate/version binding
   **before** any Slack or provider effect; rebind is rejected
-- Stable outbound `client_msg_id`; lost-response unique lookup adopts without
-  a second logical root; ambiguous lookup stays unknown
+- Stable outbound `client_msg_id`; atomic CLAIMED CAS before `post_root`
+  (concurrent losers do not post); existing CLAIMED after restart looks up
+  by `client_msg_id` — unique adopt, zero/multiple typed `unknown`, never a
+  blind repost
 - Cross-job and cross-binding resume fail closed
 - Go/Hold/Cancel records bound to job, candidate/version, actor, policy version,
   and decision idempotency key; unauthorized / mismatch / expired / replayed
-  fail closed. Cancel is terminal and is not weakened by later Go/Hold
+  fail closed. Cancel is terminal: later or replayed pre-Cancel Go/Hold stay
+  rejected as canceled; Cancel replay remains idempotent
 - No Slack routing fork: gateway adapters are untouched
 
 ## Explicit non-goals (Package 1 + these slices)

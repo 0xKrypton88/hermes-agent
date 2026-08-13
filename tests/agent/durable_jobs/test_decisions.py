@@ -164,6 +164,62 @@ def test_cancel_is_terminal_and_not_weakened_by_later_go_or_hold(tmp_path):
     assert ledger.is_canceled(job.job_id) is True
 
 
+def test_pre_cancel_go_replay_after_accepted_cancel_is_rejected_as_canceled(tmp_path):
+    store, job, ledger = _ready_job(tmp_path)
+    go = ledger.record_decision(
+        **_decision_kwargs(job.job_id, decision_type="go", decision_idempotency_key="k-go")
+    )
+    assert go.ok is True
+    cancel = ledger.record_decision(
+        **_decision_kwargs(
+            job.job_id, decision_type="cancel", decision_idempotency_key="k-cancel"
+        )
+    )
+    assert cancel.ok is True
+
+    replay_go = ledger.record_decision(
+        **_decision_kwargs(job.job_id, decision_type="go", decision_idempotency_key="k-go")
+    )
+    assert replay_go.ok is False
+    assert replay_go.status == "rejected"
+    assert "canceled" in replay_go.reason_codes
+    assert ledger.is_canceled(job.job_id) is True
+
+
+def test_pre_cancel_hold_replay_after_accepted_cancel_is_rejected_as_canceled(tmp_path):
+    store, job, ledger = _ready_job(tmp_path)
+    hold = ledger.record_decision(
+        **_decision_kwargs(
+            job.job_id, decision_type="hold", decision_idempotency_key="k-hold"
+        )
+    )
+    assert hold.ok is True
+    cancel = ledger.record_decision(
+        **_decision_kwargs(
+            job.job_id, decision_type="cancel", decision_idempotency_key="k-cancel"
+        )
+    )
+    assert cancel.ok is True
+
+    replay_hold = ledger.record_decision(
+        **_decision_kwargs(
+            job.job_id, decision_type="hold", decision_idempotency_key="k-hold"
+        )
+    )
+    assert replay_hold.ok is False
+    assert replay_hold.status == "rejected"
+    assert "canceled" in replay_hold.reason_codes
+
+    cancel_replay = ledger.record_decision(
+        **_decision_kwargs(
+            job.job_id, decision_type="cancel", decision_idempotency_key="k-cancel"
+        )
+    )
+    assert cancel_replay.ok is True
+    assert cancel_replay.status == "duplicate"
+    assert ledger.is_canceled(job.job_id) is True
+
+
 def test_decisions_survive_store_recreation(tmp_path):
     from agent.durable_jobs.decisions import DecisionLedger, DecisionType
 

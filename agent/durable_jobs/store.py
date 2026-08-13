@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS slack_job_bindings (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (workspace_id, channel_id, root_thread_ts),
-    CHECK (status IN ('bound', 'delivered', 'adopted', 'unknown')),
+    CHECK (status IN ('bound', 'claimed', 'delivered', 'adopted', 'unknown')),
     FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
 );
 

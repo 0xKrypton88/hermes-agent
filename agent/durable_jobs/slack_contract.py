@@ -23,9 +23,16 @@ from agent.durable_jobs.store import DurableJobStore
 
 class SlackRootStatus(str, Enum):
     BOUND = "bound"
+    CLAIMED = "claimed"
     DELIVERED = "delivered"
     ADOPTED = "adopted"
     UNKNOWN = "unknown"
+
+
+class SlackUnknownReason(str, Enum):
+    EMPTY_LOOKUP = "empty_lookup"
+    AMBIGUOUS_LOOKUP = "ambiguous_lookup"
+    AMBIGUOUS_RESPONSE = "ambiguous_response"
 
 
 class BindingConflict(ValueError):
@@ -36,12 +43,38 @@ class BindingRequiredError(RuntimeError):
     """An effect was attempted before the immutable Slack binding existed."""
 
 
+class OriginMismatchError(ValueError):
+    """Supplied provider origin does not match the durable Slack binding."""
+
+
 def stable_outbound_client_msg_id(job_id: str) -> str:
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL, f"hermes.durable_jobs.slack.root:{job_id}"
         )
     )
+
+
+def origin_from_slack_binding(binding: "SlackJobBinding") -> tuple[str, str, str]:
+    """Authoritative provider origin: Slack platform + bound channel/root."""
+    return ("slack", binding.channel_id, binding.root_thread_ts)
+
+
+def resolve_provider_origin(
+    binding: "SlackJobBinding",
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    origin_root_thread_id: str,
+) -> tuple[str, str, str]:
+    """Derive origin from the Slack binding; reject a supplied mismatch."""
+    derived = origin_from_slack_binding(binding)
+    supplied = (origin_platform, origin_chat_id, origin_root_thread_id)
+    if supplied != derived:
+        raise OriginMismatchError(
+            f"supplied origin {supplied!r} does not match Slack binding {derived!r}"
+        )
+    return derived
 
 
 def _utcnow() -> str:
@@ -62,6 +95,12 @@ class SlackJobBinding:
     unknown_reason: Optional[str]
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class DeliveryClaimResult:
+    binding: SlackJobBinding
+    won: bool
 
 
 class SlackMessagePort(Protocol):
@@ -278,6 +317,58 @@ class SlackBindingLedger:
             ).fetchone()
         return int(count)
 
+    def claim_delivery(self, job_id: str) -> DeliveryClaimResult:
+        """CAS BOUND → CLAIMED. Concurrent losers must not post."""
+        now = _utcnow()
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise BindingRequiredError(f"no Slack binding for {job_id}")
+            binding = self._row_to_binding(current)
+            if binding.status is not SlackRootStatus.BOUND:
+                return DeliveryClaimResult(binding=binding, won=False)
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET status = ?, updated_at = ?
+                 WHERE job_id = ? AND status = ?
+                """,
+                (
+                    SlackRootStatus.CLAIMED.value,
+                    now,
+                    job_id,
+                    SlackRootStatus.BOUND.value,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                assert row is not None
+                return DeliveryClaimResult(
+                    binding=self._row_to_binding(row), won=False
+                )
+            DurableJobStore._append_event(
+                conn,
+                job_id=job_id,
+                event_type="slack_root_claimed",
+                payload={
+                    "outbound_client_msg_id": binding.outbound_client_msg_id,
+                    "status": SlackRootStatus.CLAIMED.value,
+                },
+                idempotency_key=f"slack_root_claimed:{job_id}",
+            )
+            row = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        assert row is not None
+        return DeliveryClaimResult(binding=self._row_to_binding(row), won=True)
+
     def mark_delivered(self, job_id: str, message_ts: str) -> SlackJobBinding:
         return self._complete_delivery(
             job_id,
@@ -321,7 +412,13 @@ class SlackBindingLedger:
             if current is None:
                 raise BindingRequiredError(f"no Slack binding for {job_id}")
             binding = self._row_to_binding(current)
-            if binding.status is not SlackRootStatus.BOUND:
+            if binding.status in (
+                SlackRootStatus.DELIVERED,
+                SlackRootStatus.ADOPTED,
+                SlackRootStatus.UNKNOWN,
+            ):
+                return binding
+            if binding.status is not SlackRootStatus.CLAIMED:
                 return binding
             conn.execute(
                 """
@@ -336,7 +433,7 @@ class SlackBindingLedger:
                     unknown_reason,
                     now,
                     job_id,
-                    SlackRootStatus.BOUND.value,
+                    SlackRootStatus.CLAIMED.value,
                 ),
             )
             DurableJobStore._append_event(
@@ -382,7 +479,12 @@ def deliver_slack_root(
     *,
     job_id: str,
 ) -> SlackJobBinding:
-    """Post at most one logical root. Binding + client_msg_id must already exist."""
+    """Post at most one logical root. Binding + client_msg_id must already exist.
+
+    Atomic CLAIMED CAS happens before ``post_root``. Concurrent losers do not
+    post. An existing CLAIMED row after restart looks up by the stable
+    ``client_msg_id`` and never blindly reposts.
+    """
     binding = ledger.get_binding(job_id)
     if binding is None:
         raise BindingRequiredError(f"no Slack binding for {job_id}")
@@ -392,7 +494,14 @@ def deliver_slack_root(
         SlackRootStatus.UNKNOWN,
     ):
         return binding
+    if binding.status is SlackRootStatus.CLAIMED:
+        return _lookup_slack_root(ledger, slack_port, binding)
 
+    claimed = ledger.claim_delivery(job_id)
+    if not claimed.won:
+        return claimed.binding
+
+    binding = claimed.binding
     result = slack_port.post_root(
         client_msg_id=binding.outbound_client_msg_id,
         workspace_id=binding.workspace_id,
@@ -405,13 +514,26 @@ def deliver_slack_root(
     if kind == "accepted" and message_ts:
         return ledger.mark_delivered(job_id, message_ts)
     if kind == "ambiguous_response":
-        return ledger.mark_unknown(job_id, "ambiguous_response")
+        return ledger.mark_unknown(
+            job_id, SlackUnknownReason.AMBIGUOUS_RESPONSE.value
+        )
+    return _lookup_slack_root(ledger, slack_port, binding)
 
+
+def _lookup_slack_root(
+    ledger: SlackBindingLedger,
+    slack_port: SlackMessagePort,
+    binding: SlackJobBinding,
+) -> SlackJobBinding:
     matches = list(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )
     if len(matches) == 1:
-        return ledger.adopt_delivery(job_id, matches[0].message_ts)
+        return ledger.adopt_delivery(binding.job_id, matches[0].message_ts)
     if len(matches) == 0:
-        return ledger.mark_unknown(job_id, "empty_lookup")
-    return ledger.mark_unknown(job_id, "ambiguous_lookup")
+        return ledger.mark_unknown(
+            binding.job_id, SlackUnknownReason.EMPTY_LOOKUP.value
+        )
+    return ledger.mark_unknown(
+        binding.job_id, SlackUnknownReason.AMBIGUOUS_LOOKUP.value
+    )

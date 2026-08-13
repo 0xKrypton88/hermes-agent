@@ -178,6 +178,16 @@ class DecisionLedger:
                     and record.policy_version == policy_version
                 )
                 if same and record.status in ("accepted", "duplicate"):
+                    if (
+                        dtype is not DecisionType.CANCEL
+                        and self._canceled_row(conn, job_id) is not None
+                    ):
+                        return DecisionResult(
+                            ok=False,
+                            status="rejected",
+                            record=record,
+                            reason_codes=("canceled",),
+                        )
                     return DecisionResult(
                         ok=True,
                         status="duplicate",
@@ -279,16 +289,7 @@ class DecisionLedger:
 
     def is_canceled(self, job_id: str) -> bool:
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM job_decisions
-                 WHERE job_id = ? AND decision_type = 'cancel'
-                   AND status IN ('accepted', 'duplicate')
-                 LIMIT 1
-                """,
-                (job_id,),
-            ).fetchone()
-        return row is not None
+            return self._canceled_row(conn, job_id) is not None
 
     def count_decisions(self, job_id: str) -> int:
         with self._connect() as conn:
@@ -349,7 +350,14 @@ class DecisionLedger:
             except ValueError:
                 reasons.append("expired")
 
-        canceled = conn.execute(
+        canceled = self._canceled_row(conn, job_id)
+        if canceled is not None and dtype is not DecisionType.CANCEL:
+            reasons.append("canceled")
+        return tuple(dict.fromkeys(reasons))
+
+    @staticmethod
+    def _canceled_row(conn: sqlite3.Connection, job_id: str) -> Optional[sqlite3.Row]:
+        return conn.execute(
             """
             SELECT 1 FROM job_decisions
              WHERE job_id = ? AND decision_type = 'cancel'
@@ -358,9 +366,6 @@ class DecisionLedger:
             """,
             (job_id,),
         ).fetchone()
-        if canceled is not None and dtype is not DecisionType.CANCEL:
-            reasons.append("canceled")
-        return tuple(dict.fromkeys(reasons))
 
     @staticmethod
     def _row_to_policy(row: sqlite3.Row) -> JobAuthzPolicy:

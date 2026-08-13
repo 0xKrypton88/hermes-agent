@@ -24,6 +24,7 @@ from agent.durable_jobs.slack_contract import (
     SlackJobBinding,
     SlackMessagePort,
     deliver_slack_root,
+    resolve_provider_origin,
 )
 from agent.durable_jobs.store import DurableJobStore
 
@@ -109,6 +110,14 @@ class DurableLaneService:
             raise BindingRequiredError(
                 f"provider effect candidate/version must match Slack binding for {job_id}"
             )
+        origin_platform, origin_chat_id, origin_root_thread_id = (
+            resolve_provider_origin(
+                binding,
+                origin_platform=origin_platform,
+                origin_chat_id=origin_chat_id,
+                origin_root_thread_id=origin_root_thread_id,
+            )
+        )
         ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
         return reconcile_cursor_create(
             ledger,

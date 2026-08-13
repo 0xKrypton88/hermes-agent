@@ -6,6 +6,7 @@ live state.db. Binding is the authority — not Slack history.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -67,6 +68,7 @@ class FakeSlackPort:
         self.lookups = list(lookups or [])
         self.posts: list[dict] = []
         self.lookup_calls: list[str] = []
+        self._lock = threading.Lock()
 
     def post_root(
         self,
@@ -77,15 +79,16 @@ class FakeSlackPort:
         root_thread_ts: str,
         job_id: str,
     ) -> FakePostResult:
-        self.posts.append(
-            {
-                "client_msg_id": client_msg_id,
-                "workspace_id": workspace_id,
-                "channel_id": channel_id,
-                "root_thread_ts": root_thread_ts,
-                "job_id": job_id,
-            }
-        )
+        with self._lock:
+            self.posts.append(
+                {
+                    "client_msg_id": client_msg_id,
+                    "workspace_id": workspace_id,
+                    "channel_id": channel_id,
+                    "root_thread_ts": root_thread_ts,
+                    "job_id": job_id,
+                }
+            )
         return self.post_result
 
     def lookup_by_client_msg_id(self, client_msg_id: str) -> list[FakePosted]:
@@ -298,6 +301,135 @@ def test_lane_cursor_create_requires_binding_before_provider_effect(tmp_path):
             provider=FakeProvider(),
         )
     assert create_calls == []
+
+
+class _CrashAfterPostPort(FakeSlackPort):
+    """Simulates crash after Slack accepted the post but before durable complete."""
+
+    def post_root(self, **kwargs) -> FakePostResult:
+        super().post_root(**kwargs)
+        raise RuntimeError("simulated crash")
+
+
+def test_concurrent_slack_root_delivery_single_winner_does_not_double_post(tmp_path):
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    ledger.bind(**_bind_kwargs(job.job_id))
+    port = FakeSlackPort(FakePostResult(kind="accepted", message_ts="42.1"))
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            deliver_slack_root(ledger, port, job_id=job.job_id)
+        except BaseException as exc:  # noqa: BLE001 — surface into parent thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(port.posts) == 1
+    loaded = ledger.get_binding(job.job_id)
+    assert loaded is not None
+    assert loaded.status is SlackRootStatus.DELIVERED
+    assert loaded.delivered_message_ts == "42.1"
+
+
+def test_claimed_slack_root_after_crash_restart_unique_lookup_adopts_without_repost(
+    tmp_path,
+):
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    bound = ledger.bind(**_bind_kwargs(job.job_id))
+    crash_port = _CrashAfterPostPort(FakePostResult(kind="accepted", message_ts="10.1"))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        deliver_slack_root(ledger, crash_port, job_id=job.job_id)
+    assert len(crash_port.posts) == 1
+    crashed = ledger.get_binding(job.job_id)
+    assert crashed is not None
+    assert crashed.status is SlackRootStatus.CLAIMED
+
+    recover_port = FakeSlackPort(
+        FakePostResult(kind="lost_response"),
+        lookups=[FakePosted("10.1", bound.outbound_client_msg_id)],
+    )
+    reopened = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    adopted = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
+    assert adopted.status is SlackRootStatus.ADOPTED
+    assert adopted.delivered_message_ts == "10.1"
+    assert recover_port.posts == []
+    assert recover_port.lookup_calls == [bound.outbound_client_msg_id]
+
+
+def test_claimed_slack_root_after_restart_empty_lookup_is_typed_unknown_without_repost(
+    tmp_path,
+):
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    bound = ledger.bind(**_bind_kwargs(job.job_id))
+    crash_port = _CrashAfterPostPort(FakePostResult(kind="lost_response"))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        deliver_slack_root(ledger, crash_port, job_id=job.job_id)
+
+    recover_port = FakeSlackPort(FakePostResult(kind="lost_response"), lookups=[])
+    reopened = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    unknown = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
+    assert unknown.status is SlackRootStatus.UNKNOWN
+    assert unknown.unknown_reason == "empty_lookup"
+    assert recover_port.posts == []
+    assert recover_port.lookup_calls == [bound.outbound_client_msg_id]
+
+
+def test_claimed_slack_root_after_restart_ambiguous_lookup_is_typed_unknown_without_repost(
+    tmp_path,
+):
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    bound = ledger.bind(**_bind_kwargs(job.job_id))
+    cmid = bound.outbound_client_msg_id
+    crash_port = _CrashAfterPostPort(FakePostResult(kind="lost_response"))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        deliver_slack_root(ledger, crash_port, job_id=job.job_id)
+
+    recover_port = FakeSlackPort(
+        FakePostResult(kind="lost_response"),
+        lookups=[FakePosted("10.1", cmid), FakePosted("10.2", cmid)],
+    )
+    reopened = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    unknown = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
+    assert unknown.status is SlackRootStatus.UNKNOWN
+    assert unknown.unknown_reason == "ambiguous_lookup"
+    assert recover_port.posts == []
+    assert recover_port.lookup_calls == [cmid]
 
 
 def test_slack_paths_rejected_when_pilot_disabled(tmp_path):

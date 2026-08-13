@@ -405,6 +405,229 @@ def test_ambiguous_create_response_is_typed_unknown(tmp_path):
     assert len(provider.create_calls) == 1
 
 
+def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path):
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    kwargs = dict(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform=job.origin_platform,
+        origin_chat_id=job.origin_chat_id,
+        origin_root_thread_id=job.origin_root_thread_id,
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    claimed = ledger.claim_effect(**kwargs)
+    assert claimed.won is True
+    assert claimed.claim.status is EffectStatus.CLAIMED
+
+    key = provider_idempotency_key(job.job_id, "create_run")
+    provider = FakeCursorProvider(
+        FakeCreateResult(kind="lost_response"),
+        lookups=[FakeRun("run-unique", key)],
+    )
+    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    adopted = reconcile_cursor_create(reopened, provider, **kwargs)
+    assert adopted.status is EffectStatus.ADOPTED
+    assert adopted.provider_run_id == "run-unique"
+    assert provider.create_calls == []
+    assert provider.lookup_calls == [key]
+
+
+def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
+    tmp_path,
+):
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    kwargs = dict(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform=job.origin_platform,
+        origin_chat_id=job.origin_chat_id,
+        origin_root_thread_id=job.origin_root_thread_id,
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    ledger.claim_effect(**kwargs)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    provider = FakeCursorProvider(FakeCreateResult(kind="lost_response"), lookups=[])
+    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    unknown = reconcile_cursor_create(reopened, provider, **kwargs)
+    assert unknown.status is EffectStatus.UNKNOWN
+    assert unknown.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
+    assert provider.create_calls == []
+    assert provider.lookup_calls == [key]
+
+
+def test_claimed_after_process_recreation_ambiguous_lookup_is_typed_unknown_without_create(
+    tmp_path,
+):
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    kwargs = dict(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform=job.origin_platform,
+        origin_chat_id=job.origin_chat_id,
+        origin_root_thread_id=job.origin_root_thread_id,
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    ledger.claim_effect(**kwargs)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    provider = FakeCursorProvider(
+        FakeCreateResult(kind="lost_response"),
+        lookups=[FakeRun("run-a", key), FakeRun("run-b", key)],
+    )
+    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    unknown = reconcile_cursor_create(reopened, provider, **kwargs)
+    assert unknown.status is EffectStatus.UNKNOWN
+    assert unknown.unknown_reason == UnknownReason.AMBIGUOUS_LOOKUP.value
+    assert unknown.provider_run_id is None
+    assert provider.create_calls == []
+    assert provider.lookup_calls == [key]
+
+
+def _enabled_lane(tmp_path, store):
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.lane import DurableLaneService
+
+    cfg = load_durable_jobs_config(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": False,
+                "sqlite_path": str(store.sqlite_path),
+                "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+            }
+        }
+    )
+    return DurableLaneService(config=cfg, store=store)
+
+
+def test_provider_origin_mismatch_rejected_before_effect_claim(tmp_path):
+    from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.slack_contract import OriginMismatchError, SlackBindingLedger
+
+    store, job = _make_job(tmp_path)
+    slack = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    slack.bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    provider = FakeCursorProvider(
+        FakeCreateResult(kind="accepted", run=FakeRun("run-x", "k"))
+    )
+    lane = _enabled_lane(tmp_path, store)
+    with pytest.raises(OriginMismatchError):
+        lane.reconcile_cursor_create(
+            job_id=job.job_id,
+            action_id="create_run",
+            origin_platform="slack",
+            origin_chat_id="C-OTHER",
+            origin_root_thread_id="111.222",
+            candidate_id="cand-1",
+            candidate_version="v1",
+            provider=provider,
+        )
+    with pytest.raises(OriginMismatchError):
+        lane.reconcile_cursor_create(
+            job_id=job.job_id,
+            action_id="create_run",
+            origin_platform="cli",
+            origin_chat_id="C123",
+            origin_root_thread_id="111.222",
+            candidate_id="cand-1",
+            candidate_version="v1",
+            provider=provider,
+        )
+    with pytest.raises(OriginMismatchError):
+        lane.reconcile_cursor_create(
+            job_id=job.job_id,
+            action_id="create_run",
+            origin_platform="slack",
+            origin_chat_id="C123",
+            origin_root_thread_id="999.000",
+            candidate_id="cand-1",
+            candidate_version="v1",
+            provider=provider,
+        )
+    assert provider.create_calls == []
+    assert ProviderEffectLedger(sqlite_path=store.sqlite_path).get_claim(
+        job.job_id, "create_run"
+    ) is None
+
+
+def test_provider_origin_is_derived_from_slack_binding(tmp_path):
+    from agent.durable_jobs.effects import EffectStatus, ProviderEffectLedger
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(tmp_path)
+    slack = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    binding = slack.bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    key = f"cursor:{job.job_id}:create_run"
+    provider = FakeCursorProvider(
+        FakeCreateResult(kind="accepted", run=FakeRun("run-bound", key))
+    )
+    lane = _enabled_lane(tmp_path, store)
+    result = lane.reconcile_cursor_create(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform="slack",
+        origin_chat_id=binding.channel_id,
+        origin_root_thread_id=binding.root_thread_ts,
+        candidate_id=binding.candidate_id,
+        candidate_version=binding.candidate_version,
+        provider=provider,
+    )
+    assert result.status is EffectStatus.ACCEPTED
+    claim = ProviderEffectLedger(sqlite_path=store.sqlite_path).get_claim(
+        job.job_id, "create_run"
+    )
+    assert claim is not None
+    assert claim.origin_platform == "slack"
+    assert claim.origin_chat_id == binding.channel_id
+    assert claim.origin_root_thread_id == binding.root_thread_ts
+    mapping = ProviderEffectLedger(sqlite_path=store.sqlite_path).get_mapping(job.job_id)
+    assert mapping is not None
+    assert mapping.origin_chat_id == binding.channel_id
+    assert mapping.origin_root_thread_id == binding.root_thread_ts
+
+
 def test_reconcile_is_noop_when_pilot_disabled(tmp_path):
     from agent.durable_jobs.config import load_durable_jobs_config
     from agent.durable_jobs.lane import DurableLaneService
