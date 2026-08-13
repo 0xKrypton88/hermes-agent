@@ -1,7 +1,10 @@
 """External adapter *ports* for ENG-3 durable-jobs slices.
 
 This package ships only protocols and inert null adapters. Live Slack / Cursor /
-network adapters are intentionally absent. Even when a fake is injected into
+network adapters are intentionally absent from this module. The ENG-30 Cursor
+Cloud adapter (``cursor_cloud.CursorCloudAdapter``) is inactive/fail-closed and
+requires an injected transport — it is not exported here and never enables
+Package 1 dispatch. Even when a fake is injected into
 ``DurableJobService``, Package 1 hard-disables dispatch and never calls
 ``dispatch()``. ENG-26/27 ledgers talk only to injected fakes after a durable
 claim/binding. It must be impossible for this slice to call Slack/Cursor/network.
@@ -35,6 +38,8 @@ class CursorProviderPort(Protocol):
 
     def lookup_runs(self, *, idempotency_key: str) -> list[object]: ...
 
+    def status_run(self, *, run_id: str) -> object: ...
+
 
 class NullCursorProvider:
     """Safe stand-in that never performs I/O or Cursor API calls."""
@@ -48,6 +53,12 @@ class NullCursorProvider:
     def lookup_runs(self, *, idempotency_key: str) -> list[object]:
         raise RuntimeError(
             "NullCursorProvider refuses lookup_runs; inject an explicit fake "
+            "in tests. Live Cursor adapters are out of durable-lane scope."
+        )
+
+    def status_run(self, *, run_id: str) -> object:
+        raise RuntimeError(
+            "NullCursorProvider refuses status_run; inject an explicit fake "
             "in tests. Live Cursor adapters are out of durable-lane scope."
         )
 

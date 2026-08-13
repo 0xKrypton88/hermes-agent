@@ -74,6 +74,7 @@ class UnknownReason(str, Enum):
     AMBIGUOUS_RESPONSE = "ambiguous_response"
     ORPHAN_RESPONSE = "orphan_response"
     CORRELATION_MISMATCH = "correlation_mismatch"
+    UNKNOWN_PROVIDER_STATE = "unknown_provider_state"
 
 
 def provider_idempotency_key(job_id: str, action_id: str) -> str:
@@ -1226,6 +1227,20 @@ def reconcile_cursor_create(
                 owner_token=won_token,
                 status=EffectStatus.ACCEPTED,
             )
+        if kind in ("unknown", "unknown_provider_state"):
+            unknown = ledger.mark_unknown(
+                job_id,
+                action_id,
+                UnknownReason.UNKNOWN_PROVIDER_STATE.value,
+                owner_token=won_token,
+            )
+            if unknown.status is EffectStatus.UNKNOWN:
+                _persist_provider_recovery_hold(
+                    ledger, job_id, reason=UnknownReason.UNKNOWN_PROVIDER_STATE.value
+                )
+                return unknown
+            current = ledger.get_claim(job_id, action_id)
+            return current if current is not None else unknown
         if kind == "ambiguous_response":
             unknown = ledger.mark_unknown(
                 job_id,
