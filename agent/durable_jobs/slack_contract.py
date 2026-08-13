@@ -378,6 +378,10 @@ class SlackBindingLedger:
         if peeked.status is not SlackRootStatus.BOUND:
             return DeliveryClaimResult(binding=peeked, won=False)
         with self._connect() as conn:
+            # Python sqlite3 does not BEGIN on SELECT. Take the write lock
+            # before live Go validation so a concurrent policy change cannot
+            # commit between check and mutation.
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
                 (job_id,),
@@ -470,6 +474,10 @@ class SlackBindingLedger:
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            # Python sqlite3 does not BEGIN on SELECT. Take the write lock
+            # before live Go validation so a concurrent policy change cannot
+            # commit between check and mutation.
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
                 (job_id,),

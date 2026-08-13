@@ -185,6 +185,10 @@ class ProviderEffectLedger:
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            # Python sqlite3 does not BEGIN on SELECT. Take the write lock
+            # before live Go validation so a concurrent policy change cannot
+            # commit between check and mutation.
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 """
                 SELECT * FROM provider_effect_claims
@@ -325,6 +329,10 @@ class ProviderEffectLedger:
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
         with self._connect() as conn:
+            # Python sqlite3 does not BEGIN on SELECT. Take the write lock
+            # before live Go validation so a concurrent policy change cannot
+            # commit between check and mutation.
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 """
                 SELECT * FROM provider_effect_claims

@@ -1660,10 +1660,13 @@ def test_evaluate_authorization_on_conn_sees_uncommitted_policy_delete(tmp_path)
         denied = evaluate_authorization(conn=conn, **kwargs)
         assert denied.ok is False
         assert "unauthorized" in denied.reason_codes
-        still_committed = evaluate_authorization(
-            sqlite_path=store.sqlite_path, **kwargs
-        )
-        assert still_committed.ok is True
+        probe = sqlite3.connect(store.sqlite_path, timeout=2)
+        probe.row_factory = sqlite3.Row
+        try:
+            still_committed = evaluate_authorization(conn=probe, **kwargs)
+            assert still_committed.ok is True
+        finally:
+            probe.close()
         conn.rollback()
     finally:
         conn.close()
