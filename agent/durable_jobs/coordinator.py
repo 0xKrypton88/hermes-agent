@@ -61,7 +61,20 @@ class InboundAckPort(Protocol):
 
 
 def after_evidence_rows_before_commit() -> None:
-    """Test seam after evidence rows, before COMMIT. Production no-op."""
+    """Crash-injection instrumentation after evidence rows, before COMMIT.
+
+    Production is a no-op. This cannot authorize, grant Go, or bypass
+    ENG-29. Tests may replace it to abort an uncommitted write.
+    """
+    return None
+
+
+def after_inbound_select_before_insert() -> None:
+    """Crash/race instrumentation after inbound key lookup, before INSERT.
+
+    Production is a no-op. This cannot authorize or ACK. Tests may replace
+    it so two processes both pass the empty-select window.
+    """
     return None
 
 
@@ -69,14 +82,18 @@ def resume_idempotency_key(job_id: str, evidence_id: str) -> str:
     return f"resume:{job_id}:{evidence_id}"
 
 
-def _connect(sqlite_path: SqlitePath) -> sqlite3.Connection:
+def _connect(
+    sqlite_path: SqlitePath,
+    *,
+    isolation_level: str = "IMMEDIATE",
+) -> sqlite3.Connection:
     path = Path(sqlite_path)
     DurableJobStore(sqlite_path=path)
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    conn.isolation_level = "IMMEDIATE"
+    conn.isolation_level = isolation_level
     return conn
 
 
@@ -294,6 +311,31 @@ def mark_resume_local(sqlite_path: SqlitePath, *, job_id: str) -> ResumeEnqueue:
     return _row_to_enqueue(row)
 
 
+_INBOUND_TUPLE_FIELDS = (
+    "job_id",
+    "workspace_id",
+    "channel_id",
+    "root_thread_ts",
+    "actor_id",
+    "decision_type",
+    "policy_version",
+    "candidate_id",
+    "candidate_version",
+)
+
+
+def _inbound_tuple(**kwargs: str) -> dict[str, str]:
+    return {field: str(kwargs[field]) for field in _INBOUND_TUPLE_FIELDS}
+
+
+def _inbound_tuple_from_row(row: sqlite3.Row) -> dict[str, str]:
+    keys = set(row.keys())
+    return {
+        field: str(row[field]) if field in keys and row[field] is not None else ""
+        for field in _INBOUND_TUPLE_FIELDS
+    }
+
+
 def consume_inbound_action(
     sqlite_path: SqlitePath,
     ack_port: InboundAckPort,
@@ -309,9 +351,25 @@ def consume_inbound_action(
     candidate_id: str,
     candidate_version: str,
 ) -> InboundActionResult:
-    """Persist the decision first, then ACK. Never ACK-before-commit."""
+    """Persist the decision first, then ACK. Never ACK-before-commit.
+
+    ``decision_idempotency_key`` reuse is bound to the immutable request
+    tuple. Mismatch rejects with no decision mutation and no ACK. Replay
+    uses the persisted tuple, never caller-supplied cross-job context.
+    """
     path = Path(sqlite_path)
     DurableJobStore(sqlite_path=path)
+    requested = _inbound_tuple(
+        job_id=job_id,
+        workspace_id=workspace_id,
+        channel_id=channel_id,
+        root_thread_ts=root_thread_ts,
+        actor_id=actor_id,
+        decision_type=decision_type,
+        policy_version=policy_version,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
+    )
     binding = SlackBindingLedger(sqlite_path=path).get_binding(job_id)
     occupant = SlackBindingLedger(sqlite_path=path).get_by_root(
         workspace_id, channel_id, root_thread_ts
@@ -328,7 +386,10 @@ def consume_inbound_action(
     ):
         return InboundActionResult(ok=False, ack_status="rejected")
 
-    with _connect(path) as conn:
+    inbound_id = f"in_{uuid.uuid4().hex}"
+    # DEFERRED so two first-delivery writers can race the UNIQUE key;
+    # IMMEDIATE would serialize before INSERT and hide IntegrityError.
+    with _connect(path, isolation_level="DEFERRED") as conn:
         existing = conn.execute(
             """
             SELECT * FROM job_inbound_actions
@@ -336,48 +397,89 @@ def consume_inbound_action(
             """,
             (decision_idempotency_key,),
         ).fetchone()
-        inbound_id = existing["inbound_id"] if existing else f"in_{uuid.uuid4().hex}"
-        decision_id = existing["decision_id"] if existing else None
-        ack_status = existing["ack_status"] if existing else None
         if existing is None:
-            conn.execute(
-                """
-                INSERT INTO job_inbound_actions(
-                    inbound_id, job_id, workspace_id, channel_id, root_thread_ts,
-                    actor_id, decision_type, decision_idempotency_key, decision_id,
-                    ack_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)
-                """,
-                (
-                    inbound_id,
-                    job_id,
-                    workspace_id,
-                    channel_id,
-                    root_thread_ts,
-                    actor_id,
-                    decision_type,
-                    decision_idempotency_key,
-                    _utcnow(conn),
-                    _utcnow(conn),
-                ),
-            )
+            after_inbound_select_before_insert()
+            now = _utcnow(conn)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO job_inbound_actions(
+                        inbound_id, job_id, workspace_id, channel_id,
+                        root_thread_ts, actor_id, decision_type, policy_version,
+                        candidate_id, candidate_version,
+                        decision_idempotency_key, decision_id, ack_status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)
+                    """,
+                    (
+                        inbound_id,
+                        requested["job_id"],
+                        requested["workspace_id"],
+                        requested["channel_id"],
+                        requested["root_thread_ts"],
+                        requested["actor_id"],
+                        requested["decision_type"],
+                        requested["policy_version"],
+                        requested["candidate_id"],
+                        requested["candidate_version"],
+                        decision_idempotency_key,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Unique winner already committed. Reload that row; never
+                # insert a second inbound or ACK from caller-supplied context.
+                conn.rollback()
+                existing = conn.execute(
+                    """
+                    SELECT * FROM job_inbound_actions
+                     WHERE decision_idempotency_key = ?
+                    """,
+                    (decision_idempotency_key,),
+                ).fetchone()
+                if existing is None:
+                    raise
+            else:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM job_inbound_actions
+                     WHERE decision_idempotency_key = ?
+                    """,
+                    (decision_idempotency_key,),
+                ).fetchone()
+        assert existing is not None
+        persisted = _inbound_tuple_from_row(existing)
+        if persisted != requested:
+            return InboundActionResult(ok=False, ack_status="rejected")
+        inbound_id = str(existing["inbound_id"])
+        decision_id = existing["decision_id"]
+        ack_status = existing["ack_status"]
 
     if ack_status == "acked":
         return InboundActionResult(
             ok=True,
             ack_status="acked",
             inbound_id=inbound_id,
-            decision_id=decision_id,
+            decision_id=str(decision_id) if decision_id is not None else None,
+        )
+
+    if ack_status == "rejected":
+        return InboundActionResult(
+            ok=False,
+            ack_status="rejected",
+            inbound_id=inbound_id,
+            decision_id=str(decision_id) if decision_id is not None else None,
         )
 
     if decision_id is None:
         recorded = DecisionLedger(sqlite_path=path).record_decision(
-            job_id=job_id,
-            decision_type=decision_type,
-            candidate_id=candidate_id,
-            candidate_version=candidate_version,
-            actor_id=actor_id,
-            policy_version=policy_version,
+            job_id=persisted["job_id"],
+            decision_type=persisted["decision_type"],
+            candidate_id=persisted["candidate_id"],
+            candidate_version=persisted["candidate_version"],
+            actor_id=persisted["actor_id"],
+            policy_version=persisted["policy_version"],
             decision_idempotency_key=decision_idempotency_key,
         )
         if not recorded.ok:
@@ -407,13 +509,13 @@ def consume_inbound_action(
             )
 
     try:
-        ack_port.ack(inbound_id=inbound_id, job_id=job_id)
+        ack_port.ack(inbound_id=inbound_id, job_id=persisted["job_id"])
     except Exception:
         return InboundActionResult(
             ok=True,
             ack_status="pending",
             inbound_id=inbound_id,
-            decision_id=decision_id,
+            decision_id=str(decision_id) if decision_id is not None else None,
         )
 
     with _connect(path) as conn:
@@ -429,7 +531,7 @@ def consume_inbound_action(
         ok=True,
         ack_status="acked",
         inbound_id=inbound_id,
-        decision_id=decision_id,
+        decision_id=str(decision_id) if decision_id is not None else None,
     )
 
 

@@ -805,21 +805,21 @@ def _live_policy_actor(
 
 
 def after_in_transaction_adapter_go() -> None:
-    """Test seam after in-transaction Go validation, before claim mutation.
+    """Crash-injection instrumentation after in-transaction Go validation.
 
-    Production is a no-op. Claim and stale-takeover callers invoke this while
-    still holding the write connection so tests can prove a concurrent policy
-    revoke/delete/change cannot commit between validation and mutation.
+    Production is a no-op. This cannot authorize, grant Go, or bypass ENG-29.
+    Claim and stale-takeover callers invoke this while still holding the write
+    connection so tests can abort before the mutation commits.
     """
     return None
 
 
 def before_begin_immediate() -> None:
-    """Test seam immediately before BEGIN IMMEDIATE on claim/takeover.
+    """Crash/race instrumentation immediately before BEGIN IMMEDIATE.
 
-    Production is a no-op. Tests use it to prove a waiter reached pre-lock
-    timing while authorization was still valid, then expire policy/tuple
-    during the lock wait.
+    Production is a no-op. This cannot authorize, grant Go, or bypass ENG-29.
+    Tests use it to prove a waiter reached pre-lock timing while authorization
+    was still valid, then expire policy/tuple during the lock wait.
     """
     return None
 

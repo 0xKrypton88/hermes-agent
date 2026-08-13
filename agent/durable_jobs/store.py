@@ -27,7 +27,7 @@ from agent.durable_jobs.models import (
 )
 from agent.durable_jobs.redaction import redact_payload
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -220,6 +220,9 @@ CREATE TABLE IF NOT EXISTS job_inbound_actions (
     root_thread_ts TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     decision_type TEXT NOT NULL,
+    policy_version TEXT NOT NULL DEFAULT '',
+    candidate_id TEXT NOT NULL DEFAULT '',
+    candidate_version TEXT NOT NULL DEFAULT '',
     decision_idempotency_key TEXT NOT NULL UNIQUE,
     decision_id TEXT,
     ack_status TEXT NOT NULL,
@@ -261,6 +264,11 @@ _DECISION_AUTHZ_COLUMNS = (
     ("target_action", "TEXT"),
     ("matrix_version", "TEXT"),
 )
+_INBOUND_TUPLE_COLUMNS = (
+    ("policy_version", "TEXT NOT NULL DEFAULT ''"),
+    ("candidate_id", "TEXT NOT NULL DEFAULT ''"),
+    ("candidate_version", "TEXT NOT NULL DEFAULT ''"),
+)
 _TUPLE_CANDIDATE_COLUMNS = (
     ("candidate_id", "TEXT NOT NULL DEFAULT ''"),
     ("candidate_version", "TEXT NOT NULL DEFAULT ''"),
@@ -268,7 +276,7 @@ _TUPLE_CANDIDATE_COLUMNS = (
 
 
 class UnknownSchemaError(ValueError):
-    """Refuse writes when schema_version is missing, newer, or unparseable."""
+    """Refuse writes when schema_version is missing on a pre-existing DB, newer, or unparseable."""
 
 
 def _utcnow() -> str:
@@ -276,12 +284,40 @@ def _utcnow() -> str:
 
 
 def after_job_rows_before_commit() -> None:
-    """Test seam after job+event rows, before COMMIT.
+    """Crash-injection instrumentation after job+event rows, before COMMIT.
 
-    Production is a no-op. Crash injection must leave zero job rows and
-    zero events: the write transaction is still uncommitted.
+    Production is a no-op. This cannot authorize, grant Go, or bypass
+    ENG-29. Crash injection must leave zero job rows and zero events:
+    the write transaction is still uncommitted.
     """
     return None
+
+
+_DURABLE_JOBS_TABLE_NAMES = (
+    "durable_jobs_meta",
+    "durable_jobs",
+    "durable_job_events",
+    "provider_effect_claims",
+    "provider_job_mappings",
+    "slack_job_bindings",
+    "job_authz_policies",
+    "job_decisions",
+    "job_authorization_tuples",
+    "job_terminal_evidence",
+    "job_resume_enqueues",
+    "job_inbound_actions",
+    "retired_idempotency_keys",
+)
+
+
+def _preexisting_durable_jobs_schema(conn: sqlite3.Connection) -> bool:
+    names = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    return bool(names.intersection(_DURABLE_JOBS_TABLE_NAMES))
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> Optional[str]:
@@ -377,6 +413,20 @@ def _ensure_eng29_authz(conn: sqlite3.Connection) -> None:
                 )
 
 
+def _ensure_inbound_tuple_columns(conn: sqlite3.Connection) -> None:
+    """Persist inbound idempotency tuple identity on v8 DBs."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(job_inbound_actions)")
+    }
+    if not existing:
+        return
+    for name, decl in _INBOUND_TUPLE_COLUMNS:
+        if name not in existing:
+            conn.execute(
+                f"ALTER TABLE job_inbound_actions ADD COLUMN {name} {decl}"
+            )
+
+
 def _rebuild_status_check_for_recovering(conn: sqlite3.Connection) -> None:
     for table in _CLAIM_LEASE_TABLES:
         ddl = _table_ddl(conn, table)
@@ -454,8 +504,22 @@ class DurableJobStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            # Inspect before any DDL. A missing-table SELECT can abort the
+            # implicit txn; roll it back so fail-closed raises cleanly and a
+            # truly empty DB can still initialize.
+            preexisting = _preexisting_durable_jobs_schema(conn)
             existing = _read_schema_version(conn)
-            if existing is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            if existing is None:
+                if preexisting:
+                    raise UnknownSchemaError(
+                        "missing durable-jobs schema_version on a pre-existing "
+                        f"database; refusing writes (local SCHEMA_VERSION={SCHEMA_VERSION})"
+                    )
+            else:
                 parsed = _parse_schema_version(existing)
                 if parsed is None or parsed > SCHEMA_VERSION:
                     raise UnknownSchemaError(
@@ -467,6 +531,7 @@ class DurableJobStore:
             _ensure_recovery_protocol(conn)
             _ensure_inflight_witness(conn)
             _ensure_eng29_authz(conn)
+            _ensure_inbound_tuple_columns(conn)
             conn.execute(
                 "INSERT INTO durable_jobs_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

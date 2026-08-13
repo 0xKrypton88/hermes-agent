@@ -34,7 +34,10 @@ def _utcnow() -> str:
 
 
 def after_decision_rows_before_commit() -> None:
-    """Test seam after decision+event rows, before COMMIT. Production no-op."""
+    """Crash-injection instrumentation after decision+event rows, before COMMIT.
+
+    Production is a no-op. This cannot authorize, grant Go, or bypass ENG-29.
+    """
     return None
 
 
