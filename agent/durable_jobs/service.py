@@ -51,12 +51,9 @@ class DurableJobService:
     def _require_store(self) -> DurableJobStore:
         if self._store is not None:
             return self._store
-        if self.config.sqlite_path is None:
-            raise DurableJobsConfigError(
-                "durable_jobs.sqlite_path must be set explicitly "
-                "(disposable / test path); refusing default Hermes state.db"
-            )
-        self._store = DurableJobStore(sqlite_path=self.config.sqlite_path)
+        from agent.durable_jobs.backend import open_application_store
+
+        self._store = open_application_store(self.config)
         return self._store
 
     def create_and_advance(
@@ -74,12 +71,38 @@ class DurableJobService:
             raise PilotDisabledError(
                 "durable_jobs.enabled is False; Package 1 pilot is a no-op"
             )
+        store = self._require_store()
+        backend = self.config.resolved_backend
+        if backend == "postgresql":
+            from agent.durable_jobs.graph import run_pilot_graph_postgres
+
+            job = store.create_job(
+                origin_platform=origin_platform,
+                origin_chat_id=origin_chat_id,
+                origin_root_thread_id=origin_root_thread_id,
+                objective=objective,
+                repository_identity=repository_identity,
+                frozen_baseline_sha=frozen_baseline_sha,
+                idempotency_key=idempotency_key,
+            )
+            if job.phase is JobPhase.AWAIT_DISPATCH:
+                return job
+            run_pilot_graph_postgres(
+                store=store,
+                checkpoint_dsn=self.config.checkpoint_postgres_dsn or "",
+                checkpoint_schema=self.config.checkpoint_postgres_schema or "",
+                job_id=job.job_id,
+                frozen_baseline_sha=frozen_baseline_sha or job.frozen_baseline_sha,
+            )
+            advanced = store.get_job(job.job_id)
+            assert advanced is not None
+            return advanced
+
         if self.config.checkpoint_sqlite_path is None:
             raise DurableJobsConfigError(
                 "durable_jobs.checkpoint_sqlite_path must be set explicitly "
                 "and must remain distinct from sqlite_path"
             )
-        store = self._require_store()
         assert self.config.sqlite_path is not None
         if self.config.sqlite_path.resolve() == self.config.checkpoint_sqlite_path.resolve():
             raise DurableJobsConfigError(
@@ -120,7 +143,7 @@ class DurableJobService:
         Records a rejected intent when a job exists, then always raises.
         Config flags and injected adapters cannot enable dispatch here.
         """
-        if self.config.sqlite_path is not None:
+        if self.config.sqlite_path is not None or self.config.resolved_backend == "postgresql":
             try:
                 store = self._require_store()
                 if store.get_job(job_id) is not None:

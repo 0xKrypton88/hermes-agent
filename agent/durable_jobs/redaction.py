@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 _KEEP_KEYS = frozenset(
@@ -49,12 +50,32 @@ _REDACT_SUBSTR = (
 
 REDACTED = "[REDACTED]"
 
+_URI_PASSWORD_RE = re.compile(
+    r"((?:postgres(?:ql)?)://[^:\s/]+:)([^@\s]+)(@)",
+    re.IGNORECASE,
+)
+_KV_PASSWORD_RE = re.compile(
+    r"(password\s*=\s*)(\S+)",
+    re.IGNORECASE,
+)
+
+
+def redact_secret_text(text: str) -> str:
+    """Redact DSN passwords and URI userinfo. Never raise on odd input."""
+    if not text:
+        return text
+    redacted = _URI_PASSWORD_RE.sub(r"\1[REDACTED]\3", text)
+    redacted = _KV_PASSWORD_RE.sub(r"\1[REDACTED]", redacted)
+    return redacted
+
 
 def _key_should_redact(key: str) -> bool:
     lowered = str(key).strip().lower()
     if lowered in _KEEP_KEYS or "idempotency" in lowered:
         return False
     if lowered in _REDACT_EXACT:
+        return True
+    if "dsn" in lowered:
         return True
     return any(part in lowered for part in _REDACT_SUBSTR)
 

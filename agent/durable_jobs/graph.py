@@ -5,7 +5,7 @@ No actual dispatch node. Persistence uses a SqliteSaver on a *separate*
 checkpoint DB path from the application job store.
 
 Later: swap SqliteSaver for a PostgreSQL checkpointer in production; keep the
-application job store on its own PostgreSQL schema (not implemented here).
+application job store on its own PostgreSQL schema (see postgres_checkpointer.py).
 """
 
 from __future__ import annotations
@@ -112,6 +112,38 @@ def run_pilot_graph(
 ) -> dict[str, Any]:
     """Advance a job through the pilot graph using LangGraph persistence."""
     checkpointer, conn = open_checkpointer(checkpoint_sqlite_path)
+    try:
+        graph = _build_graph(store).compile(checkpointer=checkpointer)
+        result = graph.invoke(
+            PilotGraphState(
+                job_id=job_id,
+                frozen_baseline_sha=frozen_baseline_sha,
+            ),
+            config={"configurable": {"thread_id": job_id}},
+        )
+        if is_dataclass(result) and not isinstance(result, type):
+            return asdict(result)
+        if isinstance(result, dict):
+            return dict(result)
+        return {"job_id": job_id, "result": result}
+    finally:
+        conn.close()
+
+
+def run_pilot_graph_postgres(
+    *,
+    store: DurableJobStore,
+    checkpoint_dsn: str,
+    checkpoint_schema: str,
+    job_id: str,
+    frozen_baseline_sha: str,
+) -> dict[str, Any]:
+    """Advance a job through the pilot graph using PostgreSQL checkpoints."""
+    from agent.durable_jobs.postgres_checkpointer import open_postgres_checkpointer
+
+    checkpointer, conn = open_postgres_checkpointer(
+        dsn=checkpoint_dsn, schema=checkpoint_schema
+    )
     try:
         graph = _build_graph(store).compile(checkpointer=checkpointer)
         result = graph.invoke(

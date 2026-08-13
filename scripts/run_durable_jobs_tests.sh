@@ -5,7 +5,7 @@
 # It is NOT a core hermes-agent dependency. Release venvs therefore omit it.
 #
 # This script REQUIRES `uv` and installs via:
-#   UV_PROJECT_ENVIRONMENT=<venv> uv sync --extra dev --locked
+#   UV_PROJECT_ENVIRONMENT=<venv> uv sync --extra dev --extra langgraph-durable-postgres --locked
 # so versions match uv.lock (e.g. langgraph-checkpoint==4.1.1). Plain
 # `pip install -e '.[dev]'` is intentionally NOT used — it is non-locked and
 # can resolve newer transitive pins (observed: langgraph-checkpoint 4.2.0).
@@ -20,7 +20,7 @@
 #
 # Manual equivalent:
 #   uv venv .venv-durable-jobs
-#   UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --locked
+#   UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --extra langgraph-durable-postgres --locked
 #   .venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
 #   # Windows: .venv-durable-jobs\Scripts\python.exe -m pytest ...
 
@@ -40,9 +40,9 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 echo "▶ durable-jobs clean env (uv --locked): venv=$VENV"
-echo "▶ UV_PROJECT_ENVIRONMENT=$VENV uv sync --extra dev --locked"
+echo "▶ UV_PROJECT_ENVIRONMENT=$VENV uv sync --extra dev --extra langgraph-durable-postgres --locked"
 
-UV_PROJECT_ENVIRONMENT="$VENV" uv sync --extra dev --locked
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --extra dev --extra langgraph-durable-postgres --locked
 
 if [ -x "$VENV/bin/python" ]; then
   PY="$VENV/bin/python"
@@ -54,7 +54,7 @@ else
 fi
 
 if ! "$PY" -c 'import langgraph, langgraph.checkpoint.sqlite, pytest' 2>/dev/null; then
-  echo "error: langgraph/pytest missing after uv sync --extra dev --locked" >&2
+  echo "error: langgraph/pytest missing after uv sync --extra dev --extra langgraph-durable-postgres --locked" >&2
   exit 1
 fi
 

@@ -5,8 +5,9 @@ This SQLite store is:
 - Single-process / dev-only — NOT a production durable store.
 - Distinct from LangGraph checkpointer state (separate DB path + tables).
 
-Schema/migrations are local to this pilot (SCHEMA_VERSION). Production
-durable-store decision is PostgreSQL-first and remains unimplemented.
+Schema/migrations are local to this pilot (SCHEMA_VERSION). PostgreSQL
+application persistence lives in ``postgres_store.py`` (ENG-25) and is
+never a silent fallback from this SQLite path.
 """
 
 from __future__ import annotations

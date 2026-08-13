@@ -95,26 +95,63 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   arming/disarming, or live reconciliation
 - Does **not** touch existing completion/outbox modules or Hermes `state.db`
 - Does **not** add LangGraph to core dependencies (opt-in extra only)
-- SQLite here is **not** ENG-25 production PostgreSQL acceptance
+- SQLite here is **not** a substitute for the ENG-25 PostgreSQL extra when
+  `backend: postgresql` is selected (no silent fallback)
 
 ## Storage boundaries
 
-| Store | Path | Purpose |
-|-------|------|---------|
-| Application job store | `durable_jobs.sqlite_path` (required, explicit) | Jobs + events + ENG-26/27 ledgers |
-| LangGraph checkpointer | `durable_jobs.checkpoint_sqlite_path` (required, distinct) | Graph thread checkpoints |
+| Store | Selector | Purpose |
+|-------|----------|---------|
+| Application job store (SQLite, dev/test) | `backend: sqlite` (or inferred from sqlite paths) + `sqlite_path` | Jobs + events + ENG-26/27 ledgers |
+| LangGraph checkpointer (SQLite, dev/test) | `checkpoint_sqlite_path` (distinct file) | Graph thread checkpoints |
+| Application job store (PostgreSQL, ENG-25) | `backend: postgresql` + `postgres_dsn` + `postgres_schema` | Jobs + events (+ unused ledger DDL for later slices) |
+| LangGraph checkpointer (PostgreSQL, ENG-25) | `checkpoint_postgres_dsn` + `checkpoint_postgres_schema` | Graph thread checkpoints |
 
-Both are **dev/test SQLite only**, single-process. Schema version is local
-(`SCHEMA_VERSION` in `store.py`).
+SQLite remains single-process / disposable. PostgreSQL uses a dedicated
+application schema (CAS + `SELECT … FOR UPDATE` + `pg_advisory_xact_lock`)
+and a **separate** checkpointer schema via `search_path`. Schema version is
+local (`SCHEMA_VERSION` in `store.py`). Unknown/future/missing markers fail
+closed before application mutation.
 
-### Later: production PostgreSQL
+Mixed SQLite+PostgreSQL config, missing DSNs, identical checkpointer/
+application schema identity (same host/port/database/schema), unsafe or
+`public` schema names, and in-memory persistence are rejected at load.
+DSNs never appear in `repr` / errors.
 
-1. Keep the application job/outbox schema on PostgreSQL (migrations owned by
-   this domain, not Hermes SessionDB).
-2. Replace `langgraph.checkpoint.sqlite.SqliteSaver` with a PostgreSQL
-   checkpointer (e.g. `langgraph-checkpoint-postgres`) pointed at a separate
-   checkpoint schema/database.
-3. Do not merge checkpointer tables into the application job store.
+```yaml
+durable_jobs:
+  enabled: false
+  dispatch_enabled: false
+  backend: null   # sqlite | postgresql; postgresql must be explicit
+  sqlite_path: null
+  checkpoint_sqlite_path: null
+  postgres_dsn: null
+  postgres_schema: null
+  checkpoint_postgres_dsn: null
+  checkpoint_postgres_schema: null
+```
+
+Install PostgreSQL support with the opt-in extra (not core, not `[all]`,
+not `[dev]`):
+
+```bash
+uv sync --extra langgraph-durable-postgres --locked
+```
+
+### Remaining operational gaps (not this slice)
+
+- ENG-26/27 ledgers (`provider_effect_claims`, Slack bindings, decisions,
+  inbound ACK) still execute on SQLite connections; the durable-lane
+  facade **refuses** PostgreSQL rather than falling back to SQLite
+- No production migration runner, no replica/failover, no connection-pool
+  policy beyond per-call `psycopg.connect`
+- No SERIALIZABLE isolation (this slice uses row locks + advisory xact
+  locks + CAS)
+- Package 1 dispatch remains hard-disabled: zero Cursor/provider/Slack
+  calls, no gateway/platform wiring
+- ENG-29 Go/cancel/authorization semantics are unchanged and still
+  local-policy-contract on SQLite ledgers
+- Not a production datastore cutover; not credentials, deploy, or restart
 
 ## Config
 
@@ -122,7 +159,7 @@ Both are **dev/test SQLite only**, single-process. Schema version is local
 durable_jobs:
   enabled: false          # default; must be a real boolean (not "false")
   dispatch_enabled: false # retained for shape only — Package 1 hard-disables dispatch
-  sqlite_path: null       # must be set explicitly when enabling
+  sqlite_path: null       # must be set explicitly when enabling sqlite
   checkpoint_sqlite_path: null
 ```
 
@@ -134,10 +171,11 @@ calls an injected dispatch adapter. ENG-26/27 lane methods also no-op unless
 ## Tests (clean / release-venv safe)
 
 LangGraph is **not** installed in the release venv. Use the harness — it requires
-`uv` and installs via `uv sync --extra dev --locked` into an isolated venv so
-transitive pins match `uv.lock` (e.g. `langgraph-checkpoint==4.1.1`). Bare
-`pip install -e '.[dev]'` is **non-locked** and must not be treated as
-reproducible locked evidence.
+`uv` and installs via
+`uv sync --extra dev --extra langgraph-durable-postgres --locked`
+into an isolated venv so transitive pins match `uv.lock`
+(e.g. `langgraph-checkpoint==4.1.1`). Bare `pip install -e '.[dev]'` is
+**non-locked** and must not be treated as reproducible locked evidence.
 
 ```bash
 scripts/run_durable_jobs_tests.sh
@@ -147,11 +185,15 @@ Manual equivalent (Windows: use `Scripts\python.exe`):
 
 ```bash
 uv venv .venv-durable-jobs
-UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --locked
+UV_PROJECT_ENVIRONMENT=.venv-durable-jobs uv sync --extra dev --extra langgraph-durable-postgres --locked
 .venv-durable-jobs/bin/python -m pytest tests/agent/durable_jobs/
 ```
 
-If a local `.venv` already has `[dev]` synced from the lockfile:
+PostgreSQL integration tests require `HERMES_DURABLE_JOBS_PG_TEST_DSN`.
+They skip only with `missing-test-DSN` when that variable is unset.
+
+If a local `.venv` already has `[dev]` synced from the lockfile (SQLite
+path only):
 
 ```bash
 scripts/run_tests.sh tests/agent/durable_jobs/

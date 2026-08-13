@@ -45,6 +45,11 @@ class DurableLaneService:
             )
 
     def _require_sqlite_path(self) -> DurableJobStore:
+        if self.config.resolved_backend == "postgresql":
+            raise DurableJobsConfigError(
+                "durable-lane Slack/provider/decision ledgers do not fall back "
+                "to SQLite when durable_jobs.backend is postgresql"
+            )
         if self._store is not None:
             return self._store
         if self.config.sqlite_path is None:

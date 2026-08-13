@@ -1,4 +1,4 @@
-"""LangGraph durable-job pilot (ENG-3 Package 1 + ENG-26/ENG-27 slices).
+"""LangGraph durable-job pilot (ENG-3 Package 1 + ENG-26/ENG-27 + ENG-25 slice).
 
 Isolated, disabled-by-default module. No gateway / Slack / Cursor wiring.
 Dispatch is hard-disabled (never invokes adapters). Provider and Slack
@@ -7,8 +7,9 @@ with persisted owner token, lease fencing, owner-fenced heartbeat, and
 bounded recovering state after empty lookup.
 
 SQLite usage here is disposable, explicit-path, single-process, and
-dev/test-only. Production durable store remains PostgreSQL-first and is not
-provisioned by this package. This SQLite path does not satisfy ENG-25.
+dev/test-only. PostgreSQL persistence is an opt-in extra
+(`[langgraph-durable-postgres]`) selected only by an explicit backend;
+it does not silently fall back to SQLite.
 """
 
 from __future__ import annotations
