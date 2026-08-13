@@ -74,10 +74,12 @@ zero injected adapter calls.
 
 **Claim / stale takeover atomicity.** Live mandatory-Go validation and the
 durable initial-claim or stale-takeover mutation/event share the caller's
-active SQLite connection (IMMEDIATE write transaction). A concurrent policy
-delete, revoke, expiry, version, or actor change cannot commit between
-validation and the claim/takeover write. Cancellation checks, CAS, exact
-tuple binding, default-deny, and event atomicity are preserved.
+active SQLite connection. Callers issue `BEGIN IMMEDIATE` before validation
+because Python's sqlite3 module does not open an IMMEDIATE transaction on
+SELECT. The write lock is therefore held across live Go checks and the
+claim/takeover mutation, so a concurrent policy delete, revoke, expiry,
+version, or actor change cannot commit between them. Cancellation checks,
+CAS, exact tuple binding, default-deny, and event atomicity are preserved.
 
 **External-call boundary (not atomic).** Recovery lookup, injected
 `create_run`, and injected `post_root` re-run the latest-safe guard on a
