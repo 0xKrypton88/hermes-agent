@@ -56,6 +56,71 @@ class DurableJobService:
         self._store = open_application_store(self.config)
         return self._store
 
+    def _create_and_advance_postgres(
+        self,
+        store: DurableJobStore,
+        *,
+        origin_platform: str,
+        origin_chat_id: str,
+        origin_root_thread_id: str,
+        objective: str,
+        repository_identity: str,
+        idempotency_key: str,
+        frozen_baseline_sha: str,
+    ) -> DurableJob:
+        import secrets
+        import time
+
+        from agent.durable_jobs.graph import run_pilot_graph_postgres
+        from agent.durable_jobs.models import InvalidPhaseTransition
+        from agent.durable_jobs.postgres_advance import AdvanceClaimDecision
+        from agent.durable_jobs.postgres_identity import verify_postgres_storage_isolation
+
+        verify_postgres_storage_isolation(self.config)
+        job = store.create_job(
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
+            origin_root_thread_id=origin_root_thread_id,
+            objective=objective,
+            repository_identity=repository_identity,
+            frozen_baseline_sha=frozen_baseline_sha,
+            idempotency_key=idempotency_key,
+        )
+        owner = secrets.token_hex(16)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            current = store.get_job(job.job_id)
+            if current is None:
+                raise KeyError(job.job_id)
+            if current.phase is JobPhase.AWAIT_DISPATCH:
+                return current
+            claim = store.claim_advance(current.job_id, owner_token=owner)
+            if claim.decision is AdvanceClaimDecision.ADOPT_COMPLETED:
+                adopted = store.get_job(current.job_id)
+                assert adopted is not None
+                return adopted
+            if claim.decision is AdvanceClaimDecision.LOST_LIVE_OWNER:
+                time.sleep(0.05)
+                continue
+            try:
+                run_pilot_graph_postgres(
+                    store=store,
+                    checkpoint_dsn=self.config.checkpoint_postgres_dsn or "",
+                    checkpoint_schema=self.config.checkpoint_postgres_schema or "",
+                    job_id=current.job_id,
+                    frozen_baseline_sha=frozen_baseline_sha or current.frozen_baseline_sha,
+                )
+                store.complete_advance(current.job_id, owner_token=owner)
+            except InvalidPhaseTransition:
+                pass
+            advanced = store.get_job(current.job_id)
+            if advanced is not None and advanced.phase is JobPhase.AWAIT_DISPATCH:
+                return advanced
+            time.sleep(0.05)
+        raise TimeoutError(
+            "timed out adopting a concurrent durable-job PostgreSQL advance"
+        )
+
     def create_and_advance(
         self,
         *,
@@ -74,29 +139,16 @@ class DurableJobService:
         store = self._require_store()
         backend = self.config.resolved_backend
         if backend == "postgresql":
-            from agent.durable_jobs.graph import run_pilot_graph_postgres
-
-            job = store.create_job(
+            return self._create_and_advance_postgres(
+                store,
                 origin_platform=origin_platform,
                 origin_chat_id=origin_chat_id,
                 origin_root_thread_id=origin_root_thread_id,
                 objective=objective,
                 repository_identity=repository_identity,
-                frozen_baseline_sha=frozen_baseline_sha,
                 idempotency_key=idempotency_key,
+                frozen_baseline_sha=frozen_baseline_sha,
             )
-            if job.phase is JobPhase.AWAIT_DISPATCH:
-                return job
-            run_pilot_graph_postgres(
-                store=store,
-                checkpoint_dsn=self.config.checkpoint_postgres_dsn or "",
-                checkpoint_schema=self.config.checkpoint_postgres_schema or "",
-                job_id=job.job_id,
-                frozen_baseline_sha=frozen_baseline_sha or job.frozen_baseline_sha,
-            )
-            advanced = store.get_job(job.job_id)
-            assert advanced is not None
-            return advanced
 
         if self.config.checkpoint_sqlite_path is None:
             raise DurableJobsConfigError(

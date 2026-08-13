@@ -129,6 +129,8 @@ durable_jobs:
   postgres_schema: null
   checkpoint_postgres_dsn: null
   checkpoint_postgres_schema: null
+  postgres_storage_id: null
+  checkpoint_postgres_storage_id: null
 ```
 
 Install PostgreSQL support with the opt-in extra (not core, not `[all]`,
@@ -152,6 +154,18 @@ uv sync --extra langgraph-durable-postgres --locked
 - ENG-29 Go/cancel/authorization semantics are unchanged and still
   local-policy-contract on SQLite ledgers
 - Not a production datastore cutover; not credentials, deploy, or restart
+- Backup/restore is sandbox-gated only; see
+  `docs/design/durable-jobs-postgres-backup-restore.md`. Cursor Cloud does
+  not execute restore.
+
+PostgreSQL application vs checkpointer isolation is fail-closed:
+loopback aliases (`localhost` / `127.0.0.1` / `::1`) that target the
+same database+schema are rejected at config load; distinct
+`postgres_storage_id` values are required; live setup additionally
+compares `pg_control_system().system_identifier` + `current_database()`
++ schema. DNS is not used. Empty/foreign/unmarked/wrong-owner schemas
+are refused. `attempt_dispatch` on PostgreSQL still raises before any
+store I/O.
 
 ## Config
 

@@ -14,7 +14,6 @@ from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
-from urllib.parse import unquote, urlparse
 
 from agent.durable_jobs.redaction import redact_secret_text
 
@@ -48,6 +47,8 @@ _POSTGRES_KEYS = (
     "postgres_schema",
     "checkpoint_postgres_dsn",
     "checkpoint_postgres_schema",
+    "postgres_storage_id",
+    "checkpoint_postgres_storage_id",
 )
 
 DEFAULT_DURABLE_JOBS_CONFIG: dict[str, Any] = {
@@ -60,6 +61,8 @@ DEFAULT_DURABLE_JOBS_CONFIG: dict[str, Any] = {
     "postgres_schema": None,
     "checkpoint_postgres_dsn": None,
     "checkpoint_postgres_schema": None,
+    "postgres_storage_id": None,
+    "checkpoint_postgres_storage_id": None,
 }
 
 
@@ -87,6 +90,8 @@ class DurableJobsConfig:
     postgres_schema: Optional[str] = None
     checkpoint_postgres_dsn: Optional[str] = None
     checkpoint_postgres_schema: Optional[str] = None
+    postgres_storage_id: Optional[str] = None
+    checkpoint_postgres_storage_id: Optional[str] = None
 
     @property
     def dispatch_allowed(self) -> bool:
@@ -115,7 +120,9 @@ class DurableJobsConfig:
             f"postgres_dsn={_redact_dsn_value(self.postgres_dsn)}, "
             f"postgres_schema={self.postgres_schema!r}, "
             f"checkpoint_postgres_dsn={_redact_dsn_value(self.checkpoint_postgres_dsn)}, "
-            f"checkpoint_postgres_schema={self.checkpoint_postgres_schema!r})"
+            f"checkpoint_postgres_schema={self.checkpoint_postgres_schema!r}, "
+            f"postgres_storage_id={self.postgres_storage_id!r}, "
+            f"checkpoint_postgres_storage_id={self.checkpoint_postgres_storage_id!r})"
         )
 
 
@@ -214,33 +221,17 @@ def validate_schema_identifier(value: Any, field: str) -> str:
     return text
 
 
-def _database_identity(dsn: str) -> tuple[str, int, str]:
-    parsed = urlparse(dsn)
-    scheme = (parsed.scheme or "").lower()
-    if scheme in {"postgres", "postgresql"}:
-        host = (parsed.hostname or "").lower()
-        port = parsed.port or 5432
-        db = unquote((parsed.path or "").lstrip("/")).split("?")[0].lower()
-        return (host, port, db)
-    # libpq keyword/value form
-    kv: dict[str, str] = {}
-    for part in dsn.replace(";", " ").split():
-        if "=" not in part:
-            continue
-        key, raw = part.split("=", 1)
-        kv[key.strip().lower()] = unquote(raw.strip())
-    host = (kv.get("host") or kv.get("hostaddr") or "").lower()
-    try:
-        port = int(kv.get("port") or "5432")
-    except ValueError:
-        port = 5432
-    db = (kv.get("dbname") or kv.get("database") or "").lower()
-    return (host, port, db)
-
-
-def _schema_identity(dsn: str, schema: str) -> tuple[str, int, str, str]:
-    host, port, db = _database_identity(dsn)
-    return (host, port, db, schema)
+def validate_storage_id(value: Any, field: str) -> str:
+    text = _optional_text(value)
+    if text is None:
+        raise DurableJobsConfigError(
+            f"durable_jobs.{field} must be an explicit storage identity"
+        )
+    if not _SAFE_SCHEMA_RE.fullmatch(text) or text != text.lower():
+        raise DurableJobsConfigError(
+            f"durable_jobs.{field} is not a safe storage identity"
+        )
+    return text
 
 
 def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig:
@@ -311,6 +302,8 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
 
     postgres_schema: Optional[str] = None
     checkpoint_postgres_schema: Optional[str] = None
+    postgres_storage_id: Optional[str] = None
+    checkpoint_postgres_storage_id: Optional[str] = None
     if backend == BACKEND_POSTGRESQL:
         if postgres_dsn is None:
             raise DurableJobsConfigError("durable_jobs.postgres_dsn is required")
@@ -324,14 +317,35 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
             raise DurableJobsConfigError(
                 "durable_jobs PostgreSQL DSNs reject in-memory persistence"
             )
+        from agent.durable_jobs.postgres_identity import (
+            config_schema_identity,
+            validate_postgres_dsn,
+        )
+
+        postgres_dsn = validate_postgres_dsn(postgres_dsn, "postgres_dsn")
+        checkpoint_postgres_dsn = validate_postgres_dsn(
+            checkpoint_postgres_dsn, "checkpoint_postgres_dsn"
+        )
         postgres_schema = validate_schema_identifier(
             postgres_schema_raw, "postgres_schema"
         )
         checkpoint_postgres_schema = validate_schema_identifier(
             checkpoint_postgres_schema_raw, "checkpoint_postgres_schema"
         )
-        app_identity = _schema_identity(postgres_dsn, postgres_schema)
-        ckpt_identity = _schema_identity(
+        postgres_storage_id = validate_storage_id(
+            merged.get("postgres_storage_id"), "postgres_storage_id"
+        )
+        checkpoint_postgres_storage_id = validate_storage_id(
+            merged.get("checkpoint_postgres_storage_id"),
+            "checkpoint_postgres_storage_id",
+        )
+        if postgres_storage_id == checkpoint_postgres_storage_id:
+            raise DurableJobsConfigError(
+                "application and checkpointer postgres_storage_id values "
+                "must be distinct"
+            )
+        app_identity = config_schema_identity(postgres_dsn, postgres_schema)
+        ckpt_identity = config_schema_identity(
             checkpoint_postgres_dsn, checkpoint_postgres_schema
         )
         if app_identity == ckpt_identity:
@@ -352,4 +366,6 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
         postgres_schema=postgres_schema,
         checkpoint_postgres_dsn=checkpoint_postgres_dsn,
         checkpoint_postgres_schema=checkpoint_postgres_schema,
+        postgres_storage_id=postgres_storage_id,
+        checkpoint_postgres_storage_id=checkpoint_postgres_storage_id,
     )

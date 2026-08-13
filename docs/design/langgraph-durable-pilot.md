@@ -22,8 +22,12 @@ PostgreSQL extra is `[langgraph-durable-postgres]` — not core, not `[all]`.
 
 - SQLite paths are explicit and disposable (tests/config only).
 - PostgreSQL uses two identities: application DSN+schema and checkpointer
-  DSN+schema. Identical identity is rejected. `public` / unsafe identifiers
-  and in-memory persistence are rejected. DSNs are redacted from repr/errors.
+  DSN+schema. Identical identity is rejected, including loopback aliases
+  (`localhost` vs `127.0.0.1`) targeting the same database+schema.
+  Distinct `postgres_storage_id` values are required. Live setup compares
+  `system_identifier + current_database() + schema` (not DNS). `public` /
+  unsafe identifiers, malformed DSNs, and in-memory persistence are
+  rejected. DSNs are redacted from repr/errors/payloads.
 - External systems exist only as injected Protocol ports + fakes
   (`agent/durable_jobs/adapters.py`). Package 1 never calls them.
 - Config booleans must be real `bool` values; string/int forms are rejected.
@@ -66,6 +70,12 @@ scripts/run_durable_jobs_tests.sh
 
 Live PostgreSQL integration tests skip only with
 `missing-test-DSN: HERMES_DURABLE_JOBS_PG_TEST_DSN is unset`.
+
+Backup/restore/restart acceptance for a paired application+checkpointer
+snapshot is documented in
+`docs/design/durable-jobs-postgres-backup-restore.md`. The sandbox tool
+(`agent/durable_jobs/sandbox_backup.py`) is fail-closed and is not
+executed against live state in Cursor Cloud.
 
 ## Remaining operational gaps (not this slice)
 

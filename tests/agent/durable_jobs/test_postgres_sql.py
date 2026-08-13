@@ -103,6 +103,13 @@ def test_checkpointer_seam_binds_checkpoint_schema_and_skips_memory_saver(monkey
     class _Cursor:
         def execute(self, sql, params=None):
             recorded["sql"].append(str(sql))
+            return self
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
 
         def __enter__(self):
             return self
@@ -191,6 +198,8 @@ def test_checkpointer_factory_does_not_use_sqlite_or_memory_for_postgresql(
                 "postgres_schema": "durable_jobs_app",
                 "checkpoint_postgres_dsn": "postgresql://hermes:supersecret@localhost:5432/durable_jobs",
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
             }
         }
     )

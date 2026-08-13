@@ -26,6 +26,8 @@ def _pg_section() -> dict:
         "postgres_schema": "durable_jobs_app",
         "checkpoint_postgres_dsn": CHECKPOINT_DSN,
         "checkpoint_postgres_schema": "durable_jobs_ckpt",
+        "postgres_storage_id": "durable_app",
+        "checkpoint_postgres_storage_id": "durable_ckpt",
     }
 
 
@@ -41,6 +43,8 @@ def test_defaults_remain_disabled_without_backend_or_postgres_fields():
         "postgres_schema",
         "checkpoint_postgres_dsn",
         "checkpoint_postgres_schema",
+        "postgres_storage_id",
+        "checkpoint_postgres_storage_id",
     ):
         assert DEFAULT_DURABLE_JOBS_CONFIG.get(key) in (None, "", False)
 
@@ -54,6 +58,8 @@ def test_defaults_remain_disabled_without_backend_or_postgres_fields():
     assert cfg.postgres_schema is None
     assert cfg.checkpoint_postgres_dsn is None
     assert cfg.checkpoint_postgres_schema is None
+    assert cfg.postgres_storage_id is None
+    assert cfg.checkpoint_postgres_storage_id is None
     assert cfg.sqlite_path is None
     assert cfg.checkpoint_sqlite_path is None
 
@@ -95,6 +101,8 @@ def test_explicit_postgresql_backend_requires_both_dsns_and_schemas():
         "postgres_schema",
         "checkpoint_postgres_dsn",
         "checkpoint_postgres_schema",
+        "postgres_storage_id",
+        "checkpoint_postgres_storage_id",
     ],
 )
 def test_postgresql_backend_rejects_missing_dsn_or_schema(missing):
@@ -176,6 +184,8 @@ def test_identical_application_and_checkpointer_schema_identity_rejected():
                     "postgres_schema": "shared_schema",
                     "checkpoint_postgres_dsn": CHECKPOINT_DSN,
                     "checkpoint_postgres_schema": "shared_schema",
+                    "postgres_storage_id": "durable_app",
+                    "checkpoint_postgres_storage_id": "durable_ckpt",
                 }
             }
         )
@@ -195,6 +205,8 @@ def test_same_schema_name_on_distinct_databases_is_allowed():
                 "postgres_schema": "durable_jobs",
                 "checkpoint_postgres_dsn": OTHER_DSN,
                 "checkpoint_postgres_schema": "durable_jobs",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
             }
         }
     )
@@ -229,7 +241,9 @@ def test_unsafe_schema_identifiers_rejected(schema):
                     "postgres_dsn": SECRET_DSN,
                     "postgres_schema": schema,
                     "checkpoint_postgres_dsn": SECRET_DSN,
-                    "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
                 }
             }
         )
@@ -249,7 +263,9 @@ def test_unqualified_or_default_schema_identifiers_rejected(schema):
                     "postgres_dsn": SECRET_DSN,
                     "postgres_schema": schema or None,
                     "checkpoint_postgres_dsn": SECRET_DSN,
-                    "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
                 }
             }
         )
@@ -300,7 +316,9 @@ def test_in_memory_postgres_dsn_rejected():
                     "postgres_dsn": "postgresql:///:memory:",
                     "postgres_schema": "durable_jobs_app",
                     "checkpoint_postgres_dsn": SECRET_DSN,
-                    "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
                 }
             }
         )

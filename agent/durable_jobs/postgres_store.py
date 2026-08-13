@@ -9,6 +9,7 @@ the LangGraph checkpointer. There is no SQLite fallback.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from agent.durable_jobs.config import DurableJobsConfigError, validate_schema_identifier
@@ -18,6 +19,21 @@ from agent.durable_jobs.models import (
     DurableJob,
     InvalidPhaseTransition,
     JobPhase,
+)
+from agent.durable_jobs.postgres_advance import (
+    AdvanceClaimDecision,
+    AdvanceClaimError,
+    AdvanceClaimResult,
+    AdvanceClaimView,
+    decide_advance_claim,
+)
+from agent.durable_jobs.postgres_domain import (
+    APPLICATION_DOMAIN,
+    DOMAIN_META_KEY,
+    OWNER_META_KEY,
+    SchemaOccupancy,
+    classify_schema_occupancy,
+    require_owned_or_vacant,
 )
 from agent.durable_jobs.redaction import redact_payload
 from agent.durable_jobs.store import (
@@ -330,6 +346,18 @@ CREATE TABLE IF NOT EXISTS {q}.retired_idempotency_keys (
     origin TEXT NOT NULL,
     retired_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS {q}.durable_job_advance_claims (
+    job_id TEXT PRIMARY KEY,
+    owner_token TEXT NOT NULL,
+    status TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    leased_until TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (status IN ('claimed', 'completed')),
+    FOREIGN KEY (job_id) REFERENCES {q}.durable_jobs(job_id)
+);
 """
 
 
@@ -385,6 +413,77 @@ class PostgresDurableJobStore:
             value = row[0]
         return str(value) if value is not None else None
 
+    def _scalar(self, row: Any, key: str, index: int = 0) -> Any:
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row.get(key, row.get(list(row.keys())[index] if row else None))
+        return row[index]
+
+    def _table_names(self, conn: Any) -> frozenset[str]:
+        rows = conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = %s",
+            (self._schema,),
+        ).fetchall()
+        names = set()
+        for row in rows:
+            if isinstance(row, dict):
+                names.add(str(row.get("tablename") or next(iter(row.values()))))
+            else:
+                names.add(str(row[0]))
+        return frozenset(names)
+
+    def _read_markers(self, conn: Any, tables: frozenset[str]) -> dict[str, str]:
+        if "durable_jobs_meta" not in tables:
+            return {}
+        rows = conn.execute(
+            f"SELECT key, value FROM {self._schema}.durable_jobs_meta"
+        ).fetchall()
+        markers: dict[str, str] = {}
+        for row in rows:
+            if isinstance(row, dict):
+                markers[str(row["key"])] = str(row["value"])
+            else:
+                markers[str(row[0])] = str(row[1])
+        return markers
+
+    def _current_role(self, conn: Any) -> str:
+        row = conn.execute("SELECT current_user").fetchone()
+        return str(self._scalar(row, "current_user", 0))
+
+    def _namespace_owner(self, conn: Any) -> Optional[str]:
+        row = conn.execute(
+            """
+            SELECT r.rolname
+              FROM pg_namespace n
+              JOIN pg_roles r ON r.oid = n.nspowner
+             WHERE n.nspname = %s
+            """,
+            (self._schema,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(self._scalar(row, "rolname", 0))
+
+    def _write_application_markers(self, conn: Any, owner_role: str) -> None:
+        for key, value in (
+            ("schema_version", str(SCHEMA_VERSION)),
+            (DOMAIN_META_KEY, APPLICATION_DOMAIN),
+            (OWNER_META_KEY, owner_role),
+        ):
+            conn.execute(
+                f"INSERT INTO {self._schema}.durable_jobs_meta(key, value) "
+                "VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value),
+            )
+
+    def _apply_ddl(self, conn: Any) -> None:
+        for statement in _application_ddl(self._schema).split(";"):
+            stmt = statement.strip()
+            if stmt:
+                conn.execute(stmt)
+
     def _init_schema(self) -> None:
         conn = self._connect()
         try:
@@ -392,24 +491,31 @@ class PostgresDurableJobStore:
                 "SELECT pg_advisory_xact_lock(%s, %s)",
                 (_ADVISORY_CLASSID, 1),
             )
-            preexisting = self._preexisting(conn)
-            version = self._read_schema_version(conn) if preexisting else None
-            probe = type("Probe", (), {"version": version})()
-            fail_closed_for_schema_marker(
-                probe, schema=self._schema, preexisting=preexisting
+            owner_role = self._namespace_owner(conn)
+            current_role = self._current_role(conn)
+            tables = self._table_names(conn)
+            markers = self._read_markers(conn, tables)
+            occupancy = classify_schema_occupancy(
+                schema_exists=owner_role is not None,
+                table_names=tables,
+                markers=markers,
+                owner_role=owner_role,
+                current_role=current_role,
+                expected_domain=APPLICATION_DOMAIN,
             )
-            if version is None:
-                conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
-                for statement in _application_ddl(self._schema).split(";"):
-                    stmt = statement.strip()
-                    if stmt:
-                        conn.execute(stmt)
+            require_owned_or_vacant(occupancy, schema=self._schema)
+            if occupancy is SchemaOccupancy.VACANT:
                 conn.execute(
-                    f"INSERT INTO {self._schema}.durable_jobs_meta(key, value) "
-                    "VALUES (%s, %s) "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                    ("schema_version", str(SCHEMA_VERSION)),
+                    f"CREATE SCHEMA {self._schema} AUTHORIZATION CURRENT_USER"
                 )
+                self._apply_ddl(conn)
+                self._write_application_markers(conn, current_role)
+            else:
+                probe = type("Probe", (), {"version": markers.get("schema_version")})()
+                fail_closed_for_schema_marker(
+                    probe, schema=self._schema, preexisting=True
+                )
+                self._apply_ddl(conn)
             conn.commit()
         except Exception:
             try:
@@ -692,6 +798,136 @@ class PostgresDurableJobStore:
         finally:
             conn.close()
         return row is not None
+
+    def _parse_lease(self, raw: str) -> datetime:
+        text = str(raw).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _claim_view(self, row: Any) -> AdvanceClaimView:
+        getter = row.__getitem__
+        return AdvanceClaimView(
+            owner_token=str(getter("owner_token")),
+            status=str(getter("status")),
+            generation=int(getter("generation")),
+            leased_until=self._parse_lease(str(getter("leased_until"))),
+        )
+
+    def claim_advance(
+        self,
+        job_id: str,
+        *,
+        owner_token: str,
+        lease_seconds: float = 30.0,
+    ) -> AdvanceClaimResult:
+        now = datetime.now(timezone.utc)
+        leased_until = (now + timedelta(seconds=lease_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        stamp = _utcnow()
+        conn = self._connect()
+        try:
+            conn.execute(ADVISORY_LOCK_SQL, (_ADVISORY_CLASSID, job_id))
+            row = conn.execute(
+                JOB_ROW_LOCK_SQL_TEMPLATE.format(schema=self._schema),
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown job_id: {job_id}")
+            job = self._row_to_job(row)
+            claim_row = conn.execute(
+                f"SELECT * FROM {self._schema}.durable_job_advance_claims "
+                "WHERE job_id = %s FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            existing = self._claim_view(claim_row) if claim_row else None
+            decision = decide_advance_claim(
+                job_phase=job.phase.value,
+                existing=existing,
+                owner_token=owner_token,
+                now=now,
+            )
+            generation = existing.generation if existing is not None else 0
+            if decision is AdvanceClaimDecision.WIN:
+                generation = 1
+                conn.execute(
+                    f"""
+                    INSERT INTO {self._schema}.durable_job_advance_claims(
+                        job_id, owner_token, status, generation, leased_until,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id,
+                        owner_token,
+                        "claimed",
+                        generation,
+                        leased_until,
+                        stamp,
+                        stamp,
+                    ),
+                )
+            elif decision in {
+                AdvanceClaimDecision.TAKEOVER,
+                AdvanceClaimDecision.REENTER,
+            }:
+                if decision is AdvanceClaimDecision.TAKEOVER:
+                    generation = generation + 1
+                conn.execute(
+                    f"""
+                    UPDATE {self._schema}.durable_job_advance_claims
+                       SET owner_token = %s, status = %s, generation = %s,
+                           leased_until = %s, updated_at = %s
+                     WHERE job_id = %s
+                    """,
+                    (
+                        owner_token,
+                        "claimed",
+                        generation,
+                        leased_until,
+                        stamp,
+                        job_id,
+                    ),
+                )
+            conn.commit()
+            return AdvanceClaimResult(decision=decision, generation=generation)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def complete_advance(self, job_id: str, *, owner_token: str) -> None:
+        stamp = _utcnow()
+        conn = self._connect()
+        try:
+            conn.execute(ADVISORY_LOCK_SQL, (_ADVISORY_CLASSID, job_id))
+            cur = conn.execute(
+                f"""
+                UPDATE {self._schema}.durable_job_advance_claims
+                   SET status = %s, updated_at = %s
+                 WHERE job_id = %s AND owner_token = %s AND status = %s
+                """,
+                ("completed", stamp, job_id, owner_token, "claimed"),
+            )
+            if cur.rowcount != 1:
+                raise AdvanceClaimError(
+                    f"stale or missing advance owner for {job_id}"
+                )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def _append_event(
         self,

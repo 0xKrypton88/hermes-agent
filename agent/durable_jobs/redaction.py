@@ -51,11 +51,15 @@ _REDACT_SUBSTR = (
 REDACTED = "[REDACTED]"
 
 _URI_PASSWORD_RE = re.compile(
-    r"((?:postgres(?:ql)?)://[^:\s/]+:)([^@\s]+)(@)",
+    r"((?:postgres(?:ql)?)://[^:/?#\s]+:)(.+)(@[^/?#]+)",
     re.IGNORECASE,
 )
-_KV_PASSWORD_RE = re.compile(
-    r"(password\s*=\s*)(\S+)",
+_KV_QUOTED_PASSWORD_RE = re.compile(
+    r"(password\s*=\s*)(['\"])(.*?)\2",
+    re.IGNORECASE | re.DOTALL,
+)
+_KV_UNQUOTED_PASSWORD_RE = re.compile(
+    r"(password\s*=\s*)([^\s'\"]+)",
     re.IGNORECASE,
 )
 
@@ -65,7 +69,8 @@ def redact_secret_text(text: str) -> str:
     if not text:
         return text
     redacted = _URI_PASSWORD_RE.sub(r"\1[REDACTED]\3", text)
-    redacted = _KV_PASSWORD_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _KV_QUOTED_PASSWORD_RE.sub(r"\1\2[REDACTED]\2", redacted)
+    redacted = _KV_UNQUOTED_PASSWORD_RE.sub(r"\1[REDACTED]", redacted)
     return redacted
 
 
@@ -92,4 +97,6 @@ def redact_payload(payload: Any) -> Any:
         return redacted
     if isinstance(payload, list):
         return [redact_payload(item) for item in payload]
+    if isinstance(payload, str):
+        return redact_secret_text(payload)
     return payload
