@@ -203,7 +203,7 @@ def test_mapping_survives_process_and_store_recreation(tmp_path):
 
     store, job = _make_job(tmp_path)
     ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
-    ledger.claim_effect(
+    claimed = ledger.claim_effect(
         job_id=job.job_id,
         action_id="create_run",
         origin_platform=job.origin_platform,
@@ -212,7 +212,12 @@ def test_mapping_survives_process_and_store_recreation(tmp_path):
         candidate_id="cand-1",
         candidate_version="v1",
     )
-    ledger.mark_accepted(job.job_id, "create_run", provider_run_id="run-abc")
+    ledger.mark_accepted(
+        job.job_id,
+        "create_run",
+        provider_run_id="run-abc",
+        owner_token=claimed.owner_token,
+    )
 
     reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
     mapping = reopened.get_mapping(job.job_id)
@@ -406,6 +411,12 @@ def test_ambiguous_create_response_is_typed_unknown(tmp_path):
 
 
 def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path):
+    """Same-process unit evidence: stale lease takeover after reopen.
+
+    Not crash/subprocess death evidence. A fresh unexpired CLAIMED must not
+    be looked up; only an expired lease may be taken over.
+    """
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -414,7 +425,12 @@ def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path)
     )
 
     store, job = _make_job(tmp_path)
-    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     kwargs = dict(
         job_id=job.job_id,
         action_id="create_run",
@@ -427,13 +443,18 @@ def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path)
     claimed = ledger.claim_effect(**kwargs)
     assert claimed.won is True
     assert claimed.claim.status is EffectStatus.CLAIMED
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
 
     key = provider_idempotency_key(job.job_id, "create_run")
     provider = FakeCursorProvider(
         FakeCreateResult(kind="lost_response"),
         lookups=[FakeRun("run-unique", key)],
     )
-    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    reopened = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     adopted = reconcile_cursor_create(reopened, provider, **kwargs)
     assert adopted.status is EffectStatus.ADOPTED
     assert adopted.provider_run_id == "run-unique"
@@ -444,6 +465,11 @@ def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path)
 def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
     tmp_path,
 ):
+    """Same-process unit evidence: stale lease + empty lookup → UNKNOWN.
+
+    Not crash/subprocess death evidence.
+    """
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -453,7 +479,12 @@ def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
     )
 
     store, job = _make_job(tmp_path)
-    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     kwargs = dict(
         job_id=job.job_id,
         action_id="create_run",
@@ -464,9 +495,14 @@ def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
         candidate_version="v1",
     )
     ledger.claim_effect(**kwargs)
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
     key = provider_idempotency_key(job.job_id, "create_run")
     provider = FakeCursorProvider(FakeCreateResult(kind="lost_response"), lookups=[])
-    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    reopened = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     unknown = reconcile_cursor_create(reopened, provider, **kwargs)
     assert unknown.status is EffectStatus.UNKNOWN
     assert unknown.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
@@ -477,6 +513,11 @@ def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
 def test_claimed_after_process_recreation_ambiguous_lookup_is_typed_unknown_without_create(
     tmp_path,
 ):
+    """Same-process unit evidence: stale lease + ambiguous lookup → UNKNOWN.
+
+    Not crash/subprocess death evidence.
+    """
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -486,7 +527,12 @@ def test_claimed_after_process_recreation_ambiguous_lookup_is_typed_unknown_with
     )
 
     store, job = _make_job(tmp_path)
-    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     kwargs = dict(
         job_id=job.job_id,
         action_id="create_run",
@@ -497,12 +543,17 @@ def test_claimed_after_process_recreation_ambiguous_lookup_is_typed_unknown_with
         candidate_version="v1",
     )
     ledger.claim_effect(**kwargs)
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
     key = provider_idempotency_key(job.job_id, "create_run")
     provider = FakeCursorProvider(
         FakeCreateResult(kind="lost_response"),
         lookups=[FakeRun("run-a", key), FakeRun("run-b", key)],
     )
-    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    reopened = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
     unknown = reconcile_cursor_create(reopened, provider, **kwargs)
     assert unknown.status is EffectStatus.UNKNOWN
     assert unknown.unknown_reason == UnknownReason.AMBIGUOUS_LOOKUP.value

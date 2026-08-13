@@ -19,12 +19,18 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 ### ENG-26 — Cursor provider reconciliation (default-off)
 
 - Atomic `provider_effect_claims` before any injected fake `create_run`
+- Persisted claim owner token + lease timestamps; complete is CAS-fenced
+  to the current owner (old owner cannot mark ACCEPTED after takeover)
+- A non-owner that sees an unexpired CLAIMED must poll — no lookup, create,
+  adopt, or typed UNKNOWN. Process-local in-flight sets are not correctness
+- Only an expired (or legacy-null) lease may be taken over atomically;
+  recovery looks up by the stable idempotency key and never blindly creates
 - Stable provider idempotency key `cursor:{job_id}:{action_id}`
 - Explicit mapping `job_id == langgraph_thread_id` plus frozen origin Slack
   binding / candidate / version (not LangGraph context)
 - Origin platform/chat/root is derived from the durable Slack binding;
   a supplied mismatch is rejected before the effect claim
-- Lost-create / existing-CLAIMED recovery: unique lookup is adopted;
+- Lost-create / stale-CLAIMED recovery: unique lookup is adopted;
   empty/ambiguous lookup or ambiguous create persists typed `unknown` and
   never redispatches / never blindly `create_run`
 
@@ -33,9 +39,11 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - Immutable job ↔ workspace/channel/root-thread ↔ candidate/version binding
   **before** any Slack or provider effect; rebind is rejected
 - Stable outbound `client_msg_id`; atomic CLAIMED CAS before `post_root`
-  (concurrent losers do not post); existing CLAIMED after restart looks up
-  by `client_msg_id` — unique adopt, zero/multiple typed `unknown`, never a
-  blind repost
+  with owner token + lease (concurrent losers do not post, lookup, or
+  terminalize a live claim). Only a stale/expired CLAIMED may be taken
+  over; recovery looks up by `client_msg_id` — unique adopt, zero/multiple
+  typed `unknown`, never a blind repost. Previous owner is fenced from
+  `mark_delivered` after takeover
 - Cross-job and cross-binding resume fail closed
 - Go/Hold/Cancel records bound to job, candidate/version, actor, policy version,
   and decision idempotency key; unauthorized / mismatch / expired / replayed

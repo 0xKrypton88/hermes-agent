@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS provider_effect_claims (
     candidate_id TEXT NOT NULL,
     candidate_version TEXT NOT NULL,
     unknown_reason TEXT,
+    claim_owner_token TEXT,
+    claim_leased_at TEXT,
+    claim_expires_at TEXT,
+    claim_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (job_id, action_id),
@@ -106,6 +110,10 @@ CREATE TABLE IF NOT EXISTS slack_job_bindings (
     delivered_message_ts TEXT,
     status TEXT NOT NULL,
     unknown_reason TEXT,
+    claim_owner_token TEXT,
+    claim_leased_at TEXT,
+    claim_expires_at TEXT,
+    claim_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (workspace_id, channel_id, root_thread_ts),
@@ -141,8 +149,30 @@ CREATE TABLE IF NOT EXISTS job_decisions (
 """
 
 
+_CLAIM_LEASE_TABLES = ("provider_effect_claims", "slack_job_bindings")
+_CLAIM_LEASE_COLUMNS = (
+    ("claim_owner_token", "TEXT"),
+    ("claim_leased_at", "TEXT"),
+    ("claim_expires_at", "TEXT"),
+    ("claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _ensure_claim_lease_columns(conn: sqlite3.Connection) -> None:
+    """Evolve candidate-created v2 DBs; no-op when columns already exist."""
+    for table in _CLAIM_LEASE_TABLES:
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not existing:
+            continue
+        for name, decl in _CLAIM_LEASE_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _new_job_id() -> str:
@@ -167,6 +197,7 @@ class DurableJobStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            _ensure_claim_lease_columns(conn)
             conn.execute(
                 "INSERT INTO durable_jobs_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
