@@ -1,6 +1,6 @@
 # ENG-29 acceptance specification (local policy-contract evidence)
 
-**Matrix version:** `eng29-matrix-v1`  
+**Matrix version:** `eng29-matrix-v1`
 **Scope:** isolated, default-off, single-file SQLite durable-jobs pilot
 (dev/test only). This file is **local policy-contract evidence**. It is
 **not** Slack authorization, **not** live provider authorization, **not**
