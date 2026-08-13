@@ -18,7 +18,9 @@ def _db(tmp_path: Path) -> Path:
     return tmp_path / "pilot_jobs.sqlite"
 
 
-def _make_job(tmp_path: Path, *, idempotency_key: str = "idem-eng27"):
+def _make_job(
+    tmp_path: Path, *, idempotency_key: str = "idem-eng27", authorize: bool = True
+):
     from agent.durable_jobs.store import DurableJobStore
 
     store = DurableJobStore(sqlite_path=_db(tmp_path))
@@ -30,6 +32,10 @@ def _make_job(tmp_path: Path, *, idempotency_key: str = "idem-eng27"):
         repository_identity="github.com/example/repo",
         idempotency_key=idempotency_key,
     )
+    if authorize:
+        from agent.durable_jobs.eng29 import install_default_adapter_authorization
+
+        install_default_adapter_authorization(store.sqlite_path, job.job_id)
     return store, job
 
 
@@ -103,7 +109,7 @@ def test_binding_required_before_any_slack_effect(tmp_path):
         deliver_slack_root,
     )
 
-    store, job = _make_job(tmp_path)
+    store, job = _make_job(tmp_path, authorize=False)
     ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
     port = FakeSlackPort(FakePostResult(kind="accepted", message_ts="999.1"))
     with pytest.raises(BindingRequiredError):
@@ -262,7 +268,7 @@ def test_lane_cursor_create_requires_binding_before_provider_effect(tmp_path):
     from agent.durable_jobs.lane import DurableLaneService
     from agent.durable_jobs.slack_contract import BindingRequiredError
 
-    store, job = _make_job(tmp_path)
+    store, job = _make_job(tmp_path, authorize=False)
     cfg = load_durable_jobs_config(
         {
             "durable_jobs": {

@@ -58,6 +58,20 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   rejected as canceled; Cancel replay remains idempotent
 - No Slack routing fork: gateway adapters are untouched
 
+### ENG-29 — mandatory Go guard (default-off, local policy-contract)
+
+- Versioned immutable action matrix (`eng29-matrix-v1`) in `eng29.py`
+- Mandatory Go: scope_change, missing_prerequisites,
+  unresolved_provider_ambiguity, deploy, restart, cutover,
+  production_migration, external_promotion_release, financial_action;
+  unknown/unclassified default deny
+- Immutable authorization tuple (job, source package/version, candidate SHA,
+  environment, target action, actor, expiry, policy/matrix version, replay key)
+- Guard runs before provider/Slack effect claim, recovery lookup, `create_run`,
+  and `post_root`. No deploy/restart adapters are invented
+- **Local policy-contract evidence only** — not Slack/live authorization,
+  not gateway ingress, not PostgreSQL claims
+
 ## Explicit non-goals (Package 1 + these slices)
 
 - No production integration / gateway wiring / Slack action wiring

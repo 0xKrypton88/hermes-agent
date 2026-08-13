@@ -38,6 +38,9 @@ def _make_job(tmp_path: Path, *, idempotency_key: str = "idem-lease"):
         repository_identity="github.com/example/repo",
         idempotency_key=idempotency_key,
     )
+    from agent.durable_jobs.eng29 import install_default_adapter_authorization
+
+    install_default_adapter_authorization(store.sqlite_path, job.job_id)
     return store, job
 
 

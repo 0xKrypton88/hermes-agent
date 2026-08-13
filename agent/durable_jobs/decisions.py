@@ -61,6 +61,12 @@ class JobDecision:
     status: str
     reason_codes: tuple[str, ...]
     created_at: str
+    source_package_id: Optional[str] = None
+    source_package_version: Optional[str] = None
+    candidate_sha: Optional[str] = None
+    target_environment: Optional[str] = None
+    target_action: Optional[str] = None
+    matrix_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +191,12 @@ class DecisionLedger:
         actor_id: str,
         policy_version: str,
         decision_idempotency_key: str,
+        source_package_id: Optional[str] = None,
+        source_package_version: Optional[str] = None,
+        candidate_sha: Optional[str] = None,
+        target_environment: Optional[str] = None,
+        target_action: Optional[str] = None,
+        matrix_version: Optional[str] = None,
     ) -> DecisionResult:
         try:
             dtype = DecisionType(str(decision_type).lower())
@@ -213,6 +225,12 @@ class DecisionLedger:
                     and record.candidate_version == candidate_version
                     and record.actor_id == actor_id
                     and record.policy_version == policy_version
+                    and record.source_package_id == source_package_id
+                    and record.source_package_version == source_package_version
+                    and record.candidate_sha == candidate_sha
+                    and record.target_environment == target_environment
+                    and record.target_action == target_action
+                    and record.matrix_version == matrix_version
                 )
                 if same and record.status in ("accepted", "duplicate"):
                     if (
@@ -267,8 +285,10 @@ class DecisionLedger:
                     decision_id, job_id, decision_type, candidate_id,
                     candidate_version, actor_id, policy_version,
                     decision_idempotency_key, status, reason_codes_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, source_package_id, source_package_version,
+                    candidate_sha, target_environment, target_action,
+                    matrix_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision_id,
@@ -282,6 +302,12 @@ class DecisionLedger:
                     status,
                     json.dumps(list(reasons), sort_keys=True),
                     now,
+                    source_package_id,
+                    source_package_version,
+                    candidate_sha,
+                    target_environment,
+                    target_action,
+                    matrix_version,
                 ),
             )
             DurableJobStore._append_event(
@@ -417,6 +443,14 @@ class DecisionLedger:
 
     @staticmethod
     def _row_to_decision(row: sqlite3.Row) -> JobDecision:
+        keys = set(row.keys())
+
+        def _opt(name: str) -> Optional[str]:
+            if name not in keys:
+                return None
+            value = row[name]
+            return None if value is None else str(value)
+
         return JobDecision(
             decision_id=row["decision_id"],
             job_id=row["job_id"],
@@ -429,6 +463,12 @@ class DecisionLedger:
             status=row["status"],
             reason_codes=tuple(json.loads(row["reason_codes_json"] or "[]")),
             created_at=row["created_at"],
+            source_package_id=_opt("source_package_id"),
+            source_package_version=_opt("source_package_version"),
+            candidate_sha=_opt("candidate_sha"),
+            target_environment=_opt("target_environment"),
+            target_action=_opt("target_action"),
+            matrix_version=_opt("matrix_version"),
         )
 
 

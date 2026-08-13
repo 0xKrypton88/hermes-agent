@@ -184,6 +184,19 @@ class ProviderEffectLedger:
         )
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
+        if self.get_claim(job_id, action_id) is None:
+            from agent.durable_jobs.eng29 import (
+                PROVIDER_CREATE_TARGET_ACTION,
+                raise_unless_adapter_go,
+            )
+
+            raise_unless_adapter_go(
+                self.sqlite_path,
+                job_id=job_id,
+                target_action=PROVIDER_CREATE_TARGET_ACTION,
+                now_iso=now,
+                action="provider claim",
+            )
         with self._connect() as conn:
             existing = conn.execute(
                 """
@@ -1081,6 +1094,18 @@ def reconcile_cursor_create(
         raise_if_job_canceled(
             ledger.sqlite_path, job_id, action="provider create_run"
         )
+        from agent.durable_jobs.eng29 import (
+            PROVIDER_CREATE_TARGET_ACTION,
+            raise_unless_adapter_go,
+        )
+
+        raise_unless_adapter_go(
+            ledger.sqlite_path,
+            job_id=job_id,
+            target_action=PROVIDER_CREATE_TARGET_ACTION,
+            now_iso=ledger._now(),
+            action="provider create_run",
+        )
         with owner_lease_heartbeat(
             renew_fn=_renew_owner,
             now_fn=ledger._now_fn,
@@ -1217,6 +1242,18 @@ def _recover_claimed_provider(
     if ledger._job_is_canceled(claim.job_id):
         current = ledger.get_claim(claim.job_id, claim.action_id)
         return current if current is not None else claim
+    from agent.durable_jobs.eng29 import (
+        PROVIDER_CREATE_TARGET_ACTION,
+        raise_unless_adapter_go,
+    )
+
+    raise_unless_adapter_go(
+        ledger.sqlite_path,
+        job_id=claim.job_id,
+        target_action=PROVIDER_CREATE_TARGET_ACTION,
+        now_iso=ledger._now(),
+        action="provider lookup",
+    )
     matches = list(
         provider.lookup_runs(idempotency_key=claim.provider_idempotency_key)
     )

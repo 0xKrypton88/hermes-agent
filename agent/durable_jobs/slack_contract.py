@@ -372,6 +372,23 @@ class SlackBindingLedger:
         now = self._now()
         owner_token = uuid.uuid4().hex
         expires_at = add_seconds_iso(now, self._lease_seconds)
+        peeked = self.get_binding(job_id)
+        if peeked is None:
+            raise BindingRequiredError(f"no Slack binding for {job_id}")
+        if peeked.status is not SlackRootStatus.BOUND:
+            return DeliveryClaimResult(binding=peeked, won=False)
+        from agent.durable_jobs.eng29 import (
+            SLACK_POST_ROOT_TARGET_ACTION,
+            raise_unless_adapter_go,
+        )
+
+        raise_unless_adapter_go(
+            self.sqlite_path,
+            job_id=job_id,
+            target_action=SLACK_POST_ROOT_TARGET_ACTION,
+            now_iso=now,
+            action="slack delivery claim",
+        )
         with self._connect() as conn:
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
@@ -1068,6 +1085,18 @@ def deliver_slack_root(
         raise_if_job_canceled(
             ledger.sqlite_path, job_id, action="slack post_root"
         )
+        from agent.durable_jobs.eng29 import (
+            SLACK_POST_ROOT_TARGET_ACTION,
+            raise_unless_adapter_go,
+        )
+
+        raise_unless_adapter_go(
+            ledger.sqlite_path,
+            job_id=job_id,
+            target_action=SLACK_POST_ROOT_TARGET_ACTION,
+            now_iso=ledger._now(),
+            action="slack post_root",
+        )
         with owner_lease_heartbeat(
             renew_fn=_renew_owner,
             now_fn=ledger._now_fn,
@@ -1173,6 +1202,18 @@ def _lookup_slack_root(
     if ledger._job_is_canceled(binding.job_id):
         current = ledger.get_binding(binding.job_id)
         return current if current is not None else binding
+    from agent.durable_jobs.eng29 import (
+        SLACK_POST_ROOT_TARGET_ACTION,
+        raise_unless_adapter_go,
+    )
+
+    raise_unless_adapter_go(
+        ledger.sqlite_path,
+        job_id=binding.job_id,
+        target_action=SLACK_POST_ROOT_TARGET_ACTION,
+        now_iso=ledger._now(),
+        action="slack lookup",
+    )
     matches = list(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )

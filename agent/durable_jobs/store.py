@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -152,8 +152,33 @@ CREATE TABLE IF NOT EXISTS job_decisions (
     status TEXT NOT NULL,
     reason_codes_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
+    source_package_id TEXT,
+    source_package_version TEXT,
+    candidate_sha TEXT,
+    target_environment TEXT,
+    target_action TEXT,
+    matrix_version TEXT,
     CHECK (decision_type IN ('go', 'hold', 'cancel')),
     CHECK (status IN ('accepted', 'duplicate', 'rejected')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_authorization_tuples (
+    job_id TEXT NOT NULL,
+    target_action TEXT NOT NULL,
+    source_package_id TEXT NOT NULL,
+    source_package_version TEXT NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    target_environment TEXT NOT NULL,
+    authorized_actor TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    matrix_version TEXT NOT NULL,
+    authorization_idempotency_key TEXT NOT NULL UNIQUE,
+    prerequisites_satisfied INTEGER NOT NULL DEFAULT 0,
+    provider_ambiguity_resolved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, target_action),
     FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
 );
 """
@@ -174,6 +199,14 @@ _CLAIM_RECOVERY_COLUMNS = (
 _CLAIM_INFLIGHT_COLUMNS = (
     ("effect_inflight_token", "TEXT"),
     ("effect_inflight_until", "TEXT"),
+)
+_DECISION_AUTHZ_COLUMNS = (
+    ("source_package_id", "TEXT"),
+    ("source_package_version", "TEXT"),
+    ("candidate_sha", "TEXT"),
+    ("target_environment", "TEXT"),
+    ("target_action", "TEXT"),
+    ("matrix_version", "TEXT"),
 )
 
 
@@ -227,6 +260,19 @@ def _ensure_inflight_witness(conn: sqlite3.Connection) -> None:
         for name, decl in _CLAIM_INFLIGHT_COLUMNS:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _ensure_eng29_authz(conn: sqlite3.Connection) -> None:
+    """Disposable-dev ENG-29 tuple table + decision replay columns."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(job_decisions)")
+    }
+    if existing:
+        for name, decl in _DECISION_AUTHZ_COLUMNS:
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE job_decisions ADD COLUMN {name} {decl}"
+                )
 
 
 def _rebuild_status_check_for_recovering(conn: sqlite3.Connection) -> None:
@@ -310,6 +356,7 @@ class DurableJobStore:
             _ensure_claim_lease_columns(conn)
             _ensure_recovery_protocol(conn)
             _ensure_inflight_witness(conn)
+            _ensure_eng29_authz(conn)
             conn.execute(
                 "INSERT INTO durable_jobs_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
