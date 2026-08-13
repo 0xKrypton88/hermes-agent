@@ -1656,15 +1656,16 @@ def test_schema_v7_migrates_pre_v7_tuple_blank_candidate_fail_closed(tmp_path):
     assert migrated.candidate_id == ""
     assert migrated.candidate_version == ""
 
-    class _Job:
-        job_id = job_id
-        repository_identity = "github.com/example/repo"
-        frozen_baseline_sha = "sha-eng29-test"
-        origin_platform = "slack"
-        origin_chat_id = "C123"
-        origin_root_thread_id = "111.222"
+    from types import SimpleNamespace
 
-    job = _Job()
+    job = SimpleNamespace(
+        job_id=job_id,
+        repository_identity="github.com/example/repo",
+        frozen_baseline_sha="sha-eng29-test",
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+    )
     blank = evaluate_authorization(
         sqlite_path=path,
         **_guard_kwargs(job, candidate_id="", candidate_version=""),
