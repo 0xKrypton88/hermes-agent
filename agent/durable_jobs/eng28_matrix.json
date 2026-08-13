@@ -8,6 +8,17 @@
     "BLOCKED_EXTERNAL",
     "BLOCKED_MISSING_SEAM"
   ],
+  "coverage": {
+    "PROVEN_LOCAL": 19,
+    "PARTIAL": 3,
+    "BLOCKED_EXTERNAL": 0,
+    "BLOCKED_MISSING_SEAM": 0
+  },
+  "external_blockers": [
+    "PostgreSQL durable store, advisory locks, and SERIALIZABLE isolation (ENG-25) — never claimed from SQLite IMMEDIATE",
+    "Sandbox E2E against live Cursor or live Slack",
+    "Gateway ingress, production state.db, deploy, service restart, credentials, order mutation"
+  ],
   "rows": [
     {
       "id": 1,
@@ -17,9 +28,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row01_crash_after_job_commit_reopens_exactly_one",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row01_tuple_rejected_before_job_exists"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "after_job_rows_before_commit seam. Crash-before-commit leaves 0 jobs/events. Duplicate idempotency adopts. SQLite rollback is not PostgreSQL."
     },
     {
       "id": 2,
@@ -28,9 +39,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_crash_before_go_commit_blocks_effect",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row02_go_persist_then_consume_claim"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "after_decision_rows_before_commit. Uncommitted Go cannot be consumed; ENG-29 claim still requires accepted Go."
     },
     {
       "id": 3,
@@ -39,9 +50,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row03_concurrent_go_hold_cancel_cancel_is_terminal",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row03_crash_during_consume_claim_no_create_run"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Cancel is terminal. os._exit during after_in_transaction_adapter_go leaves zero claims. Not a live adapter RPC abort."
     },
     {
       "id": 4,
@@ -50,9 +61,9 @@
         "tests/agent/durable_jobs/test_provider_effects.py::test_claim_happens_before_provider_create_call",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row04_claim_before_create_zero_effect_without_go"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Zero provider create without bound Go. Characterization of existing claim-before-create plus ENG-29 deny."
     },
     {
       "id": 5,
@@ -62,9 +73,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row05_http_5xx_busy_never_blind_retry",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row05_multiple_lookup_is_provider_ambiguous"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Stateful fake provider only. Live Cursor timeout/5xx/busy is BLOCKED_EXTERNAL and is not counted GREEN."
     },
     {
       "id": 6,
@@ -73,9 +84,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row06_accepted_orphan_run_fail_closed",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row06_idempotency_mismatch_fail_closed"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Accepted create without run_id is ORPHAN_RESPONSE. cursor: key mismatch is CORRELATION_MISMATCH. No mapping bind."
     },
     {
       "id": 7,
@@ -85,9 +96,9 @@
         "tests/agent/durable_jobs/test_provider_effects.py::test_concurrent_effect_claims_single_winner_same_idempotency_key",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row07_restart_does_not_create_second_effect"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Reopen ledger does not call create_run again. Threads are not OS processes (see row 19)."
     },
     {
       "id": 8,
@@ -96,9 +107,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row08_empty_lookup_bound_then_typed_hold",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row08_wrong_lookup_key_is_provider_ambiguous_hold"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Empty lookup stays RECOVERING until recovery_deadline then UNKNOWN+Hold. Wrong-key lookup is PROVIDER_AMBIGUOUS+Hold. Never blind retry."
     },
     {
       "id": 9,
@@ -107,9 +118,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row09_cancel_during_inflight_does_not_bind",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row09_crash_during_cancel_is_atomic"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "In-flight create cannot be aborted by SQLite; success CAS includes Cancel predicate so bind cannot overwrite Cancel. Crash-before-commit Cancel is atomic."
     },
     {
       "id": 10,
@@ -118,9 +129,9 @@
         "tests/agent/durable_jobs/test_slack_bindings.py::test_binding_required_before_any_slack_effect",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row10_claim_before_post_root"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "CLAIMED is durable before post_root. Fake Slack port only."
     },
     {
       "id": 11,
@@ -129,9 +140,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row11_lost_root_unique_adopt",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row11_ambiguous_root_is_remote_delivery_ambiguous"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "AMBIGUOUS_LOOKUP aliases REMOTE_DELIVERY_AMBIGUOUS. Live Slack lookup is BLOCKED_EXTERNAL."
     },
     {
       "id": 12,
@@ -140,9 +151,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row12_post_without_bind_rejected",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row12_accepted_root_cannot_cross_bind"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "BindingRequiredError before post. UNIQUE (workspace, channel, root) rejects cross-job bind."
     },
     {
       "id": 13,
@@ -152,9 +163,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_decision_commits_before_ack",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row13_crash_after_decision_before_ack_reacks"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "coordinator.consume_inbound_action is a local SQLite seam, not gateway Slack action routing."
     },
     {
       "id": 14,
@@ -163,9 +174,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row14_terminal_evidence_requires_matching_durable_status",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row14_crash_before_evidence_commit_persists_nothing"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Evidence requires matching ACCEPTED/ADOPTED provider_run_id or DELIVERED/ADOPTED Slack ts. No COMPLETE without it."
     },
     {
       "id": 15,
@@ -175,9 +186,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row15_cannot_local_mark_before_accepted_enqueue",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row15_stable_resume_idempotency_key"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Stable key resume:{job_id}:{evidence_id}. CHECK forbids local_marked unless status=accepted. Not a live Slack resume enqueue."
     },
     {
       "id": 16,
@@ -186,9 +197,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row16_slack_delivery_claim_before_post_and_ack_after_accept",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row16_lost_post_adopt_at_least_once"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": "Generic non-Slack delivery sink is not a production coordinator; Slack root delivery lease is the supported seam."
+      "proof_layer": "PARTIAL",
+      "status": "PARTIAL",
+      "notes": "Slack root delivery lease is the supported production seam (claim before post, lost→adopt). Generic non-Slack delivery sink is BLOCKED_MISSING_SEAM — not invented. Live Slack is BLOCKED_EXTERNAL."
     },
     {
       "id": 17,
@@ -197,9 +208,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row17_exact_expiry_equality_is_expired",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row17_clock_rewind_cannot_unexpire_lease"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "claim_is_expired uses <=. Per-ledger ClockWatermark refuses rewind. Not NTP, not distributed clocks, not PostgreSQL."
     },
     {
       "id": 18,
@@ -208,9 +219,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row18_restart_executes_only_persisted_next_action",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row18_tampered_next_action_is_denied"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "Package 1 phases INTAKE/FREEZE_BASELINE/AWAIT_DISPATCH only. Dispatch remains hard-disabled. Tampered next_action is RestartDenied."
     },
     {
       "id": 19,
@@ -220,9 +231,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row19_two_processes_single_slack_delivery_winner",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row19_two_processes_single_resume_enqueue_winner"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": "SQLite IMMEDIATE writer lock is not PostgreSQL advisory locks or sandbox multi-replica."
+      "proof_layer": "PARTIAL",
+      "status": "PARTIAL",
+      "notes": "Two real CPython processes vs one SQLite file with BEGIN IMMEDIATE. Not PostgreSQL advisory locks, not sandbox multi-replica. SQLite is not PostgreSQL."
     },
     {
       "id": 20,
@@ -232,9 +243,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row20_injected_full_no_partial_mutation",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row20_crash_mid_transaction_rolls_back"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PARTIAL",
+      "status": "PARTIAL",
+      "notes": "SQLite writer lock, injected disk-full seam, and mid-transaction crash rollback are proven locally. PostgreSQL unavailable/SERIALIZABLE/tablespace-full is BLOCKED_EXTERNAL."
     },
     {
       "id": 21,
@@ -244,9 +255,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_unknown_schema_version_refuses_writes",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row21_pruned_authorization_key_not_reused"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "UnknownSchemaError on unparseable/newer schema. prune_authorization_tuple retires the idempotency key. ENG-29 unknown actions still default-deny."
     },
     {
       "id": 22,
@@ -255,9 +266,9 @@
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row22_events_redact_tokens_and_prompts",
         "tests/agent/durable_jobs/test_eng28_failure_matrix.py::test_row22_events_preserve_job_and_idempotency_correlation"
       ],
-      "proof_layer": "PENDING",
-      "status": "PENDING",
-      "notes": ""
+      "proof_layer": "PROVEN_LOCAL",
+      "status": "GREEN",
+      "notes": "durable_job_events payload redacts token/prompt/authorization keys. job_id and event idempotency_key columns are preserved."
     }
   ]
 }

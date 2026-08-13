@@ -28,6 +28,10 @@ from SQLite or fakes.
 
 See `eng28_matrix.json` for selectors, proof_layer, and status. Row titles:
 
+Local SQLite/fake proof is never PostgreSQL proof and never sandbox E2E.
+Coverage totals live in `eng28_matrix.json` `coverage`
+(`PROVEN_LOCAL` / `PARTIAL` / `BLOCKED_EXTERNAL` / `BLOCKED_MISSING_SEAM`).
+
 1. before/after immutable job/package commit
 2. before decision and Go persist/consume
 3. concurrent Go/Hold/Cancel and crash during consume+claim

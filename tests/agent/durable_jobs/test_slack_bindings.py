@@ -446,6 +446,7 @@ def test_claimed_slack_root_after_restart_ambiguous_lookup_is_typed_unknown_with
     from agent.durable_jobs.slack_contract import (
         SlackBindingLedger,
         SlackRootStatus,
+        SlackUnknownReason,
         deliver_slack_root,
     )
 
@@ -474,7 +475,7 @@ def test_claimed_slack_root_after_restart_ambiguous_lookup_is_typed_unknown_with
     )
     unknown = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
     assert unknown.status is SlackRootStatus.UNKNOWN
-    assert unknown.unknown_reason == "ambiguous_lookup"
+    assert unknown.unknown_reason == SlackUnknownReason.REMOTE_DELIVERY_AMBIGUOUS.value
     assert recover_port.posts == []
     assert recover_port.lookup_calls == [cmid]
 
