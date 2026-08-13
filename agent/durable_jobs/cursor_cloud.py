@@ -66,6 +66,21 @@ class CursorStatusResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class CursorStatusReconcileResult:
+    """Status observation against ledger identity.
+
+    Status reconcile never rewrites a terminal ledger claim. ``ok`` is True
+    only when the provider uniquely confirms the bound ``provider_run_id``.
+    UNKNOWN/AMBIGUOUS/mismatch is fail-closed (``ok`` False) and must not be
+    treated as success; the stored claim remains the durable identity.
+    """
+
+    claim: Any
+    observation: Optional[CursorStatusResult]
+    ok: bool
+
+
 class CursorCloudTransport(Protocol):
     """Injected transport. Tests supply an in-memory fake; no default client."""
 
@@ -84,7 +99,7 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
     if isinstance(raw, dict):
         run_id = raw.get("run_id") or raw.get("id")
         key = raw.get("idempotency_key")
-        if key is None:
+        if key is None or (isinstance(key, str) and not key.strip()):
             key = fallback_key
         if not run_id:
             return None
@@ -97,7 +112,7 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
     if not run_id:
         return None
     key = getattr(raw, "idempotency_key", None)
-    if key is None:
+    if key is None or (isinstance(key, str) and not key.strip()):
         key = fallback_key
     state = getattr(raw, "state", None) or getattr(raw, "status", None)
     return CursorRun(
@@ -156,7 +171,10 @@ def normalize_create_result(raw: Any, *, expected_key: str) -> CursorCreateResul
             if parsed is not None
         ]
         if len(runs) == 1:
-            return CursorCreateResult(kind=CursorCreateKind.ACCEPTED, run=runs[0])
+            return _fail_closed_create(
+                CursorCreateResult(kind=CursorCreateKind.ACCEPTED, run=runs[0]),
+                expected_key=expected_key,
+            )
         if len(runs) == 0:
             return CursorCreateResult(kind=CursorCreateKind.LOST_RESPONSE)
         return CursorCreateResult(
@@ -209,11 +227,20 @@ def _fail_closed_create(
                 error=result.error,
             )
         run_key = result.run.idempotency_key
-        if (
-            isinstance(run_key, str)
-            and run_key.startswith("cursor:")
-            and run_key != expected_key
-        ):
+        if not isinstance(run_key, str) or not run_key.strip():
+            # Missing key uses the ledger/transport expected identity.
+            bound = CursorRun(
+                run_id=result.run.run_id,
+                idempotency_key=expected_key,
+                state=result.run.state,
+            )
+            return CursorCreateResult(
+                kind=CursorCreateKind.ACCEPTED,
+                run=bound,
+                candidates=result.candidates,
+                error=result.error,
+            )
+        if run_key != expected_key:
             return CursorCreateResult(
                 kind=CursorCreateKind.UNKNOWN,
                 run=result.run,
@@ -284,7 +311,7 @@ class CursorCloudAdapter:
         job_id: str,
         action_id: str,
         owner_token: Optional[str] = None,
-    ) -> Any:
+    ) -> CursorStatusReconcileResult:
         from agent.durable_jobs.effects import EffectStatus, reconcile_cursor_create
 
         claim = ledger.get_claim(job_id, action_id)
@@ -295,10 +322,14 @@ class CursorCloudAdapter:
             EffectStatus.ADOPTED,
             EffectStatus.UNKNOWN,
         ):
+            observation: Optional[CursorStatusResult] = None
             if claim.provider_run_id:
-                self.status_run(run_id=claim.provider_run_id)
-            return claim
-        return reconcile_cursor_create(
+                observation = self.status_run(run_id=claim.provider_run_id)
+            ok = _status_observation_confirms_claim(claim, observation)
+            return CursorStatusReconcileResult(
+                claim=claim, observation=observation, ok=ok
+            )
+        recovered = reconcile_cursor_create(
             ledger,
             self,
             job_id=claim.job_id,
@@ -309,6 +340,10 @@ class CursorCloudAdapter:
             candidate_id=claim.candidate_id,
             candidate_version=claim.candidate_version,
             owner_token=owner_token,
+        )
+        ok = recovered.status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED)
+        return CursorStatusReconcileResult(
+            claim=recovered, observation=None, ok=ok
         )
 
 
@@ -349,7 +384,7 @@ def normalize_status_result(
     raw: Any, *, expected_run_id: Optional[str] = None
 ) -> CursorStatusResult:
     if isinstance(raw, CursorStatusResult):
-        return raw
+        return _fail_closed_status(raw, expected_run_id=expected_run_id)
     if raw is None:
         return CursorStatusResult(kind=CursorStatusKind.UNKNOWN)
     if isinstance(raw, (list, tuple)):
@@ -357,14 +392,47 @@ def normalize_status_result(
         if len(runs) == 0:
             return CursorStatusResult(kind=CursorStatusKind.EMPTY)
         if len(runs) > 1:
-            return CursorStatusResult(
-                kind=CursorStatusKind.AMBIGUOUS, candidates=tuple(runs)
+            return _fail_closed_status(
+                CursorStatusResult(
+                    kind=CursorStatusKind.AMBIGUOUS, candidates=tuple(runs)
+                ),
+                expected_run_id=expected_run_id,
             )
         return _status_from_known_run(runs[0], expected_run_id=expected_run_id)
     run = _parse_run(raw, fallback_key="")
     if run is None:
         return CursorStatusResult(kind=CursorStatusKind.UNKNOWN)
     return _status_from_known_run(run, expected_run_id=expected_run_id)
+
+
+def _fail_closed_status(
+    result: CursorStatusResult, *, expected_run_id: Optional[str]
+) -> CursorStatusResult:
+    if not expected_run_id:
+        return result
+    if result.kind is CursorStatusKind.UNIQUE:
+        run = result.run
+        if run is None or run.run_id != expected_run_id:
+            return CursorStatusResult(
+                kind=CursorStatusKind.UNKNOWN,
+                run=run,
+                candidates=result.candidates,
+                error=result.error,
+            )
+        return result
+    return result
+
+
+def _status_observation_confirms_claim(
+    claim: Any, observation: Optional[CursorStatusResult]
+) -> bool:
+    if observation is None or observation.kind is not CursorStatusKind.UNIQUE:
+        return False
+    bound = getattr(claim, "provider_run_id", None)
+    run = observation.run
+    if not bound or run is None:
+        return False
+    return run.run_id == bound
 
 
 def _status_from_known_run(

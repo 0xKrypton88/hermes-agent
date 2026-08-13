@@ -463,8 +463,9 @@ def test_status_and_reconcile_use_ledger_not_a_second_store(tmp_path):
     reconciled = adapter.reconcile_status(
         ledger, job_id=job.job_id, action_id="create_run"
     )
-    assert reconciled.status is EffectStatus.ACCEPTED
-    assert reconciled.provider_run_id == "run-status"
+    assert reconciled.ok is True
+    assert reconciled.claim.status is EffectStatus.ACCEPTED
+    assert reconciled.claim.provider_run_id == "run-status"
     assert ledger.get_mapping(job.job_id).provider_run_id == "run-status"
 
     transport.status_payload = [
@@ -476,8 +477,11 @@ def test_status_and_reconcile_use_ledger_not_a_second_store(tmp_path):
     still = adapter.reconcile_status(
         ledger, job_id=job.job_id, action_id="create_run"
     )
-    assert still.status is EffectStatus.ACCEPTED
-    assert still.provider_run_id == "run-status"
+    assert still.ok is False
+    assert still.observation is not None
+    assert still.observation.kind is CursorStatusKind.AMBIGUOUS
+    assert still.claim.status is EffectStatus.ACCEPTED
+    assert still.claim.provider_run_id == "run-status"
 
 
 def test_adapter_methods_open_no_network_sockets(monkeypatch):
@@ -508,3 +512,178 @@ def test_adapter_methods_open_no_network_sockets(monkeypatch):
     assert created.run is not None
     assert adapter.lookup_runs(idempotency_key="cursor:job:create_run")
     assert adapter.status_run(run_id="run-offline").run is not None
+
+
+def test_explicit_nonempty_idempotency_mismatch_fails_closed_without_adoption(tmp_path):
+    """Any explicit non-empty key mismatch must fail closed, not only cursor: prefixes."""
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        CursorCreateKind,
+        CursorCreateResult,
+        CursorRun,
+        normalize_create_result,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    expected = "cursor:job:create_run"
+    mismatched = normalize_create_result(
+        {
+            "kind": "accepted",
+            "run": {"run_id": "run-1", "idempotency_key": "other-system-key"},
+        },
+        expected_key=expected,
+    )
+    assert mismatched.kind is CursorCreateKind.UNKNOWN
+    assert mismatched.kind is not CursorCreateKind.ACCEPTED
+
+    typed = CursorCreateResult(
+        kind=CursorCreateKind.ACCEPTED,
+        run=CursorRun(run_id="run-1", idempotency_key="other-system-key"),
+    )
+    typed_out = normalize_create_result(typed, expected_key=expected)
+    assert typed_out.kind is CursorCreateKind.UNKNOWN
+
+    missing = normalize_create_result(
+        {"kind": "accepted", "run": {"run_id": "run-fallback"}},
+        expected_key=expected,
+    )
+    assert missing.kind is CursorCreateKind.ACCEPTED
+    assert missing.run is not None
+    assert missing.run.idempotency_key == expected
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    transport = MemoryCursorTransport(
+        create_payload={
+            "kind": "accepted",
+            "run": {"run_id": "run-foreign", "idempotency_key": "other-system-key"},
+        }
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert key == f"cursor:{job.job_id}:create_run"
+    assert claim.status is EffectStatus.UNKNOWN
+    assert claim.provider_run_id is None
+    assert ledger.get_mapping(job.job_id).provider_run_id is None
+
+
+def test_typed_status_result_validates_expected_run_identity():
+    """Pre-typed UNIQUE results must still fail closed on run_id mismatch."""
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        CursorRun,
+        CursorRunState,
+        CursorStatusKind,
+        CursorStatusResult,
+        normalize_status_result,
+    )
+
+    typed = CursorStatusResult(
+        kind=CursorStatusKind.UNIQUE,
+        run=CursorRun(
+            run_id="wrong-run",
+            idempotency_key="cursor:job:create_run",
+            state=CursorRunState.RUNNING,
+        ),
+    )
+    result = normalize_status_result(typed, expected_run_id="expected-run")
+    assert result.kind is CursorStatusKind.UNKNOWN
+    assert result.kind is not CursorStatusKind.UNIQUE
+
+    transport = MemoryCursorTransport(status_payload=typed)
+    adapter = CursorCloudAdapter(transport=transport)
+    observed = adapter.status_run(run_id="expected-run")
+    assert observed.kind is CursorStatusKind.UNKNOWN
+    assert observed.kind is not CursorStatusKind.UNIQUE
+
+    matched = normalize_status_result(
+        CursorStatusResult(
+            kind=CursorStatusKind.UNIQUE,
+            run=CursorRun(
+                run_id="expected-run",
+                idempotency_key="cursor:job:create_run",
+                state=CursorRunState.RUNNING,
+            ),
+        ),
+        expected_run_id="expected-run",
+    )
+    assert matched.kind is CursorStatusKind.UNIQUE
+    assert matched.run is not None
+    assert matched.run.run_id == "expected-run"
+
+
+def test_reconcile_status_does_not_report_stale_success_when_provider_is_fail_closed(
+    tmp_path,
+):
+    """Status UNKNOWN/AMBIGUOUS must not be reported as accepted ledger success."""
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter, CursorStatusKind
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    transport = MemoryCursorTransport(
+        create_payload={
+            "kind": "accepted",
+            "run": {"run_id": "run-status", "idempotency_key": key, "state": "running"},
+        },
+        status_payload={"run_id": "run-status", "state": "not-a-real-state"},
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    bound = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert bound.status is EffectStatus.ACCEPTED
+    assert bound.provider_run_id == "run-status"
+
+    unknown = adapter.reconcile_status(
+        ledger, job_id=job.job_id, action_id="create_run"
+    )
+    # Stale ACCEPTED claim must not be treated as a successful status confirm.
+    assert getattr(unknown, "ok", True) is False
+    observation = getattr(unknown, "observation", None)
+    assert getattr(observation, "kind", None) in (
+        CursorStatusKind.UNKNOWN,
+        CursorStatusKind.AMBIGUOUS,
+    )
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert persisted.status is EffectStatus.ACCEPTED
+    assert persisted.provider_run_id == "run-status"
+
+    transport.status_payload = [
+        {"run_id": "run-status", "idempotency_key": key},
+        {"run_id": "run-other", "idempotency_key": key},
+    ]
+    ambiguous = adapter.reconcile_status(
+        ledger, job_id=job.job_id, action_id="create_run"
+    )
+    assert getattr(ambiguous, "ok", True) is False
+    amb_obs = getattr(ambiguous, "observation", None)
+    assert getattr(amb_obs, "kind", None) is CursorStatusKind.AMBIGUOUS
+    still = ledger.get_claim(job.job_id, "create_run")
+    assert still is not None
+    assert still.status is EffectStatus.ACCEPTED
+    assert still.provider_run_id == "run-status"
+    assert ledger.get_mapping(job.job_id).provider_run_id == "run-status"
