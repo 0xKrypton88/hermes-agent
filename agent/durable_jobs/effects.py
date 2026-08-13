@@ -10,9 +10,12 @@ Authorities live in this ledger, not LangGraph context:
 - frozen origin Slack + candidate/version snapshot
 
 A non-owner that encounters an unexpired CLAIMED must poll and must not
-lookup, create, adopt, or terminalize. Only an expired/legacy-null lease may
-be taken over; recovery looks up by the stable idempotency key and never
-blindly creates.
+lookup, create, adopt, or terminalize. The live owner renews the persisted
+lease (owner-fenced heartbeat) so a long create_run cannot be stolen.
+Only an expired/legacy-null lease may be taken over; recovery looks up by
+the stable idempotency key and never blindly creates. An empty lookup after
+takeover enters bounded RECOVERING instead of immediately persisting typed
+UNKNOWN, so delayed provider visibility can still be adopted.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 It does not satisfy ENG-25 production PostgreSQL acceptance.
@@ -30,15 +33,22 @@ from typing import Any, Callable, Optional, Protocol
 
 from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
+    DEFAULT_RECOVERY_MAX_ATTEMPTS,
+    DEFAULT_RECOVERY_WINDOW_SECONDS,
     add_seconds_iso,
     claim_is_expired,
     utcnow_iso,
+)
+from agent.durable_jobs.claim_protocol import (
+    owner_lease_heartbeat,
+    recovery_bound_exceeded,
 )
 from agent.durable_jobs.store import DurableJobStore
 
 
 class EffectStatus(str, Enum):
     CLAIMED = "claimed"
+    RECOVERING = "recovering"
     ACCEPTED = "accepted"
     ADOPTED = "adopted"
     UNKNOWN = "unknown"
@@ -73,6 +83,9 @@ class ProviderEffectClaim:
     claim_leased_at: Optional[str]
     claim_expires_at: Optional[str]
     claim_generation: int
+    recovery_attempt_count: int
+    recovery_started_at: Optional[str]
+    recovery_deadline: Optional[str]
     created_at: str
     updated_at: str
 
@@ -112,12 +125,16 @@ class ProviderEffectLedger:
         sqlite_path: Path,
         now_fn: Optional[Callable[[], str]] = None,
         lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
+        recovery_max_attempts: int = DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        recovery_window_seconds: int = DEFAULT_RECOVERY_WINDOW_SECONDS,
     ) -> None:
         self.sqlite_path = Path(sqlite_path)
         # Ensure Package 1 job tables exist before ENG-26 FKs.
         self._jobs = DurableJobStore(sqlite_path=self.sqlite_path)
         self._now_fn = now_fn or utcnow_iso
         self._lease_seconds = int(lease_seconds)
+        self._recovery_max_attempts = int(recovery_max_attempts)
+        self._recovery_window_seconds = int(recovery_window_seconds)
 
     def _now(self) -> str:
         return self._now_fn()
@@ -337,6 +354,32 @@ class ProviderEffectLedger:
             claim=self._row_to_claim(row), won=True, owner_token=owner_token
         )
 
+    def renew_claim(self, job_id: str, action_id: str, *, owner_token: str) -> bool:
+        """Owner-fenced lease renewal. Stale tokens and terminal rows fail."""
+        now = self._now()
+        expires_at = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET claim_leased_at = ?, claim_expires_at = ?, updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND claim_owner_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    now,
+                    expires_at,
+                    now,
+                    job_id,
+                    action_id,
+                    owner_token,
+                    EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
     def get_claim(self, job_id: str, action_id: str) -> Optional[ProviderEffectClaim]:
         with self._connect() as conn:
             row = conn.execute(
@@ -400,6 +443,100 @@ class ProviderEffectLedger:
             owner_token=owner_token,
         )
 
+    def note_empty_lookup(
+        self, job_id: str, action_id: str, *, owner_token: str
+    ) -> ProviderEffectClaim:
+        """Persist bounded RECOVERING on empty lookup; UNKNOWN only at the bound."""
+        now = self._now()
+        deadline = add_seconds_iso(now, self._recovery_window_seconds)
+        expires_at = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            current = conn.execute(
+                """
+                SELECT * FROM provider_effect_claims
+                 WHERE job_id = ? AND action_id = ?
+                """,
+                (job_id, action_id),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
+            claim = self._row_to_claim(current)
+            if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
+                return claim
+            cur = conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET status = ?,
+                       recovery_attempt_count = recovery_attempt_count + 1,
+                       recovery_started_at = COALESCE(recovery_started_at, ?),
+                       recovery_deadline = COALESCE(recovery_deadline, ?),
+                       claim_leased_at = ?,
+                       claim_expires_at = ?,
+                       updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND status IN (?, ?)
+                   AND claim_owner_token = ?
+                """,
+                (
+                    EffectStatus.RECOVERING.value,
+                    now,
+                    deadline,
+                    now,
+                    expires_at,
+                    now,
+                    job_id,
+                    action_id,
+                    EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
+                    owner_token,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    """
+                    SELECT * FROM provider_effect_claims
+                     WHERE job_id = ? AND action_id = ?
+                    """,
+                    (job_id, action_id),
+                ).fetchone()
+                assert row is not None
+                return self._row_to_claim(row)
+            DurableJobStore._append_event(
+                conn,
+                job_id=job_id,
+                event_type="provider_effect_recovering",
+                payload={
+                    "action_id": action_id,
+                    "claim_generation": claim.claim_generation,
+                },
+                idempotency_key=(
+                    f"provider_effect_recovering:{job_id}:{action_id}:"
+                    f"{claim.claim_generation}"
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM provider_effect_claims
+                 WHERE job_id = ? AND action_id = ?
+                """,
+                (job_id, action_id),
+            ).fetchone()
+        assert row is not None
+        updated = self._row_to_claim(row)
+        if recovery_bound_exceeded(
+            attempt_count=updated.recovery_attempt_count,
+            deadline=updated.recovery_deadline,
+            now_iso=now,
+            max_attempts=self._recovery_max_attempts,
+        ):
+            return self.mark_unknown(
+                job_id,
+                action_id,
+                UnknownReason.EMPTY_LOOKUP.value,
+                owner_token=owner_token,
+            )
+        return updated
+
     def _complete_claim(
         self,
         job_id: str,
@@ -423,14 +560,15 @@ class ProviderEffectLedger:
             if current is None:
                 raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
             claim = self._row_to_claim(current)
-            if claim.status is not EffectStatus.CLAIMED:
+            if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
                 return claim
             cur = conn.execute(
                 """
                 UPDATE provider_effect_claims
                    SET status = ?, provider_run_id = ?, unknown_reason = ?,
                        updated_at = ?
-                 WHERE job_id = ? AND action_id = ? AND status = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND status IN (?, ?)
                    AND claim_owner_token = ?
                 """,
                 (
@@ -441,6 +579,7 @@ class ProviderEffectLedger:
                     job_id,
                     action_id,
                     EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
                     owner_token,
                 ),
             )
@@ -540,6 +679,15 @@ class ProviderEffectLedger:
                 row["claim_expires_at"] if "claim_expires_at" in keys else None
             ),
             claim_generation=generation,
+            recovery_attempt_count=int(row["recovery_attempt_count"] or 0)
+            if "recovery_attempt_count" in keys
+            else 0,
+            recovery_started_at=(
+                row["recovery_started_at"] if "recovery_started_at" in keys else None
+            ),
+            recovery_deadline=(
+                row["recovery_deadline"] if "recovery_deadline" in keys else None
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -574,8 +722,10 @@ def reconcile_cursor_create(
 
     UNKNOWN / ACCEPTED / ADOPTED claims do not call ``create_run`` again.
     A live foreign CLAIMED is polled — no lookup, create, adopt, or UNKNOWN.
+    The winner renews the persisted lease while ``create_run`` is in flight.
     Only an expired CLAIMED may be taken over; recovery looks up by the
-    stable idempotency key and never blindly calls ``create_run``.
+    stable idempotency key and never blindly calls ``create_run``. Empty
+    lookup enters RECOVERING until the recovery bound, then typed UNKNOWN.
     """
     origin_platform, origin_chat_id, origin_root_thread_id = (
         _authoritative_origin_from_slack_binding(
@@ -602,6 +752,16 @@ def reconcile_cursor_create(
         EffectStatus.UNKNOWN,
     ):
         return claim
+    if claim.status is EffectStatus.RECOVERING:
+        token = claim.claim_owner_token
+        if not token:
+            taken = ledger.takeover_stale_claim(job_id, action_id)
+            if not taken.won:
+                return taken.claim
+            token = taken.owner_token
+        return _recover_claimed_provider(
+            ledger, provider, claim, owner_token=token
+        )
     if not claimed.won:
         if claim.status is EffectStatus.CLAIMED:
             taken = ledger.takeover_stale_claim(job_id, action_id)
@@ -615,10 +775,17 @@ def reconcile_cursor_create(
     owner_token = claimed.owner_token
     if not owner_token:
         return claim
-    result = provider.create_run(
-        idempotency_key=claim.provider_idempotency_key,
-        job_id=job_id,
-    )
+    with owner_lease_heartbeat(
+        renew_fn=lambda: ledger.renew_claim(
+            job_id, action_id, owner_token=owner_token
+        ),
+        now_fn=ledger._now_fn,
+        lease_seconds=ledger._lease_seconds,
+    ):
+        result = provider.create_run(
+            idempotency_key=claim.provider_idempotency_key,
+            job_id=job_id,
+        )
     kind = getattr(result, "kind", None)
     run = getattr(result, "run", None)
     if kind == "accepted" and run is not None:
@@ -681,11 +848,8 @@ def _recover_claimed_provider(
             owner_token=owner_token,
         )
     if len(matches) == 0:
-        return ledger.mark_unknown(
-            claim.job_id,
-            claim.action_id,
-            UnknownReason.EMPTY_LOOKUP.value,
-            owner_token=owner_token,
+        return ledger.note_empty_lookup(
+            claim.job_id, claim.action_id, owner_token=owner_token
         )
     return ledger.mark_unknown(
         claim.job_id,

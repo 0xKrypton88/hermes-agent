@@ -563,7 +563,10 @@ def test_fresh_disposable_db_has_claim_lease_columns(tmp_path):
         assert "claim_leased_at" in cols
         assert "claim_expires_at" in cols
         assert "claim_generation" in cols
-    assert SCHEMA_VERSION >= 3
+        assert "recovery_attempt_count" in cols
+        assert "recovery_started_at" in cols
+        assert "recovery_deadline" in cols
+    assert SCHEMA_VERSION >= 4
 
 
 def test_reopen_candidate_v2_db_evolves_lease_columns_null_expiry_is_stale(tmp_path):
@@ -655,3 +658,501 @@ def test_pilot_remains_default_off_and_state_stays_on_explicit_path(tmp_path):
     assert path.exists()
     home_state = Path.home() / ".hermes" / "state.db"
     assert path.resolve() != home_state.resolve()
+
+
+# ---------------------------------------------------------------------------
+# ENG-26/27 lease protocol: live-call expiry, heartbeat stop, delayed visibility
+# ---------------------------------------------------------------------------
+
+
+class _DelayedLookupProvider:
+    """Lookup becomes uniquely visible only after ``visible`` is set."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.visible = False
+        self.create_calls: list[str] = []
+        self.lookup_calls: list[str] = []
+
+    def create_run(self, *, idempotency_key: str, job_id: str):
+        self.create_calls.append(idempotency_key)
+
+        class _R:
+            kind = "lost_response"
+            run = None
+
+        return _R()
+
+    def lookup_runs(self, *, idempotency_key: str):
+        self.lookup_calls.append(idempotency_key)
+        if not self.visible:
+            return []
+
+        class _Run:
+            run_id = self.run_id
+
+        return [_Run()]
+
+
+class _DelayedLookupPort:
+    def __init__(self, message_ts: str) -> None:
+        self.message_ts = message_ts
+        self.visible = False
+        self.posts: list[str] = []
+        self.lookup_calls: list[str] = []
+
+    def post_root(self, **kwargs):
+        self.posts.append(kwargs["client_msg_id"])
+
+        class _R:
+            kind = "lost_response"
+            message_ts = None
+
+        return _R()
+
+    def lookup_by_client_msg_id(self, client_msg_id: str):
+        self.lookup_calls.append(client_msg_id)
+        if not self.visible:
+            return []
+
+        class _Posted:
+            message_ts = self.message_ts
+
+        return [_Posted()]
+
+
+def test_provider_expiry_during_live_create_does_not_unknown_while_owner_alive(tmp_path):
+    """Winner paused inside create_run; clock past 30s lease; loser must poll.
+
+    Must not takeover or terminalize UNKNOWN while the owner is still alive.
+    """
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-live-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    kwargs = _provider_kwargs(job)
+    started = threading.Event()
+    release = threading.Event()
+
+    class GateProvider(FakeCursorProvider):
+        def create_run(self, *, idempotency_key: str, job_id: str) -> FakeCreateResult:
+            started.set()
+            assert release.wait(5.0), "winner was not released"
+            return super().create_run(idempotency_key=idempotency_key, job_id=job_id)
+
+    winner_provider = GateProvider(
+        FakeCreateResult(kind="accepted", run=FakeRun("run-live", "k"))
+    )
+    loser_provider = FakeCursorProvider(
+        FakeCreateResult(kind="lost_response"), lookups=[]
+    )
+    errors: list[BaseException] = []
+
+    def winner() -> None:
+        try:
+            reconcile_cursor_create(ledger, winner_provider, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 — surface into parent
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert started.wait(5.0), "winner never reached create_run"
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    loser_ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    loser = reconcile_cursor_create(loser_ledger, loser_provider, **kwargs)
+    assert loser.status is EffectStatus.CLAIMED
+    assert loser.unknown_reason is None
+    assert loser.provider_run_id is None
+    assert loser_provider.lookup_calls == []
+    assert loser_provider.create_calls == []
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert persisted.status is EffectStatus.CLAIMED
+    release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    done = ledger.get_claim(job.job_id, "create_run")
+    assert done is not None
+    assert done.status is EffectStatus.ACCEPTED
+    assert done.provider_run_id == "run-live"
+
+
+def test_slack_expiry_during_live_post_does_not_unknown_while_owner_alive(tmp_path):
+    """Winner paused inside post_root; clock past 30s lease; loser must poll."""
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-live-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    started = threading.Event()
+    release = threading.Event()
+
+    class GatePort(FakeSlackPort):
+        def post_root(self, **kwargs) -> FakePostResult:
+            started.set()
+            assert release.wait(5.0), "winner was not released"
+            return super().post_root(**kwargs)
+
+    winner_port = GatePort(FakePostResult(kind="accepted", message_ts="42.1"))
+    loser_port = FakeSlackPort(FakePostResult(kind="lost_response"), lookups=[])
+    errors: list[BaseException] = []
+
+    def winner() -> None:
+        try:
+            deliver_slack_root(ledger, winner_port, job_id=job.job_id)
+        except BaseException as exc:  # noqa: BLE001 — surface into parent
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert started.wait(5.0), "winner never reached post_root"
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    loser_ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    loser = deliver_slack_root(loser_ledger, loser_port, job_id=job.job_id)
+    assert loser.status is SlackRootStatus.CLAIMED
+    assert loser.unknown_reason is None
+    assert loser.delivered_message_ts is None
+    assert loser_port.lookup_calls == []
+    assert loser_port.posts == []
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.CLAIMED
+    release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    done = ledger.get_binding(job.job_id)
+    assert done is not None
+    assert done.status is SlackRootStatus.DELIVERED
+    assert done.delivered_message_ts == "42.1"
+
+
+def test_provider_heartbeat_stop_then_expiry_allows_lookup_only_takeover(tmp_path):
+    """Owner death is heartbeat stop: after expiry a second worker may take over."""
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.claim_protocol import owner_lease_heartbeat
+    from agent.durable_jobs.effects import EffectStatus, ProviderEffectLedger
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-hb-stop-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    first = ledger.claim_effect(**_provider_kwargs(job))
+    assert first.won is True
+    with owner_lease_heartbeat(
+        renew_fn=lambda: ledger.renew_claim(
+            job.job_id, "create_run", owner_token=first.owner_token
+        ),
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    ):
+        clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+        live = ledger.takeover_stale_claim(job.job_id, "create_run")
+        assert live.won is False
+        assert live.claim.claim_owner_token == first.owner_token
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    taken = ledger.takeover_stale_claim(job.job_id, "create_run")
+    assert taken.won is True
+    assert taken.owner_token != first.owner_token
+    assert taken.claim.status is EffectStatus.CLAIMED
+
+
+def test_slack_heartbeat_stop_then_expiry_allows_lookup_only_takeover(tmp_path):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.claim_protocol import owner_lease_heartbeat
+    from agent.durable_jobs.slack_contract import SlackBindingLedger, SlackRootStatus
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-hb-stop-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    first = ledger.claim_delivery(job.job_id)
+    assert first.won is True
+    with owner_lease_heartbeat(
+        renew_fn=lambda: ledger.renew_delivery(
+            job.job_id, owner_token=first.owner_token
+        ),
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    ):
+        clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+        live = ledger.takeover_stale_delivery(job.job_id)
+        assert live.won is False
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    taken = ledger.takeover_stale_delivery(job.job_id)
+    assert taken.won is True
+    assert taken.owner_token != first.owner_token
+    assert taken.binding.status is SlackRootStatus.CLAIMED
+
+
+def test_provider_renew_cas_extends_lease_stale_token_rejected(tmp_path):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.effects import ProviderEffectLedger
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-renew-cas-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    first = ledger.claim_effect(**_provider_kwargs(job))
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS - 1)
+    assert ledger.renew_claim(
+        job.job_id, "create_run", owner_token=first.owner_token
+    ) is True
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS - 1)
+    blocked = ledger.takeover_stale_claim(job.job_id, "create_run")
+    assert blocked.won is False
+    clock.advance(2)
+    taken = ledger.takeover_stale_claim(job.job_id, "create_run")
+    assert taken.won is True
+    assert ledger.renew_claim(
+        job.job_id, "create_run", owner_token=first.owner_token
+    ) is False
+    assert ledger.renew_claim(
+        job.job_id, "create_run", owner_token=taken.owner_token
+    ) is True
+
+
+def test_slack_renew_cas_extends_lease_stale_token_rejected(tmp_path):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-renew-cas-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    first = ledger.claim_delivery(job.job_id)
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS - 1)
+    assert ledger.renew_delivery(job.job_id, owner_token=first.owner_token) is True
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS - 1)
+    blocked = ledger.takeover_stale_delivery(job.job_id)
+    assert blocked.won is False
+    clock.advance(2)
+    taken = ledger.takeover_stale_delivery(job.job_id)
+    assert taken.won is True
+    assert ledger.renew_delivery(job.job_id, owner_token=first.owner_token) is False
+    assert ledger.renew_delivery(job.job_id, owner_token=taken.owner_token) is True
+
+
+def test_provider_delayed_visibility_after_takeover_does_not_false_negative(tmp_path):
+    """Post-crash takeover: first empty lookup must not terminalize UNKNOWN."""
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-delay-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    kwargs = _provider_kwargs(job)
+    first = ledger.claim_effect(**kwargs)
+    assert first.won is True
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    provider = _DelayedLookupProvider("run-late")
+    recovered = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    empty = reconcile_cursor_create(recovered, provider, **kwargs)
+    assert empty.status is EffectStatus.RECOVERING
+    assert empty.unknown_reason is None
+    assert empty.provider_run_id is None
+    assert provider.create_calls == []
+    assert len(provider.lookup_calls) == 1
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "provider_effect_unknown"
+    ]
+    assert unknown_events == []
+
+    provider.visible = True
+    adopted = reconcile_cursor_create(recovered, provider, **kwargs)
+    assert adopted.status is EffectStatus.ADOPTED
+    assert adopted.provider_run_id == "run-late"
+    assert provider.create_calls == []
+    assert len(provider.lookup_calls) == 2
+
+
+def test_slack_delayed_visibility_after_takeover_does_not_false_negative(tmp_path):
+    from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-delay-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    first = ledger.claim_delivery(job.job_id)
+    assert first.won is True
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    port = _DelayedLookupPort("10.9")
+    recovered = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    empty = deliver_slack_root(recovered, port, job_id=job.job_id)
+    assert empty.status is SlackRootStatus.RECOVERING
+    assert empty.unknown_reason is None
+    assert empty.delivered_message_ts is None
+    assert port.posts == []
+    assert len(port.lookup_calls) == 1
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "slack_root_unknown"
+    ]
+    assert unknown_events == []
+
+    port.visible = True
+    adopted = deliver_slack_root(recovered, port, job_id=job.job_id)
+    assert adopted.status is SlackRootStatus.ADOPTED
+    assert adopted.delivered_message_ts == "10.9"
+    assert port.posts == []
+    assert len(port.lookup_calls) == 2
+
+
+def test_provider_empty_recovery_bound_then_unknown_without_create(tmp_path):
+    from agent.durable_jobs.clock import (
+        DEFAULT_CLAIM_LEASE_SECONDS,
+        DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        FrozenClock,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-bound-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    kwargs = _provider_kwargs(job)
+    ledger.claim_effect(**kwargs)
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    provider = FakeCursorProvider(FakeCreateResult(kind="lost_response"), lookups=[])
+    recovered = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    last = None
+    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 1):
+        last = reconcile_cursor_create(recovered, provider, **kwargs)
+        assert last.status is EffectStatus.RECOVERING
+        assert last.unknown_reason is None
+    terminal = reconcile_cursor_create(recovered, provider, **kwargs)
+    assert terminal.status is EffectStatus.UNKNOWN
+    assert terminal.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
+    assert provider.create_calls == []
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "provider_effect_unknown"
+    ]
+    assert len(unknown_events) == 1
+
+
+def test_slack_empty_recovery_bound_then_unknown_without_repost(tmp_path):
+    from agent.durable_jobs.clock import (
+        DEFAULT_CLAIM_LEASE_SECONDS,
+        DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        FrozenClock,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        SlackUnknownReason,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-bound-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    ledger.claim_delivery(job.job_id)
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    port = FakeSlackPort(FakePostResult(kind="lost_response"), lookups=[])
+    recovered = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 1):
+        last = deliver_slack_root(recovered, port, job_id=job.job_id)
+        assert last.status is SlackRootStatus.RECOVERING
+        assert last.unknown_reason is None
+    terminal = deliver_slack_root(recovered, port, job_id=job.job_id)
+    assert terminal.status is SlackRootStatus.UNKNOWN
+    assert terminal.unknown_reason == SlackUnknownReason.EMPTY_LOOKUP.value
+    assert port.posts == []
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "slack_root_unknown"
+    ]
+    assert len(unknown_events) == 1

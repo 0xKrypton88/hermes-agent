@@ -337,7 +337,8 @@ def test_ambiguous_lookup_persists_typed_unknown_and_never_redispatches(tmp_path
     assert len(provider.create_calls) == 1
 
 
-def test_empty_lookup_after_lost_create_is_typed_unknown_not_redispatch(tmp_path):
+def test_empty_lookup_after_lost_create_recovers_then_unknown_without_redispatch(tmp_path):
+    from agent.durable_jobs.clock import DEFAULT_RECOVERY_MAX_ATTEMPTS
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -358,11 +359,16 @@ def test_empty_lookup_after_lost_create_is_typed_unknown_not_redispatch(tmp_path
         candidate_version="v1",
     )
     first = reconcile_cursor_create(ledger, provider, **kwargs)
-    assert first.status is EffectStatus.UNKNOWN
-    assert first.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
-
-    second = reconcile_cursor_create(ledger, provider, **kwargs)
-    assert second.status is EffectStatus.UNKNOWN
+    assert first.status is EffectStatus.RECOVERING
+    assert first.unknown_reason is None
+    for _ in range(DEFAULT_RECOVERY_MAX_ATTEMPTS - 2):
+        mid = reconcile_cursor_create(ledger, provider, **kwargs)
+        assert mid.status is EffectStatus.RECOVERING
+    terminal = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert terminal.status is EffectStatus.UNKNOWN
+    assert terminal.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
+    retry = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert retry.status is EffectStatus.UNKNOWN
     assert len(provider.create_calls) == 1
 
 
@@ -462,18 +468,17 @@ def test_claimed_after_restart_unique_lookup_adopts_without_create_run(tmp_path)
     assert provider.lookup_calls == [key]
 
 
-def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
+def test_claimed_after_restart_empty_lookup_recovers_without_create_run(
     tmp_path,
 ):
-    """Same-process unit evidence: stale lease + empty lookup → UNKNOWN.
+    """Same-process unit evidence: stale lease + empty lookup → RECOVERING.
 
-    Not crash/subprocess death evidence.
+    Not crash/subprocess death evidence. UNKNOWN requires the recovery bound.
     """
     from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
-        UnknownReason,
         provider_idempotency_key,
         reconcile_cursor_create,
     )
@@ -503,9 +508,9 @@ def test_claimed_after_restart_empty_lookup_is_typed_unknown_without_create_run(
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     )
-    unknown = reconcile_cursor_create(reopened, provider, **kwargs)
-    assert unknown.status is EffectStatus.UNKNOWN
-    assert unknown.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
+    recovering = reconcile_cursor_create(reopened, provider, **kwargs)
+    assert recovering.status is EffectStatus.RECOVERING
+    assert recovering.unknown_reason is None
     assert provider.create_calls == []
     assert provider.lookup_calls == [key]
 

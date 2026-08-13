@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -76,11 +76,14 @@ CREATE TABLE IF NOT EXISTS provider_effect_claims (
     claim_leased_at TEXT,
     claim_expires_at TEXT,
     claim_generation INTEGER NOT NULL DEFAULT 0,
+    recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
+    recovery_started_at TEXT,
+    recovery_deadline TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (job_id, action_id),
     CHECK (langgraph_thread_id = job_id),
-    CHECK (status IN ('claimed', 'accepted', 'adopted', 'unknown')),
+    CHECK (status IN ('claimed', 'accepted', 'adopted', 'unknown', 'recovering')),
     FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
 );
 
@@ -114,10 +117,13 @@ CREATE TABLE IF NOT EXISTS slack_job_bindings (
     claim_leased_at TEXT,
     claim_expires_at TEXT,
     claim_generation INTEGER NOT NULL DEFAULT 0,
+    recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
+    recovery_started_at TEXT,
+    recovery_deadline TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (workspace_id, channel_id, root_thread_ts),
-    CHECK (status IN ('bound', 'claimed', 'delivered', 'adopted', 'unknown')),
+    CHECK (status IN ('bound', 'claimed', 'delivered', 'adopted', 'unknown', 'recovering')),
     FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
 );
 
@@ -156,6 +162,11 @@ _CLAIM_LEASE_COLUMNS = (
     ("claim_expires_at", "TEXT"),
     ("claim_generation", "INTEGER NOT NULL DEFAULT 0"),
 )
+_CLAIM_RECOVERY_COLUMNS = (
+    ("recovery_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("recovery_started_at", "TEXT"),
+    ("recovery_deadline", "TEXT"),
+)
 
 
 def _utcnow() -> str:
@@ -173,6 +184,84 @@ def _ensure_claim_lease_columns(conn: sqlite3.Connection) -> None:
         for name, decl in _CLAIM_LEASE_COLUMNS:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _table_ddl(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row[0] if row else ""
+
+
+def _ensure_recovery_protocol(conn: sqlite3.Connection) -> None:
+    """Add recovery columns and widen status CHECK to include recovering."""
+    for table in _CLAIM_LEASE_TABLES:
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not existing:
+            continue
+        for name, decl in _CLAIM_RECOVERY_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    _rebuild_status_check_for_recovering(conn)
+
+
+def _rebuild_status_check_for_recovering(conn: sqlite3.Connection) -> None:
+    for table in _CLAIM_LEASE_TABLES:
+        ddl = _table_ddl(conn, table)
+        if not ddl or "recovering" in ddl.lower():
+            continue
+        _rebuild_claim_table(conn, table)
+
+
+def _rebuild_claim_table(conn: sqlite3.Connection, table: str) -> None:
+    """Recreate a claim table so CHECK allows 'recovering'."""
+    legacy = f"{table}__legacy_v4"
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+        create_sql = _claim_table_create_sql(table)
+        conn.execute(create_sql)
+        dest_cols = [
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        ]
+        src_cols = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({legacy})")
+        }
+        select_parts = []
+        for col in dest_cols:
+            if col in src_cols:
+                select_parts.append(col)
+            elif col == "recovery_attempt_count":
+                select_parts.append("0")
+            else:
+                select_parts.append("NULL")
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(dest_cols)}) "
+            f"SELECT {', '.join(select_parts)} FROM {legacy}"
+        )
+        conn.execute(f"DROP TABLE {legacy}")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _claim_table_create_sql(table: str) -> str:
+    marker = f"CREATE TABLE IF NOT EXISTS {table} ("
+    start = _SCHEMA_SQL.find(marker)
+    if start < 0:
+        raise RuntimeError(f"missing schema for {table}")
+    depth = 0
+    for index, char in enumerate(_SCHEMA_SQL[start:]):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                # Drop IF NOT EXISTS so a rebuild after RENAME still creates.
+                return "CREATE TABLE " + _SCHEMA_SQL[start + len("CREATE TABLE IF NOT EXISTS "): start + index + 1]
+    raise RuntimeError(f"unterminated schema for {table}")
 
 
 def _new_job_id() -> str:
@@ -198,6 +287,7 @@ class DurableJobStore:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
             _ensure_claim_lease_columns(conn)
+            _ensure_recovery_protocol(conn)
             conn.execute(
                 "INSERT INTO durable_jobs_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

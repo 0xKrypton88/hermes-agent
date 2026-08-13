@@ -3,7 +3,8 @@
 Isolated, disabled-by-default module. No gateway / Slack / Cursor wiring.
 Dispatch is hard-disabled (never invokes adapters). Provider and Slack
 effects use injected fakes only, after an explicit durable claim/binding
-with persisted owner token + lease fencing.
+with persisted owner token, lease fencing, owner-fenced heartbeat, and
+bounded recovering state after empty lookup.
 
 SQLite usage here is disposable, explicit-path, single-process, and
 dev/test-only. Production durable store remains PostgreSQL-first and is not

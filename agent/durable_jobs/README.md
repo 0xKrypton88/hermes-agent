@@ -19,12 +19,17 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 ### ENG-26 — Cursor provider reconciliation (default-off)
 
 - Atomic `provider_effect_claims` before any injected fake `create_run`
-- Persisted claim owner token + lease timestamps; complete is CAS-fenced
-  to the current owner (old owner cannot mark ACCEPTED after takeover)
+- Persisted claim owner token + lease timestamps; the live owner renews
+  the lease (owner-fenced heartbeat) while `create_run` is in flight
+- Complete is CAS-fenced to the current owner (old owner cannot mark
+  ACCEPTED after takeover)
 - A non-owner that sees an unexpired CLAIMED must poll — no lookup, create,
   adopt, or typed UNKNOWN. Process-local in-flight sets are not correctness
 - Only an expired (or legacy-null) lease may be taken over atomically;
   recovery looks up by the stable idempotency key and never blindly creates
+- Empty lookup after takeover/lost-create enters bounded `recovering`;
+  typed UNKNOWN is persisted only when the recovery bound is exceeded and
+  the terminal CAS succeeds. Delayed provider visibility can still be adopted
 - Stable provider idempotency key `cursor:{job_id}:{action_id}`
 - Explicit mapping `job_id == langgraph_thread_id` plus frozen origin Slack
   binding / candidate / version (not LangGraph context)
@@ -40,10 +45,12 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   **before** any Slack or provider effect; rebind is rejected
 - Stable outbound `client_msg_id`; atomic CLAIMED CAS before `post_root`
   with owner token + lease (concurrent losers do not post, lookup, or
-  terminalize a live claim). Only a stale/expired CLAIMED may be taken
-  over; recovery looks up by `client_msg_id` — unique adopt, zero/multiple
-  typed `unknown`, never a blind repost. Previous owner is fenced from
-  `mark_delivered` after takeover
+  terminalize a live claim). The live owner renews the lease while
+  `post_root` is in flight. Only a stale/expired CLAIMED may be taken
+  over; recovery looks up by `client_msg_id` — unique adopt, empty
+  lookup enters bounded `recovering` (not an immediate UNKNOWN),
+  multiple typed `unknown`, never a blind repost. Previous owner is
+  fenced from `mark_delivered` after takeover
 - Cross-job and cross-binding resume fail closed
 - Go/Hold/Cancel records bound to job, candidate/version, actor, policy version,
   and decision idempotency key; unauthorized / mismatch / expired / replayed

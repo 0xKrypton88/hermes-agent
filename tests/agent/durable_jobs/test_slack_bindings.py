@@ -393,10 +393,10 @@ def test_claimed_slack_root_after_crash_restart_unique_lookup_adopts_without_rep
     assert recover_port.lookup_calls == [bound.outbound_client_msg_id]
 
 
-def test_claimed_slack_root_after_restart_empty_lookup_is_typed_unknown_without_repost(
+def test_claimed_slack_root_after_restart_empty_lookup_recovers_without_repost(
     tmp_path,
 ):
-    """Same-process unit evidence: stale lease + empty lookup → UNKNOWN."""
+    """Same-process unit evidence: stale lease + empty lookup → RECOVERING."""
     from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.slack_contract import (
         SlackBindingLedger,
@@ -423,9 +423,9 @@ def test_claimed_slack_root_after_restart_empty_lookup_is_typed_unknown_without_
         now_fn=clock,
         lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
     )
-    unknown = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
-    assert unknown.status is SlackRootStatus.UNKNOWN
-    assert unknown.unknown_reason == "empty_lookup"
+    recovering = deliver_slack_root(reopened, recover_port, job_id=job.job_id)
+    assert recovering.status is SlackRootStatus.RECOVERING
+    assert recovering.unknown_reason is None
     assert recover_port.posts == []
     assert recover_port.lookup_calls == [bound.outbound_client_msg_id]
 

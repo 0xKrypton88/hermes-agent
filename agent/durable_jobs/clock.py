@@ -6,10 +6,13 @@ time deterministically. Wall-clock sleeps are not part of the contract.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 DEFAULT_CLAIM_LEASE_SECONDS = 30
+DEFAULT_RECOVERY_MAX_ATTEMPTS = 3
+DEFAULT_RECOVERY_WINDOW_SECONDS = 90
 
 
 def to_iso(dt: datetime) -> str:
@@ -44,16 +47,43 @@ def claim_is_expired(expires_at: Optional[str], now_iso: str) -> bool:
 
 
 class FrozenClock:
-    """Deterministic clock. Tests advance it explicitly — no sleeps."""
+    """Deterministic clock. Tests advance it explicitly — no sleeps.
+
+    Owner heartbeats register via ``register_tick_listener`` so ``advance()``
+    renews a live lease without wall-clock sleeps.
+    """
 
     def __init__(self, start: Optional[datetime] = None) -> None:
         self._now = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._lock = threading.Lock()
+        self._tick_listeners: list[Callable[[], None]] = []
 
     def now(self) -> datetime:
-        return self._now
+        with self._lock:
+            return self._now
 
     def __call__(self) -> str:
-        return to_iso(self._now)
+        with self._lock:
+            return to_iso(self._now)
+
+    def register_tick_listener(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        with self._lock:
+            self._tick_listeners.append(callback)
+
+        def unregister() -> None:
+            with self._lock:
+                try:
+                    self._tick_listeners.remove(callback)
+                except ValueError:
+                    return
+
+        return unregister
 
     def advance(self, seconds: float) -> None:
-        self._now = self._now + timedelta(seconds=seconds)
+        with self._lock:
+            self._now = self._now + timedelta(seconds=seconds)
+            listeners = list(self._tick_listeners)
+        for callback in listeners:
+            callback()

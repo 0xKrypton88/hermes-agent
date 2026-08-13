@@ -6,9 +6,11 @@ any outbound effect. Rebind and cross-job/cross-binding resume fail closed.
 
 Delivery claims persist an owner token and lease. A non-owner that sees an
 unexpired CLAIMED must poll and must not lookup, post, adopt, or terminalize.
+The live owner renews the persisted lease while ``post_root`` is in flight.
 Only an expired/legacy-null lease may be taken over; recovery looks up by
-the stable ``client_msg_id`` and never blindly reposts. The previous owner
-is fenced from mark_delivered after takeover.
+the stable ``client_msg_id`` and never blindly reposts. An empty lookup after
+takeover enters bounded RECOVERING instead of immediately persisting typed
+UNKNOWN. The previous owner is fenced from mark_delivered after takeover.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 No live Slack API client is constructed.
@@ -25,9 +27,15 @@ from typing import Any, Callable, Optional, Protocol
 
 from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
+    DEFAULT_RECOVERY_MAX_ATTEMPTS,
+    DEFAULT_RECOVERY_WINDOW_SECONDS,
     add_seconds_iso,
     claim_is_expired,
     utcnow_iso,
+)
+from agent.durable_jobs.claim_protocol import (
+    owner_lease_heartbeat,
+    recovery_bound_exceeded,
 )
 from agent.durable_jobs.store import DurableJobStore
 
@@ -35,6 +43,7 @@ from agent.durable_jobs.store import DurableJobStore
 class SlackRootStatus(str, Enum):
     BOUND = "bound"
     CLAIMED = "claimed"
+    RECOVERING = "recovering"
     DELIVERED = "delivered"
     ADOPTED = "adopted"
     UNKNOWN = "unknown"
@@ -104,6 +113,9 @@ class SlackJobBinding:
     claim_leased_at: Optional[str]
     claim_expires_at: Optional[str]
     claim_generation: int
+    recovery_attempt_count: int
+    recovery_started_at: Optional[str]
+    recovery_deadline: Optional[str]
     created_at: str
     updated_at: str
 
@@ -137,11 +149,15 @@ class SlackBindingLedger:
         sqlite_path: Path,
         now_fn: Optional[Callable[[], str]] = None,
         lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
+        recovery_max_attempts: int = DEFAULT_RECOVERY_MAX_ATTEMPTS,
+        recovery_window_seconds: int = DEFAULT_RECOVERY_WINDOW_SECONDS,
     ) -> None:
         self.sqlite_path = Path(sqlite_path)
         self._jobs = DurableJobStore(sqlite_path=self.sqlite_path)
         self._now_fn = now_fn or utcnow_iso
         self._lease_seconds = int(lease_seconds)
+        self._recovery_max_attempts = int(recovery_max_attempts)
+        self._recovery_window_seconds = int(recovery_window_seconds)
 
     def _now(self) -> str:
         return self._now_fn()
@@ -473,6 +489,30 @@ class SlackBindingLedger:
             binding=self._row_to_binding(row), won=True, owner_token=owner_token
         )
 
+    def renew_delivery(self, job_id: str, *, owner_token: str) -> bool:
+        """Owner-fenced lease renewal. Stale tokens and terminal rows fail."""
+        now = self._now()
+        expires_at = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET claim_leased_at = ?, claim_expires_at = ?, updated_at = ?
+                 WHERE job_id = ? AND claim_owner_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    now,
+                    expires_at,
+                    now,
+                    job_id,
+                    owner_token,
+                    SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
     def mark_delivered(
         self, job_id: str, message_ts: str, *, owner_token: str
     ) -> SlackJobBinding:
@@ -507,6 +547,90 @@ class SlackBindingLedger:
             owner_token=owner_token,
         )
 
+    def note_empty_lookup(
+        self, job_id: str, *, owner_token: str
+    ) -> SlackJobBinding:
+        """Persist bounded RECOVERING on empty lookup; UNKNOWN only at the bound."""
+        now = self._now()
+        deadline = add_seconds_iso(now, self._recovery_window_seconds)
+        expires_at = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise BindingRequiredError(f"no Slack binding for {job_id}")
+            binding = self._row_to_binding(current)
+            if binding.status not in (
+                SlackRootStatus.CLAIMED,
+                SlackRootStatus.RECOVERING,
+            ):
+                return binding
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET status = ?,
+                       recovery_attempt_count = recovery_attempt_count + 1,
+                       recovery_started_at = COALESCE(recovery_started_at, ?),
+                       recovery_deadline = COALESCE(recovery_deadline, ?),
+                       claim_leased_at = ?,
+                       claim_expires_at = ?,
+                       updated_at = ?
+                 WHERE job_id = ? AND status IN (?, ?)
+                   AND claim_owner_token = ?
+                """,
+                (
+                    SlackRootStatus.RECOVERING.value,
+                    now,
+                    deadline,
+                    now,
+                    expires_at,
+                    now,
+                    job_id,
+                    SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
+                    owner_token,
+                ),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                assert row is not None
+                return self._row_to_binding(row)
+            DurableJobStore._append_event(
+                conn,
+                job_id=job_id,
+                event_type="slack_root_recovering",
+                payload={
+                    "outbound_client_msg_id": binding.outbound_client_msg_id,
+                    "claim_generation": binding.claim_generation,
+                },
+                idempotency_key=(
+                    f"slack_root_recovering:{job_id}:{binding.claim_generation}"
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        assert row is not None
+        updated = self._row_to_binding(row)
+        if recovery_bound_exceeded(
+            attempt_count=updated.recovery_attempt_count,
+            deadline=updated.recovery_deadline,
+            now_iso=now,
+            max_attempts=self._recovery_max_attempts,
+        ):
+            return self.mark_unknown(
+                job_id,
+                SlackUnknownReason.EMPTY_LOOKUP.value,
+                owner_token=owner_token,
+            )
+        return updated
+
     def _complete_delivery(
         self,
         job_id: str,
@@ -532,14 +656,17 @@ class SlackBindingLedger:
                 SlackRootStatus.UNKNOWN,
             ):
                 return binding
-            if binding.status is not SlackRootStatus.CLAIMED:
+            if binding.status not in (
+                SlackRootStatus.CLAIMED,
+                SlackRootStatus.RECOVERING,
+            ):
                 return binding
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
                    SET status = ?, delivered_message_ts = ?, unknown_reason = ?,
                        updated_at = ?
-                 WHERE job_id = ? AND status = ? AND claim_owner_token = ?
+                 WHERE job_id = ? AND status IN (?, ?) AND claim_owner_token = ?
                 """,
                 (
                     status.value,
@@ -548,6 +675,7 @@ class SlackBindingLedger:
                     now,
                     job_id,
                     SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
                     owner_token,
                 ),
             )
@@ -604,6 +732,15 @@ class SlackBindingLedger:
                 row["claim_expires_at"] if "claim_expires_at" in keys else None
             ),
             claim_generation=generation,
+            recovery_attempt_count=int(row["recovery_attempt_count"] or 0)
+            if "recovery_attempt_count" in keys
+            else 0,
+            recovery_started_at=(
+                row["recovery_started_at"] if "recovery_started_at" in keys else None
+            ),
+            recovery_deadline=(
+                row["recovery_deadline"] if "recovery_deadline" in keys else None
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -618,9 +755,11 @@ def deliver_slack_root(
     """Post at most one logical root. Binding + client_msg_id must already exist.
 
     Atomic CLAIMED CAS happens before ``post_root``. A live foreign CLAIMED
-    is polled — concurrent losers do not post, lookup, or terminalize. An
+    is polled — concurrent losers do not post, lookup, or terminalize. The
+    winner renews the persisted lease while ``post_root`` is in flight. An
     expired CLAIMED may be taken over; recovery looks up by the stable
-    ``client_msg_id`` and never blindly reposts.
+    ``client_msg_id`` and never blindly reposts. Empty lookup enters
+    RECOVERING until the recovery bound, then typed UNKNOWN.
     """
     binding = ledger.get_binding(job_id)
     if binding is None:
@@ -631,6 +770,16 @@ def deliver_slack_root(
         SlackRootStatus.UNKNOWN,
     ):
         return binding
+    if binding.status is SlackRootStatus.RECOVERING:
+        token = binding.claim_owner_token
+        if not token:
+            taken = ledger.takeover_stale_delivery(job_id)
+            if not taken.won:
+                return taken.binding
+            token = taken.owner_token
+        return _lookup_slack_root(
+            ledger, slack_port, binding, owner_token=token
+        )
     if binding.status is SlackRootStatus.CLAIMED:
         taken = ledger.takeover_stale_delivery(job_id)
         if not taken.won:
@@ -647,13 +796,20 @@ def deliver_slack_root(
     owner_token = claimed.owner_token
     if not owner_token:
         return binding
-    result = slack_port.post_root(
-        client_msg_id=binding.outbound_client_msg_id,
-        workspace_id=binding.workspace_id,
-        channel_id=binding.channel_id,
-        root_thread_ts=binding.root_thread_ts,
-        job_id=job_id,
-    )
+    with owner_lease_heartbeat(
+        renew_fn=lambda: ledger.renew_delivery(
+            job_id, owner_token=owner_token
+        ),
+        now_fn=ledger._now_fn,
+        lease_seconds=ledger._lease_seconds,
+    ):
+        result = slack_port.post_root(
+            client_msg_id=binding.outbound_client_msg_id,
+            workspace_id=binding.workspace_id,
+            channel_id=binding.channel_id,
+            root_thread_ts=binding.root_thread_ts,
+            job_id=job_id,
+        )
     kind = getattr(result, "kind", None)
     message_ts = getattr(result, "message_ts", None)
     if kind == "accepted" and message_ts:
@@ -686,10 +842,8 @@ def _lookup_slack_root(
             binding.job_id, matches[0].message_ts, owner_token=owner_token
         )
     if len(matches) == 0:
-        return ledger.mark_unknown(
-            binding.job_id,
-            SlackUnknownReason.EMPTY_LOOKUP.value,
-            owner_token=owner_token,
+        return ledger.note_empty_lookup(
+            binding.job_id, owner_token=owner_token
         )
     return ledger.mark_unknown(
         binding.job_id,

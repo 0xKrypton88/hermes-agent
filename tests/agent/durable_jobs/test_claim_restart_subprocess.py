@@ -238,3 +238,147 @@ def test_slack_child_process_death_then_stale_takeover_looks_up(tmp_path):
     assert adopted.delivered_message_ts == "10.1"
     assert port.posts == []
     assert port.lookup_calls == [client_msg_id]
+
+
+def test_provider_child_death_empty_then_delayed_visibility_adopts(tmp_path):
+    """Crash/restart: first empty lookup stays non-terminal; later unique adopt."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-sub-delay-provider")
+    completed = subprocess.run(
+        [sys.executable, "-c", _PROVIDER_CHILD, str(store.sqlite_path), job.job_id],
+        env=_child_env(),
+        cwd=str(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    parent_clock = FrozenClock(
+        datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=31)
+    )
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=parent_clock,
+        lease_seconds=30,
+    )
+
+    class _Delayed:
+        def __init__(self) -> None:
+            self.visible = False
+            self.create_calls: list[str] = []
+            self.lookup_calls: list[str] = []
+
+        def create_run(self, *, idempotency_key: str, job_id: str):
+            self.create_calls.append(idempotency_key)
+
+            class _R:
+                kind = "lost_response"
+                run = None
+
+            return _R()
+
+        def lookup_runs(self, *, idempotency_key: str):
+            self.lookup_calls.append(idempotency_key)
+            if not self.visible:
+                return []
+
+            class _Run:
+                run_id = "run-after-delay"
+
+            return [_Run()]
+
+    provider = _Delayed()
+    kwargs = dict(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform=job.origin_platform,
+        origin_chat_id=job.origin_chat_id,
+        origin_root_thread_id=job.origin_root_thread_id,
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    empty = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert empty.status is EffectStatus.RECOVERING
+    assert empty.unknown_reason is None
+    assert provider.create_calls == []
+    provider.visible = True
+    adopted = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert adopted.status is EffectStatus.ADOPTED
+    assert adopted.provider_run_id == "run-after-delay"
+    assert provider.create_calls == []
+
+
+def test_slack_child_death_empty_then_delayed_visibility_adopts(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-sub-delay-slack")
+    completed = subprocess.run(
+        [sys.executable, "-c", _SLACK_CHILD, str(store.sqlite_path), job.job_id],
+        env=_child_env(),
+        cwd=str(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    parent_clock = FrozenClock(
+        datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=31)
+    )
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=parent_clock,
+        lease_seconds=30,
+    )
+
+    class _Delayed:
+        def __init__(self) -> None:
+            self.visible = False
+            self.posts: list[str] = []
+            self.lookup_calls: list[str] = []
+
+        def post_root(self, **kwargs):
+            self.posts.append(kwargs["client_msg_id"])
+
+            class _R:
+                kind = "lost_response"
+                message_ts = None
+
+            return _R()
+
+        def lookup_by_client_msg_id(self, client_msg_id: str):
+            self.lookup_calls.append(client_msg_id)
+            if not self.visible:
+                return []
+
+            class _Posted:
+                message_ts = "10.8"
+
+            return [_Posted()]
+
+    port = _Delayed()
+    empty = deliver_slack_root(ledger, port, job_id=job.job_id)
+    assert empty.status is SlackRootStatus.RECOVERING
+    assert empty.unknown_reason is None
+    assert port.posts == []
+    port.visible = True
+    adopted = deliver_slack_root(ledger, port, job_id=job.job_id)
+    assert adopted.status is SlackRootStatus.ADOPTED
+    assert adopted.delivered_message_ts == "10.8"
+    assert port.posts == []
