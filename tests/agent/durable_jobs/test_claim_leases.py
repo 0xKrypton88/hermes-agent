@@ -579,6 +579,8 @@ def test_fresh_disposable_db_has_claim_lease_columns(tmp_path):
         assert "recovery_attempt_count" in cols
         assert "recovery_started_at" in cols
         assert "recovery_deadline" in cols
+        assert "effect_inflight_token" in cols
+        assert "effect_inflight_until" in cols
     assert SCHEMA_VERSION >= 4
 
 

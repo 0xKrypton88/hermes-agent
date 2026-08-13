@@ -136,3 +136,19 @@ def recovery_bound_exceeded(
     if deadline is None or not str(deadline).strip():
         return False
     return claim_is_expired(deadline, now_iso)
+
+
+def inflight_witness_blocks_unknown(
+    *, inflight_until: Optional[str], now_iso: str
+) -> bool:
+    """True when a persisted in-flight RPC witness is still live.
+
+    This is restart-safe state in SQLite, not a process-local Event. A live
+    owner renews ``effect_inflight_until`` while ``create_run`` / ``post_root``
+    is outstanding (including late renew after a FrozenClock jump). A crashed
+    owner stops renewing; once ``inflight_until`` expires, recovery may
+    UNKNOWN. Missing/empty until means no outstanding RPC.
+    """
+    if inflight_until is None or not str(inflight_until).strip():
+        return False
+    return not claim_is_expired(inflight_until, now_iso)

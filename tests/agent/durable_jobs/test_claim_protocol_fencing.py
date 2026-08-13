@@ -21,6 +21,7 @@ from typing import List, Optional
 from agent.durable_jobs.clock import (
     DEFAULT_CLAIM_LEASE_SECONDS,
     DEFAULT_RECOVERY_MAX_ATTEMPTS,
+    DEFAULT_RECOVERY_WINDOW_SECONDS,
     FrozenClock,
 )
 
@@ -639,3 +640,315 @@ def test_slack_late_renew_after_expiry_returns_false_without_takeover(tmp_path):
     taken = ledger.takeover_stale_delivery(job.job_id)
     assert taken.won is True
     assert taken.owner_token != first.owner_token
+
+
+# ---------------------------------------------------------------------------
+# Remaining race: in-flight create/post still blocked past recovery deadline
+# ---------------------------------------------------------------------------
+
+
+def test_provider_inflight_past_recovery_deadline_does_not_unknown(tmp_path):
+    """Lease + recovery window elapse while create_run is still blocked.
+
+    d0de351 only delayed the old race by 90s: a foreign caller UNKNOWNs and
+    the original cannot bind the run that then succeeds.
+    """
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-inflight-deadline-provider")
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    kwargs = _provider_kwargs(job)
+    winner_provider = GateCreateProvider("run-late")
+    errors: list[BaseException] = []
+    winner_result = []
+
+    def winner() -> None:
+        try:
+            winner_result.append(
+                reconcile_cursor_create(ledger, winner_provider, **kwargs)
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert winner_provider.started.wait(5.0), "winner never reached create_run"
+
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    recovering = reconcile_cursor_create(
+        ProviderEffectLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        ),
+        EmptyLookupProvider(),
+        **kwargs,
+    )
+    assert recovering.status is EffectStatus.RECOVERING
+
+    clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
+    after_deadline = reconcile_cursor_create(
+        ProviderEffectLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        ),
+        EmptyLookupProvider(),
+        **kwargs,
+    )
+    assert after_deadline.status is not EffectStatus.UNKNOWN, (
+        f"in-flight create still blocked; got {after_deadline.status} "
+        f"{after_deadline.unknown_reason}"
+    )
+    assert after_deadline.unknown_reason is None
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "provider_effect_unknown"
+    ]
+    assert unknown_events == []
+
+    winner_provider.release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    mapping = ledger.get_mapping(job.job_id)
+    assert persisted.status is not EffectStatus.UNKNOWN
+    assert persisted.unknown_reason != UnknownReason.EMPTY_LOOKUP.value
+    assert persisted.status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED)
+    assert persisted.provider_run_id == "run-late"
+    assert mapping is not None
+    assert mapping.provider_run_id == "run-late"
+    assert winner_result
+    assert winner_result[0].status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED)
+    assert winner_result[0].provider_run_id == "run-late"
+
+
+def test_slack_inflight_past_recovery_deadline_does_not_unknown(tmp_path):
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        SlackUnknownReason,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-inflight-deadline-slack")
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    winner_port = GatePostPort("42.9")
+    errors: list[BaseException] = []
+    winner_result = []
+
+    def winner() -> None:
+        try:
+            winner_result.append(
+                deliver_slack_root(ledger, winner_port, job_id=job.job_id)
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert winner_port.started.wait(5.0), "winner never reached post_root"
+
+    clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
+    recovering = deliver_slack_root(
+        SlackBindingLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        ),
+        EmptyLookupPort(),
+        job_id=job.job_id,
+    )
+    assert recovering.status is SlackRootStatus.RECOVERING
+
+    clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
+    after_deadline = deliver_slack_root(
+        SlackBindingLedger(
+            sqlite_path=store.sqlite_path,
+            now_fn=clock,
+            lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+        ),
+        EmptyLookupPort(),
+        job_id=job.job_id,
+    )
+    assert after_deadline.status is not SlackRootStatus.UNKNOWN, (
+        f"in-flight post still blocked; got {after_deadline.status} "
+        f"{after_deadline.unknown_reason}"
+    )
+    assert after_deadline.unknown_reason is None
+    unknown_events = [
+        event
+        for event in store.list_events(job.job_id)
+        if event["event_type"] == "slack_root_unknown"
+    ]
+    assert unknown_events == []
+
+    winner_port.release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is not SlackRootStatus.UNKNOWN
+    assert persisted.unknown_reason != SlackUnknownReason.EMPTY_LOOKUP.value
+    assert persisted.status in (SlackRootStatus.DELIVERED, SlackRootStatus.ADOPTED)
+    assert persisted.delivered_message_ts == "42.9"
+    assert winner_result
+    assert winner_result[0].status in (
+        SlackRootStatus.DELIVERED,
+        SlackRootStatus.ADOPTED,
+    )
+    assert winner_result[0].delivered_message_ts == "42.9"
+
+
+def test_provider_cancel_blocks_inflight_bind_and_stays_terminal(tmp_path):
+    """Cancel is terminal: in-flight completion must not overwrite it."""
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        reconcile_cursor_create,
+    )
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-cancel-inflight-provider")
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(**_bind_kwargs(job.job_id))
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    clock = FrozenClock()
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    kwargs = _provider_kwargs(job)
+    winner_provider = GateCreateProvider("run-canceled")
+    errors: list[BaseException] = []
+
+    def winner() -> None:
+        try:
+            reconcile_cursor_create(ledger, winner_provider, **kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert winner_provider.started.wait(5.0)
+    canceled = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="cancel",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-cancel-inflight",
+    )
+    assert canceled.ok is True
+    assert decisions.is_canceled(job.job_id) is True
+    winner_provider.release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    persisted = ledger.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert persisted.status is not EffectStatus.ACCEPTED
+    assert persisted.status is not EffectStatus.ADOPTED
+    assert decisions.is_canceled(job.job_id) is True
+    go_after = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="go",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-go-after-cancel",
+    )
+    assert go_after.ok is False
+    assert "canceled" in go_after.reason_codes
+
+
+def test_slack_cancel_blocks_inflight_bind_and_stays_terminal(tmp_path):
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-cancel-inflight-slack")
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    clock = FrozenClock()
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=clock,
+        lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS,
+    )
+    ledger.bind(**_bind_kwargs(job.job_id))
+    winner_port = GatePostPort("42.0")
+    errors: list[BaseException] = []
+
+    def winner() -> None:
+        try:
+            deliver_slack_root(ledger, winner_port, job_id=job.job_id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert winner_port.started.wait(5.0)
+    canceled = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="cancel",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-cancel-inflight-slack",
+    )
+    assert canceled.ok is True
+    winner_port.release.set()
+    thread.join(timeout=5.0)
+    assert errors == []
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is not SlackRootStatus.DELIVERED
+    assert persisted.status is not SlackRootStatus.ADOPTED
+    assert decisions.is_canceled(job.job_id) is True
+    go_after = decisions.record_decision(
+        job_id=job.job_id,
+        decision_type="go",
+        candidate_id="cand-1",
+        candidate_version="v1",
+        actor_id="U-alice",
+        policy_version="pol-1",
+        decision_idempotency_key="k-go-after-cancel-slack",
+    )
+    assert go_after.ok is False
+    assert "canceled" in go_after.reason_codes

@@ -38,6 +38,7 @@ from agent.durable_jobs.clock import (
 )
 from agent.durable_jobs.claim_protocol import (
     caller_holds_live_lease,
+    inflight_witness_blocks_unknown,
     owner_lease_heartbeat,
     recovery_bound_exceeded,
 )
@@ -537,6 +538,72 @@ class SlackBindingLedger:
             )
             return cur.rowcount == 1
 
+    def begin_inflight(self, job_id: str, *, owner_token: str) -> bool:
+        """Persist that this owner has an outstanding post_root."""
+        now = self._now()
+        until = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET effect_inflight_token = ?, effect_inflight_until = ?,
+                       updated_at = ?
+                 WHERE job_id = ? AND claim_owner_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    owner_token,
+                    until,
+                    now,
+                    job_id,
+                    owner_token,
+                    SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def renew_inflight(self, job_id: str, *, owner_token: str) -> bool:
+        """Renew the in-flight witness. Late renew is allowed while token matches."""
+        now = self._now()
+        until = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET effect_inflight_until = ?, updated_at = ?
+                 WHERE job_id = ? AND effect_inflight_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    until,
+                    now,
+                    job_id,
+                    owner_token,
+                    SlackRootStatus.CLAIMED.value,
+                    SlackRootStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def clear_inflight(self, job_id: str, *, owner_token: str) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE slack_job_bindings
+                   SET effect_inflight_token = NULL, effect_inflight_until = NULL,
+                       updated_at = ?
+                 WHERE job_id = ? AND effect_inflight_token = ?
+                """,
+                (now, job_id, owner_token),
+            )
+
+    def _job_is_canceled(self, job_id: str) -> bool:
+        from agent.durable_jobs.decisions import DecisionLedger
+
+        return DecisionLedger(sqlite_path=self.sqlite_path).is_canceled(job_id)
+
     def mark_delivered(
         self, job_id: str, message_ts: str, *, owner_token: str
     ) -> SlackJobBinding:
@@ -666,6 +733,14 @@ class SlackBindingLedger:
         unknown_reason: Optional[str] = None,
     ) -> SlackJobBinding:
         now = self._now()
+        if status in (
+            SlackRootStatus.DELIVERED,
+            SlackRootStatus.ADOPTED,
+        ) and self._job_is_canceled(job_id):
+            blocked = self.get_binding(job_id)
+            if blocked is None:
+                raise BindingRequiredError(f"no Slack binding for {job_id}")
+            return blocked
         with self._connect() as conn:
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
@@ -685,12 +760,37 @@ class SlackBindingLedger:
                 SlackRootStatus.RECOVERING,
             ):
                 return binding
+            inflight_until = None
+            inflight_token = None
+            if "effect_inflight_until" in current.keys():
+                inflight_until = current["effect_inflight_until"]
+            if "effect_inflight_token" in current.keys():
+                inflight_token = current["effect_inflight_token"]
+            if (
+                status is SlackRootStatus.UNKNOWN
+                and inflight_token != owner_token
+                and inflight_witness_blocks_unknown(
+                    inflight_until=inflight_until, now_iso=now
+                )
+            ):
+                return binding
+            unknown_inflight_sql = ""
+            unknown_inflight_args: tuple = ()
+            if status is SlackRootStatus.UNKNOWN:
+                unknown_inflight_sql = (
+                    " AND (effect_inflight_until IS NULL"
+                    " OR effect_inflight_until <= ?"
+                    " OR effect_inflight_token = ?)"
+                )
+                unknown_inflight_args = (now, owner_token)
             cur = conn.execute(
-                """
+                f"""
                 UPDATE slack_job_bindings
                    SET status = ?, delivered_message_ts = ?, unknown_reason = ?,
+                       effect_inflight_token = NULL, effect_inflight_until = NULL,
                        updated_at = ?
                  WHERE job_id = ? AND status IN (?, ?) AND claim_owner_token = ?
+                   {unknown_inflight_sql}
                 """,
                 (
                     status.value,
@@ -701,6 +801,7 @@ class SlackBindingLedger:
                     SlackRootStatus.CLAIMED.value,
                     SlackRootStatus.RECOVERING.value,
                     owner_token,
+                    *unknown_inflight_args,
                 ),
             )
             if cur.rowcount != 1:
@@ -752,6 +853,11 @@ class SlackBindingLedger:
             else "slack_root_adopted"
         )
         now = self._now()
+        if self._job_is_canceled(job_id):
+            blocked = self.get_binding(job_id)
+            if blocked is None:
+                raise BindingRequiredError(f"no Slack binding for {job_id}")
+            return blocked
         with self._connect() as conn:
             current = conn.execute(
                 "SELECT * FROM slack_job_bindings WHERE job_id = ?",
@@ -769,6 +875,7 @@ class SlackBindingLedger:
                 """
                 UPDATE slack_job_bindings
                    SET status = ?, delivered_message_ts = ?, unknown_reason = NULL,
+                       effect_inflight_token = NULL, effect_inflight_until = NULL,
                        updated_at = ?
                  WHERE job_id = ? AND status IN (?, ?)
                    AND (delivered_message_ts IS NULL OR delivered_message_ts = ?)
@@ -897,43 +1004,51 @@ def deliver_slack_root(
     won_token = claimed.owner_token
     if not won_token:
         return binding
-    with owner_lease_heartbeat(
-        renew_fn=lambda: ledger.renew_delivery(
-            job_id, owner_token=won_token
-        ),
-        now_fn=ledger._now_fn,
-        lease_seconds=ledger._lease_seconds,
-    ):
-        result = slack_port.post_root(
-            client_msg_id=binding.outbound_client_msg_id,
-            workspace_id=binding.workspace_id,
-            channel_id=binding.channel_id,
-            root_thread_ts=binding.root_thread_ts,
-            job_id=job_id,
+
+    def _renew_owner() -> bool:
+        inflight_ok = ledger.renew_inflight(job_id, owner_token=won_token)
+        claim_ok = ledger.renew_delivery(job_id, owner_token=won_token)
+        return bool(inflight_ok or claim_ok)
+
+    ledger.begin_inflight(job_id, owner_token=won_token)
+    try:
+        with owner_lease_heartbeat(
+            renew_fn=_renew_owner,
+            now_fn=ledger._now_fn,
+            lease_seconds=ledger._lease_seconds,
+        ):
+            result = slack_port.post_root(
+                client_msg_id=binding.outbound_client_msg_id,
+                workspace_id=binding.workspace_id,
+                channel_id=binding.channel_id,
+                root_thread_ts=binding.root_thread_ts,
+                job_id=job_id,
+            )
+        kind = getattr(result, "kind", None)
+        message_ts = getattr(result, "message_ts", None)
+        if kind == "accepted" and message_ts:
+            return _finish_observed_slack_delivery(
+                ledger,
+                job_id,
+                message_ts,
+                owner_token=won_token,
+                status=SlackRootStatus.DELIVERED,
+            )
+        if kind == "ambiguous_response":
+            unknown = ledger.mark_unknown(
+                job_id,
+                SlackUnknownReason.AMBIGUOUS_RESPONSE.value,
+                owner_token=won_token,
+            )
+            if unknown.status is SlackRootStatus.UNKNOWN:
+                return unknown
+            current = ledger.get_binding(job_id)
+            return current if current is not None else unknown
+        return _lookup_slack_root(
+            ledger, slack_port, binding, owner_token=won_token
         )
-    kind = getattr(result, "kind", None)
-    message_ts = getattr(result, "message_ts", None)
-    if kind == "accepted" and message_ts:
-        return _finish_observed_slack_delivery(
-            ledger,
-            job_id,
-            message_ts,
-            owner_token=won_token,
-            status=SlackRootStatus.DELIVERED,
-        )
-    if kind == "ambiguous_response":
-        unknown = ledger.mark_unknown(
-            job_id,
-            SlackUnknownReason.AMBIGUOUS_RESPONSE.value,
-            owner_token=won_token,
-        )
-        if unknown.status is SlackRootStatus.UNKNOWN:
-            return unknown
-        current = ledger.get_binding(job_id)
-        return current if current is not None else unknown
-    return _lookup_slack_root(
-        ledger, slack_port, binding, owner_token=won_token
-    )
+    finally:
+        ledger.clear_inflight(job_id, owner_token=won_token)
 
 
 def _recover_or_poll_slack(

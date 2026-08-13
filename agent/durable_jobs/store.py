@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS provider_effect_claims (
     recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
     recovery_started_at TEXT,
     recovery_deadline TEXT,
+    effect_inflight_token TEXT,
+    effect_inflight_until TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (job_id, action_id),
@@ -120,6 +122,8 @@ CREATE TABLE IF NOT EXISTS slack_job_bindings (
     recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
     recovery_started_at TEXT,
     recovery_deadline TEXT,
+    effect_inflight_token TEXT,
+    effect_inflight_until TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (workspace_id, channel_id, root_thread_ts),
@@ -167,6 +171,10 @@ _CLAIM_RECOVERY_COLUMNS = (
     ("recovery_started_at", "TEXT"),
     ("recovery_deadline", "TEXT"),
 )
+_CLAIM_INFLIGHT_COLUMNS = (
+    ("effect_inflight_token", "TEXT"),
+    ("effect_inflight_until", "TEXT"),
+)
 
 
 def _utcnow() -> str:
@@ -206,6 +214,19 @@ def _ensure_recovery_protocol(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
     _rebuild_status_check_for_recovering(conn)
+
+
+def _ensure_inflight_witness(conn: sqlite3.Connection) -> None:
+    """Persist in-flight create/post liveness; no-op when columns exist."""
+    for table in _CLAIM_LEASE_TABLES:
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not existing:
+            continue
+        for name, decl in _CLAIM_INFLIGHT_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _rebuild_status_check_for_recovering(conn: sqlite3.Connection) -> None:
@@ -288,6 +309,7 @@ class DurableJobStore:
             conn.executescript(_SCHEMA_SQL)
             _ensure_claim_lease_columns(conn)
             _ensure_recovery_protocol(conn)
+            _ensure_inflight_witness(conn)
             conn.execute(
                 "INSERT INTO durable_jobs_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

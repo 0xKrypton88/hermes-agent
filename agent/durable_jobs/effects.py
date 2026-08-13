@@ -17,8 +17,11 @@ lease still unexpired; False/exception is observable and does not cancel
 an in-flight create. Only an expired/legacy-null lease may be taken over
 (CLAIMED or RECOVERING), minting a new owner token; recovery looks up by
 the stable idempotency key and never blindly creates. Empty lookup stays
-RECOVERING until ``recovery_deadline``, then typed UNKNOWN. A persisted
-foreign token is never caller authority.
+RECOVERING until ``recovery_deadline``, then typed UNKNOWN **only if** the
+persisted in-flight witness has also expired (a live create_run still
+renews that witness in SQLite after claim takeover). A persisted
+foreign token is never caller authority. Cancel is terminal: accepted
+effects cannot overwrite a canceled job.
 
 SQLite here is disposable, explicit-path, single-process, and dev/test-only.
 It does not satisfy ENG-25 production PostgreSQL acceptance.
@@ -44,6 +47,7 @@ from agent.durable_jobs.clock import (
 )
 from agent.durable_jobs.claim_protocol import (
     caller_holds_live_lease,
+    inflight_witness_blocks_unknown,
     owner_lease_heartbeat,
     recovery_bound_exceeded,
 )
@@ -401,6 +405,85 @@ class ProviderEffectLedger:
             )
             return cur.rowcount == 1
 
+    def begin_inflight(self, job_id: str, action_id: str, *, owner_token: str) -> bool:
+        """Persist that this owner has an outstanding create_run.
+
+        Survives takeover of the claim lease. Cleared when the RPC returns.
+        A crash leaves ``effect_inflight_until`` to expire on its own.
+        """
+        now = self._now()
+        until = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET effect_inflight_token = ?, effect_inflight_until = ?,
+                       updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND claim_owner_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    owner_token,
+                    until,
+                    now,
+                    job_id,
+                    action_id,
+                    owner_token,
+                    EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def renew_inflight(self, job_id: str, action_id: str, *, owner_token: str) -> bool:
+        """Renew the in-flight witness. Late renew is allowed while token matches.
+
+        Claim-lease takeover does not steal this slot. One-shot FrozenClock
+        jumps still keep a live RPC from being UNKNOWN'd.
+        """
+        now = self._now()
+        until = add_seconds_iso(now, self._lease_seconds)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET effect_inflight_until = ?, updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND effect_inflight_token = ?
+                   AND status IN (?, ?)
+                """,
+                (
+                    until,
+                    now,
+                    job_id,
+                    action_id,
+                    owner_token,
+                    EffectStatus.CLAIMED.value,
+                    EffectStatus.RECOVERING.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def clear_inflight(self, job_id: str, action_id: str, *, owner_token: str) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE provider_effect_claims
+                   SET effect_inflight_token = NULL, effect_inflight_until = NULL,
+                       updated_at = ?
+                 WHERE job_id = ? AND action_id = ?
+                   AND effect_inflight_token = ?
+                """,
+                (now, job_id, action_id, owner_token),
+            )
+
+    def _job_is_canceled(self, job_id: str) -> bool:
+        from agent.durable_jobs.decisions import DecisionLedger
+
+        return DecisionLedger(sqlite_path=self.sqlite_path).is_canceled(job_id)
+
     def get_claim(self, job_id: str, action_id: str) -> Optional[ProviderEffectClaim]:
         with self._connect() as conn:
             row = conn.execute(
@@ -570,6 +653,13 @@ class ProviderEffectLedger:
         unknown_reason: Optional[str] = None,
     ) -> ProviderEffectClaim:
         now = self._now()
+        if status in (EffectStatus.ACCEPTED, EffectStatus.ADOPTED) and self._job_is_canceled(
+            job_id
+        ):
+            blocked = self.get_claim(job_id, action_id)
+            if blocked is None:
+                raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
+            return blocked
         with self._connect() as conn:
             current = conn.execute(
                 """
@@ -583,14 +673,39 @@ class ProviderEffectLedger:
             claim = self._row_to_claim(current)
             if claim.status not in (EffectStatus.CLAIMED, EffectStatus.RECOVERING):
                 return claim
+            inflight_until = None
+            inflight_token = None
+            if "effect_inflight_until" in current.keys():
+                inflight_until = current["effect_inflight_until"]
+            if "effect_inflight_token" in current.keys():
+                inflight_token = current["effect_inflight_token"]
+            if (
+                status is EffectStatus.UNKNOWN
+                and inflight_token != owner_token
+                and inflight_witness_blocks_unknown(
+                    inflight_until=inflight_until, now_iso=now
+                )
+            ):
+                return claim
+            unknown_inflight_sql = ""
+            unknown_inflight_args: tuple = ()
+            if status is EffectStatus.UNKNOWN:
+                unknown_inflight_sql = (
+                    " AND (effect_inflight_until IS NULL"
+                    " OR effect_inflight_until <= ?"
+                    " OR effect_inflight_token = ?)"
+                )
+                unknown_inflight_args = (now, owner_token)
             cur = conn.execute(
-                """
+                f"""
                 UPDATE provider_effect_claims
                    SET status = ?, provider_run_id = ?, unknown_reason = ?,
+                       effect_inflight_token = NULL, effect_inflight_until = NULL,
                        updated_at = ?
                  WHERE job_id = ? AND action_id = ?
                    AND status IN (?, ?)
                    AND claim_owner_token = ?
+                   {unknown_inflight_sql}
                 """,
                 (
                     status.value,
@@ -602,6 +717,7 @@ class ProviderEffectLedger:
                     EffectStatus.CLAIMED.value,
                     EffectStatus.RECOVERING.value,
                     owner_token,
+                    *unknown_inflight_args,
                 ),
             )
             if cur.rowcount != 1:
@@ -668,6 +784,11 @@ class ProviderEffectLedger:
             else "provider_effect_adopted"
         )
         now = self._now()
+        if self._job_is_canceled(job_id):
+            blocked = self.get_claim(job_id, action_id)
+            if blocked is None:
+                raise KeyError(f"unknown effect claim: {job_id}/{action_id}")
+            return blocked
         with self._connect() as conn:
             current = conn.execute(
                 """
@@ -685,6 +806,7 @@ class ProviderEffectLedger:
                 """
                 UPDATE provider_effect_claims
                    SET status = ?, provider_run_id = ?, unknown_reason = NULL,
+                       effect_inflight_token = NULL, effect_inflight_until = NULL,
                        updated_at = ?
                  WHERE job_id = ? AND action_id = ?
                    AND status IN (?, ?)
@@ -844,7 +966,8 @@ def reconcile_cursor_create(
     while ``create_run`` is in flight; renew False/exception is observable
     and does not cancel that call. Only an expired CLAIMED/RECOVERING may
     be taken over (new token); recovery looks up by the stable idempotency
-    key. Empty lookup stays RECOVERING until ``recovery_deadline``.
+    key. Empty lookup stays RECOVERING until ``recovery_deadline`` **and**
+    the persisted in-flight witness has expired.
     """
     origin_platform, origin_chat_id, origin_root_thread_id = (
         _authoritative_origin_from_slack_binding(
@@ -888,41 +1011,53 @@ def reconcile_cursor_create(
     won_token = claimed.owner_token
     if not won_token:
         return claim
-    with owner_lease_heartbeat(
-        renew_fn=lambda: ledger.renew_claim(
+
+    def _renew_owner() -> bool:
+        inflight_ok = ledger.renew_inflight(
             job_id, action_id, owner_token=won_token
-        ),
-        now_fn=ledger._now_fn,
-        lease_seconds=ledger._lease_seconds,
-    ):
-        result = provider.create_run(
-            idempotency_key=claim.provider_idempotency_key,
-            job_id=job_id,
         )
-    kind = getattr(result, "kind", None)
-    run = getattr(result, "run", None)
-    if kind == "accepted" and run is not None:
-        return _finish_observed_provider_run(
-            ledger,
-            claim,
-            run.run_id,
-            owner_token=won_token,
-            status=EffectStatus.ACCEPTED,
+        claim_ok = ledger.renew_claim(
+            job_id, action_id, owner_token=won_token
         )
-    if kind == "ambiguous_response":
-        unknown = ledger.mark_unknown(
-            job_id,
-            action_id,
-            UnknownReason.AMBIGUOUS_RESPONSE.value,
-            owner_token=won_token,
+        return bool(inflight_ok or claim_ok)
+
+    ledger.begin_inflight(job_id, action_id, owner_token=won_token)
+    try:
+        with owner_lease_heartbeat(
+            renew_fn=_renew_owner,
+            now_fn=ledger._now_fn,
+            lease_seconds=ledger._lease_seconds,
+        ):
+            result = provider.create_run(
+                idempotency_key=claim.provider_idempotency_key,
+                job_id=job_id,
+            )
+        kind = getattr(result, "kind", None)
+        run = getattr(result, "run", None)
+        if kind == "accepted" and run is not None:
+            return _finish_observed_provider_run(
+                ledger,
+                claim,
+                run.run_id,
+                owner_token=won_token,
+                status=EffectStatus.ACCEPTED,
+            )
+        if kind == "ambiguous_response":
+            unknown = ledger.mark_unknown(
+                job_id,
+                action_id,
+                UnknownReason.AMBIGUOUS_RESPONSE.value,
+                owner_token=won_token,
+            )
+            if unknown.status is EffectStatus.UNKNOWN:
+                return unknown
+            current = ledger.get_claim(job_id, action_id)
+            return current if current is not None else unknown
+        return _recover_claimed_provider(
+            ledger, provider, claim, owner_token=won_token
         )
-        if unknown.status is EffectStatus.UNKNOWN:
-            return unknown
-        current = ledger.get_claim(job_id, action_id)
-        return current if current is not None else unknown
-    return _recover_claimed_provider(
-        ledger, provider, claim, owner_token=won_token
-    )
+    finally:
+        ledger.clear_inflight(job_id, action_id, owner_token=won_token)
 
 
 def _authoritative_origin_from_slack_binding(

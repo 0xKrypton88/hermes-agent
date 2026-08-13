@@ -144,6 +144,80 @@ _SLACK_RECOVERING_CHILD = textwrap.dedent(
     """
 )
 
+_PROVIDER_INFLIGHT_DIE = textwrap.dedent(
+    """
+    import os
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
+    from agent.durable_jobs.store import DurableJobStore
+
+    db = Path(sys.argv[1])
+    job_id = sys.argv[2]
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    DurableJobStore(sqlite_path=db)
+    ledger = ProviderEffectLedger(sqlite_path=db, now_fn=clock, lease_seconds=30)
+
+    class Die:
+        def create_run(self, *, idempotency_key, job_id):
+            os._exit(1)
+
+        def lookup_runs(self, *, idempotency_key):
+            return []
+
+    reconcile_cursor_create(
+        ledger,
+        Die(),
+        job_id=job_id,
+        action_id="create_run",
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    """
+)
+
+_SLACK_INFLIGHT_DIE = textwrap.dedent(
+    """
+    import os
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from agent.durable_jobs.clock import FrozenClock
+    from agent.durable_jobs.slack_contract import SlackBindingLedger, deliver_slack_root
+    from agent.durable_jobs.store import DurableJobStore
+
+    db = Path(sys.argv[1])
+    job_id = sys.argv[2]
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    DurableJobStore(sqlite_path=db)
+    ledger = SlackBindingLedger(sqlite_path=db, now_fn=clock, lease_seconds=30)
+    ledger.bind(
+        job_id=job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+
+    class Die:
+        def post_root(self, **kwargs):
+            os._exit(1)
+
+        def lookup_by_client_msg_id(self, client_msg_id):
+            return []
+
+    deliver_slack_root(ledger, Die(), job_id=job_id)
+    """
+)
+
 
 def _make_job(tmp_path: Path, *, idempotency_key: str):
     from agent.durable_jobs.store import DurableJobStore
@@ -652,3 +726,153 @@ def test_slack_recovering_child_token_is_not_caller_authority(tmp_path):
     assert adopted.claim_owner_token != child_token
     assert found.posts == []
     assert found.lookup_calls != []
+
+
+def test_provider_crash_during_create_eventually_unknowns_after_inflight_expires(
+    tmp_path,
+):
+    """Crashed owner: persisted inflight witness expires, then bounded UNKNOWN."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent.durable_jobs.clock import (
+        DEFAULT_RECOVERY_WINDOW_SECONDS,
+        FrozenClock,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-sub-inflight-die-provider")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PROVIDER_INFLIGHT_DIE,
+            str(store.sqlite_path),
+            job.job_id,
+        ],
+        env=_child_env(),
+        cwd=str(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+
+    parent_clock = FrozenClock(
+        datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=31)
+    )
+    ledger = ProviderEffectLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=parent_clock,
+        lease_seconds=30,
+    )
+    kwargs = dict(
+        job_id=job.job_id,
+        action_id="create_run",
+        origin_platform=job.origin_platform,
+        origin_chat_id=job.origin_chat_id,
+        origin_root_thread_id=job.origin_root_thread_id,
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+
+    class _Empty:
+        def __init__(self) -> None:
+            self.create_calls: list[str] = []
+            self.lookup_calls: list[str] = []
+
+        def create_run(self, *, idempotency_key: str, job_id: str):
+            self.create_calls.append(idempotency_key)
+
+            class _R:
+                kind = "lost_response"
+                run = None
+
+            return _R()
+
+        def lookup_runs(self, *, idempotency_key: str):
+            self.lookup_calls.append(idempotency_key)
+            return []
+
+    provider = _Empty()
+    recovering = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert recovering.status is EffectStatus.RECOVERING
+    assert provider.create_calls == []
+    parent_clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
+    terminal = reconcile_cursor_create(ledger, provider, **kwargs)
+    assert terminal.status is EffectStatus.UNKNOWN
+    assert terminal.unknown_reason == UnknownReason.EMPTY_LOOKUP.value
+    assert provider.create_calls == []
+
+
+def test_slack_crash_during_post_eventually_unknowns_after_inflight_expires(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from agent.durable_jobs.clock import (
+        DEFAULT_RECOVERY_WINDOW_SECONDS,
+        FrozenClock,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        SlackUnknownReason,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-sub-inflight-die-slack")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _SLACK_INFLIGHT_DIE,
+            str(store.sqlite_path),
+            job.job_id,
+        ],
+        env=_child_env(),
+        cwd=str(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+
+    parent_clock = FrozenClock(
+        datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=31)
+    )
+    ledger = SlackBindingLedger(
+        sqlite_path=store.sqlite_path,
+        now_fn=parent_clock,
+        lease_seconds=30,
+    )
+
+    class _Empty:
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+            self.lookup_calls: list[str] = []
+
+        def post_root(self, **kwargs):
+            self.posts.append(kwargs["client_msg_id"])
+
+            class _R:
+                kind = "lost_response"
+                message_ts = None
+
+            return _R()
+
+        def lookup_by_client_msg_id(self, client_msg_id: str):
+            self.lookup_calls.append(client_msg_id)
+            return []
+
+    port = _Empty()
+    recovering = deliver_slack_root(ledger, port, job_id=job.job_id)
+    assert recovering.status is SlackRootStatus.RECOVERING
+    assert port.posts == []
+    parent_clock.advance(DEFAULT_RECOVERY_WINDOW_SECONDS + 1)
+    terminal = deliver_slack_root(ledger, port, job_id=job.job_id)
+    assert terminal.status is SlackRootStatus.UNKNOWN
+    assert terminal.unknown_reason == SlackUnknownReason.EMPTY_LOOKUP.value
+    assert port.posts == []
