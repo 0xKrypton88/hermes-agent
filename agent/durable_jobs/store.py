@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -58,6 +58,86 @@ CREATE TABLE IF NOT EXISTS durable_job_events (
     created_at TEXT NOT NULL,
     UNIQUE(job_id, event_type, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS provider_effect_claims (
+    job_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    provider_idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    provider_run_id TEXT,
+    langgraph_thread_id TEXT NOT NULL,
+    origin_platform TEXT NOT NULL,
+    origin_chat_id TEXT NOT NULL,
+    origin_root_thread_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    unknown_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, action_id),
+    CHECK (langgraph_thread_id = job_id),
+    CHECK (status IN ('claimed', 'accepted', 'adopted', 'unknown')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_job_mappings (
+    job_id TEXT PRIMARY KEY,
+    langgraph_thread_id TEXT NOT NULL,
+    provider_run_id TEXT,
+    origin_platform TEXT NOT NULL,
+    origin_chat_id TEXT NOT NULL,
+    origin_root_thread_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (langgraph_thread_id = job_id),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS slack_job_bindings (
+    job_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    root_thread_ts TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    outbound_client_msg_id TEXT NOT NULL UNIQUE,
+    delivered_message_ts TEXT,
+    status TEXT NOT NULL,
+    unknown_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (workspace_id, channel_id, root_thread_ts),
+    CHECK (status IN ('bound', 'delivered', 'adopted', 'unknown')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_authz_policies (
+    job_id TEXT PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    allowed_actors_json TEXT NOT NULL,
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_decisions (
+    decision_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    decision_idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    CHECK (decision_type IN ('go', 'hold', 'cancel')),
+    CHECK (status IN ('accepted', 'duplicate', 'rejected')),
+    FOREIGN KEY (job_id) REFERENCES durable_jobs(job_id)
+);
 """
 
 
@@ -78,9 +158,10 @@ class DurableJobStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.sqlite_path)
+        conn = sqlite3.connect(self.sqlite_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def _init_schema(self) -> None:

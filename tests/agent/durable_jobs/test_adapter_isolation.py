@@ -69,6 +69,8 @@ def test_no_live_dispatch_adapter_is_exported():
 
     assert hasattr(adapters, "DispatchPort")
     assert hasattr(adapters, "NullDispatchAdapter")
+    assert hasattr(adapters, "NullCursorProvider")
+    assert hasattr(adapters, "NullSlackPort")
     assert not hasattr(adapters, "SlackDispatchAdapter")
     assert not hasattr(adapters, "CursorCloudAdapter")
 

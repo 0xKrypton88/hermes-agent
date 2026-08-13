@@ -132,6 +132,11 @@ def test_application_store_schema_is_local_and_isolated_from_checkpointer_tables
 
     assert "durable_jobs" in tables
     assert "durable_job_events" in tables
+    assert "provider_effect_claims" in tables
+    assert "provider_job_mappings" in tables
+    assert "slack_job_bindings" in tables
+    assert "job_authz_policies" in tables
+    assert "job_decisions" in tables
     assert "checkpoints" not in tables
     assert "checkpoint_blobs" not in tables
     assert SCHEMA_VERSION >= 1

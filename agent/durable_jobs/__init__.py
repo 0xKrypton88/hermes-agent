@@ -1,11 +1,12 @@
-"""LangGraph durable-job pilot (ENG-3 Package 1).
+"""LangGraph durable-job pilot (ENG-3 Package 1 + ENG-26/ENG-27 slices).
 
 Isolated, disabled-by-default module. No gateway / Slack / Cursor wiring.
-Dispatch is hard-disabled (never invokes adapters).
+Dispatch is hard-disabled (never invokes adapters). Provider and Slack
+effects use injected fakes only, after an explicit durable claim/binding.
 
 SQLite usage here is disposable, explicit-path, single-process, and
 dev/test-only. Production durable store remains PostgreSQL-first and is not
-provisioned by this package.
+provisioned by this package. This SQLite path does not satisfy ENG-25.
 """
 
 from __future__ import annotations

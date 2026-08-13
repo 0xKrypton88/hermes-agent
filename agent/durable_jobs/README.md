@@ -1,4 +1,4 @@
-# ENG-3 LangGraph Durable-Job Pilot (Package 1)
+# ENG-3 LangGraph Durable-Job Pilot (Package 1 + ENG-26/ENG-27 slices)
 
 Isolated, **disabled-by-default** durable-job pilot. Not wired into the gateway,
 Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
@@ -16,21 +16,43 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   `DispatchDisabledError` and never invokes any adapter, even when
   `enabled` and `dispatch_enabled` are both true and a fake adapter is injected
 
-## Explicit non-goals (Package 1)
+### ENG-26 — Cursor provider reconciliation (default-off)
+
+- Atomic `provider_effect_claims` before any injected fake `create_run`
+- Stable provider idempotency key `cursor:{job_id}:{action_id}`
+- Explicit mapping `job_id == langgraph_thread_id` plus frozen origin Slack
+  binding / candidate / version (not LangGraph context)
+- Lost-create recovery: unique lookup is adopted; empty/ambiguous lookup or
+  ambiguous create persists typed `unknown` and never redispatches
+
+### ENG-27 — Slack job-thread + Go/Hold/Cancel (default-off)
+
+- Immutable job ↔ workspace/channel/root-thread ↔ candidate/version binding
+  **before** any Slack or provider effect; rebind is rejected
+- Stable outbound `client_msg_id`; lost-response unique lookup adopts without
+  a second logical root; ambiguous lookup stays unknown
+- Cross-job and cross-binding resume fail closed
+- Go/Hold/Cancel records bound to job, candidate/version, actor, policy version,
+  and decision idempotency key; unauthorized / mismatch / expired / replayed
+  fail closed. Cancel is terminal and is not weakened by later Go/Hold
+- No Slack routing fork: gateway adapters are untouched
+
+## Explicit non-goals (Package 1 + these slices)
 
 - No production integration / gateway wiring / Slack action wiring
-- No Cursor or cloud provider calls
+- No Cursor or cloud provider calls (injected fakes in tests only)
 - No external dispatch capability whatsoever (not configuration-gated)
 - No service restarts, deployment, credentials, live trading, order mutation,
-  arming/disarming, or reconciliation
+  arming/disarming, or live reconciliation
 - Does **not** touch existing completion/outbox modules or Hermes `state.db`
 - Does **not** add LangGraph to core dependencies (opt-in extra only)
+- SQLite here is **not** ENG-25 production PostgreSQL acceptance
 
 ## Storage boundaries
 
 | Store | Path | Purpose |
 |-------|------|---------|
-| Application job store | `durable_jobs.sqlite_path` (required, explicit) | Jobs + append-only events |
+| Application job store | `durable_jobs.sqlite_path` (required, explicit) | Jobs + events + ENG-26/27 ledgers |
 | LangGraph checkpointer | `durable_jobs.checkpoint_sqlite_path` (required, distinct) | Graph thread checkpoints |
 
 Both are **dev/test SQLite only**, single-process. Schema version is local
@@ -57,7 +79,8 @@ durable_jobs:
 
 `enabled` / `dispatch_enabled` reject non-bool values (strings/ints) to avoid
 `bool("false") == True` ambiguity. Even with both flags true, Package 1 never
-calls an injected dispatch adapter.
+calls an injected dispatch adapter. ENG-26/27 lane methods also no-op unless
+`enabled` is true, and still never construct live Cursor/Slack clients.
 
 ## Tests (clean / release-venv safe)
 
