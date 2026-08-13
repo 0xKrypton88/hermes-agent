@@ -10,6 +10,7 @@ does not keep a second run map.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence
@@ -82,9 +83,15 @@ class CursorStatusReconcileResult:
 
 
 class CursorCloudTransport(Protocol):
-    """Injected transport. Tests supply an in-memory fake; no default client."""
+    """Injected transport. Tests supply an in-memory fake; no default client.
 
-    def create(self, *, idempotency_key: str, job_id: str, name: str) -> Any: ...
+    ``create`` must send client ``agent_id`` (official ``agentId``). Live v1
+    list/get echo that value as ``id`` and do not preserve create ``name``.
+    """
+
+    def create(
+        self, *, idempotency_key: str, job_id: str, name: str, agent_id: str
+    ) -> Any: ...
 
     def lookup(self, *, idempotency_key: str) -> Sequence[Any]: ...
 
@@ -95,12 +102,20 @@ class CursorCloudTransport(Protocol):
 CURSOR_AGENT_NAME_MAX = 100
 _CURSOR_KEY_RE = re.compile(r"^cursor:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 _CURSOR_AGENT_ID_RE = re.compile(r"^bc[-_][A-Za-z0-9-]+$")
+# Official OpenAPI: POST /v1/agents agentId.
+_CURSOR_CLIENT_AGENT_ID_RE = re.compile(
+    r"^bc-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_CURSOR_AGENT_ID_PREFIX = "hermes-durable-jobs:cursor-agent:"
 _OFFICIAL_LIST_KEYS = ("agents", "items")
 
 
 def cursor_correlation_name(idempotency_key: str) -> str:
-    """Provider-preserved Cloud Agents ``name``. Equals the ledger key or raises.
+    """Create ``name`` to send (display only). Equals the ledger key or raises.
 
+    Live v1 overwrites ``name`` with a generated display string; list/get do
+    not preserve it. Recovery identity is ``cursor_correlation_agent_id``.
     Keys longer than ``CURSOR_AGENT_NAME_MAX`` are rejected fail-closed. This
     function never silently truncates (truncation would collide distinct keys).
     """
@@ -110,6 +125,25 @@ def cursor_correlation_name(idempotency_key: str) -> str:
             "provider idempotency key exceeds Cursor agent name limit"
         )
     return key
+
+
+def cursor_correlation_agent_id(idempotency_key: str) -> str:
+    """Deterministic client ``agentId`` echoed by live list/get as ``id``.
+
+    OpenAPI pattern: ``bc-`` + UUID. uuid5 of a stable namespace+prefix plus
+    the ledger key is idempotent across lost-create retries without injecting
+    a synthetic ``idempotency_key`` into official payloads.
+    """
+    key = str(idempotency_key).strip()
+    if not key:
+        raise ValueError(
+            "Cursor correlation agent id requires a non-empty idempotency key"
+        )
+    derived = uuid.uuid5(uuid.NAMESPACE_URL, _CURSOR_AGENT_ID_PREFIX + key)
+    agent_id = f"bc-{derived}"
+    if not _CURSOR_CLIENT_AGENT_ID_RE.fullmatch(agent_id):
+        raise ValueError("derived Cursor agent id is not a valid client agentId")
+    return agent_id
 
 
 def cursor_correlation_prompt(idempotency_key: str, text: str = "") -> str:
@@ -203,6 +237,43 @@ def _provider_records(raw: Any) -> Sequence[Any]:
     return (raw,)
 
 
+def _record_id(raw: Any) -> str:
+    if isinstance(raw, dict):
+        rid = raw.get("run_id") or raw.get("id")
+    else:
+        rid = getattr(raw, "run_id", None) or getattr(raw, "id", None)
+    if isinstance(rid, str) and rid.strip():
+        return rid.strip()
+    return ""
+
+
+def _matches_derived_agent_id(raw: Any, *, expected_key: str) -> bool:
+    if not expected_key:
+        return False
+    record_id = _record_id(raw)
+    if not record_id:
+        return False
+    try:
+        derived = cursor_correlation_agent_id(expected_key)
+    except ValueError:
+        return False
+    return record_id.lower() == derived.lower()
+
+
+def _is_cursor_agent_id_conflict(raw: Any) -> bool:
+    """Official re-POST of the same client agentId returns 409 agent_id_conflict."""
+    if not isinstance(raw, dict):
+        return False
+    chunks: list[str] = []
+    for key in ("error", "code", "message", "error_code", "kind"):
+        val = raw.get(key)
+        if isinstance(val, dict):
+            chunks.extend(str(part) for part in val.values() if part is not None)
+        elif val is not None:
+            chunks.append(str(val))
+    return "agent_id_conflict" in " ".join(chunks).lower()
+
+
 def _correlation_for_record(raw: Any, *, fallback_key: str) -> str:
     if isinstance(raw, dict):
         explicit = raw.get("idempotency_key")
@@ -210,6 +281,8 @@ def _correlation_for_record(raw: Any, *, fallback_key: str) -> str:
         explicit = getattr(raw, "idempotency_key", None)
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
+    if _matches_derived_agent_id(raw, expected_key=fallback_key):
+        return fallback_key
     extracted = _extract_preserved_correlation(raw, expected_key=fallback_key)
     if extracted:
         return extracted
@@ -292,6 +365,9 @@ def normalize_create_result(raw: Any, *, expected_key: str) -> CursorCreateResul
     if isinstance(raw, CursorCreateResult):
         return _fail_closed_create(raw, expected_key=expected_key)
     if raw is None:
+        return CursorCreateResult(kind=CursorCreateKind.LOST_RESPONSE)
+    if _is_cursor_agent_id_conflict(raw):
+        # Same client agentId already exists — look up rather than create again.
         return CursorCreateResult(kind=CursorCreateKind.LOST_RESPONSE)
     if isinstance(raw, (list, tuple)):
         runs = [
@@ -433,6 +509,7 @@ class CursorCloudAdapter:
     def create_run(self, *, idempotency_key: str, job_id: str) -> CursorCreateResult:
         try:
             name = cursor_correlation_name(idempotency_key)
+            agent_id = cursor_correlation_agent_id(idempotency_key)
         except ValueError as exc:
             return CursorCreateResult(
                 kind=CursorCreateKind.UNKNOWN,
@@ -440,7 +517,10 @@ class CursorCloudAdapter:
             )
         try:
             raw = self._transport.create(
-                idempotency_key=idempotency_key, job_id=job_id, name=name
+                idempotency_key=idempotency_key,
+                job_id=job_id,
+                name=name,
+                agent_id=agent_id,
             )
         except Exception as exc:
             return CursorCreateResult(

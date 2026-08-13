@@ -7,6 +7,7 @@ provider effect ledger.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,20 +62,26 @@ class MemoryCursorTransport:
     status_calls: list = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def create(self, *, idempotency_key: str, job_id: str, name: str = "") -> Any:
+    def create(
+        self, *, idempotency_key: str, job_id: str, name: str = "", agent_id: str = ""
+    ) -> Any:
         with self._lock:
             self.create_calls.append(
                 {
                     "idempotency_key": idempotency_key,
                     "job_id": job_id,
                     "name": name,
+                    "agent_id": agent_id,
                 }
             )
             if callable(self.create_payload) and not isinstance(
                 self.create_payload, type
             ):
                 return self.create_payload(
-                    idempotency_key=idempotency_key, job_id=job_id, name=name
+                    idempotency_key=idempotency_key,
+                    job_id=job_id,
+                    name=name,
+                    agent_id=agent_id,
                 )
             if isinstance(self.create_payload, BaseException):
                 raise self.create_payload
@@ -145,7 +152,9 @@ def test_adapter_seam_requires_injected_transport_and_preserves_null_isolation()
 
 
 class _FakeTransport:
-    def create(self, *, idempotency_key: str, job_id: str, name: str = ""):
+    def create(
+        self, *, idempotency_key: str, job_id: str, name: str = "", agent_id: str = ""
+    ):
         raise AssertionError("transport must not be called in isolation test")
 
     def lookup(self, *, idempotency_key: str):
@@ -734,13 +743,16 @@ class OfficialNameMarkerTransport:
     _agents: list = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def create(self, *, idempotency_key: str, job_id: str, name: str) -> Any:
+    def create(
+        self, *, idempotency_key: str, job_id: str, name: str, agent_id: str = ""
+    ) -> Any:
         with self._lock:
             self.create_calls.append(
                 {
                     "idempotency_key": idempotency_key,
                     "job_id": job_id,
                     "name": name,
+                    "agent_id": agent_id,
                 }
             )
             agent = _official_v0_agent(
@@ -859,3 +871,186 @@ def test_cursor_correlation_name_equals_untruncated_ledger_key():
     assert cursor_correlation_name(key) == key
     with pytest.raises(ValueError, match="name limit"):
         cursor_correlation_name("cursor:" + ("j" * 120) + ":create_run")
+
+
+def _official_v1_list_item(
+    *,
+    agent_id: str,
+    name: str,
+    status: str = "ACTIVE",
+    latest_run_id: str = "run-00000000-0000-0000-0000-000000000099",
+) -> dict:
+    """GET /v1/agents list item: identity fields only. No prompt, no idempotency_key."""
+    item = {
+        "id": agent_id,
+        "name": name,
+        "status": status,
+        "env": {"type": "cloud"},
+        "url": f"https://cursor.com/agents/{agent_id}",
+        "createdAt": "2026-08-13T20:00:00.000Z",
+        "updatedAt": "2026-08-13T20:00:00.000Z",
+        "latestRunId": latest_run_id,
+    }
+    assert "prompt" not in item
+    assert "idempotency_key" not in item
+    return item
+
+
+@dataclass
+class OfficialV1GeneratedNameTransport:
+    """Live v1 contract: create ``name`` is overwritten; list echoes ``items[].id``.
+
+    ``create`` accepts optional ``agent_id`` so this double can run against
+    f33ed150 (which does not pass it). Lookup never injects ``idempotency_key``.
+    """
+
+    extra_items: List[Any] = field(default_factory=list)
+    create_calls: list = field(default_factory=list)
+    lookup_calls: list = field(default_factory=list)
+    status_calls: list = field(default_factory=list)
+    generated_name: str = "ENG-26 disposable sandbox"
+    _items: list = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def create(
+        self,
+        *,
+        idempotency_key: str,
+        job_id: str,
+        name: str = "",
+        agent_id: str = "",
+    ) -> Any:
+        with self._lock:
+            self.create_calls.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "job_id": job_id,
+                    "name": name,
+                    "agent_id": agent_id,
+                }
+            )
+            stored_id = (agent_id or "").strip() or (
+                "bc-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            )
+            item = _official_v1_list_item(
+                agent_id=stored_id,
+                name=self.generated_name,
+                status="ACTIVE",
+            )
+            assert item["name"] != name
+            self._items.append(item)
+            return {"kind": "lost_response"}
+
+    def lookup(self, *, idempotency_key: str) -> Any:
+        with self._lock:
+            self.lookup_calls.append(idempotency_key)
+            items = [dict(item) for item in self._items]
+            items.extend(dict(extra) for extra in self.extra_items)
+            envelope = {
+                "items": items,
+                "nextCursor": "bc-ffffffff-ffff-4fff-8fff-ffffffffffff",
+            }
+            assert all("idempotency_key" not in item for item in envelope["items"])
+            assert all("prompt" not in item for item in envelope["items"])
+            return envelope
+
+    def status(self, *, run_id: str) -> Any:
+        with self._lock:
+            self.status_calls.append(run_id)
+            for item in self._items:
+                if item.get("id") == run_id:
+                    return dict(item)
+            return None
+
+
+def test_v1_items_generated_name_lost_create_adopts_client_agent_id(tmp_path):
+    """Live v1 list envelope: generated names are not correlation; ``id`` is.
+
+    Overlay-safe: imports only symbols present on f33ed150. Does not import
+    cursor_correlation_agent_id or other post-parent production helpers.
+
+    Intended RED on f33ed150: create does not pass agent_id, list names are
+    human-readable (not the ledger key), so lookup stays empty and reconcile
+    returns RECOVERING instead of ADOPTED.
+    """
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    generated = "ENG-26 disposable sandbox"
+    assert 23 <= len(generated) <= 33
+    assert generated != key
+    transport = OfficialV1GeneratedNameTransport(
+        generated_name=generated,
+        extra_items=[
+            _official_v1_list_item(
+                agent_id="bc-99999999-9999-4999-8999-999999999999",
+                name="Investigate flaky CI tests",
+            ),
+            _official_v1_list_item(
+                agent_id="bc-88888888-8888-4888-8888-888888888888",
+                name=f"leftover {key} sandbox",
+            ),
+            _official_v1_list_item(
+                agent_id="bc-77777777-7777-4777-8777-777777777777",
+                name="Fix cursor adapter contract",
+            ),
+        ],
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is EffectStatus.ADOPTED
+    sent = transport.create_calls[0]["agent_id"]
+    assert sent
+    assert re.fullmatch(
+        r"^bc-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        sent,
+    )
+    assert claim.provider_run_id == sent
+    assert claim.provider_run_id != "run-00000000-0000-0000-0000-000000000099"
+    assert claim.provider_idempotency_key == key
+    assert ledger.get_mapping(job.job_id).provider_run_id == sent
+    assert len(transport.create_calls) == 1
+    assert transport.create_calls[0]["idempotency_key"] == key
+    assert transport.lookup_calls == [key]
+
+    raw_list = transport.lookup(idempotency_key=key)
+    assert isinstance(raw_list, dict)
+    assert "items" in raw_list
+    assert "nextCursor" in raw_list
+    assert "agents" not in raw_list
+    assert all("idempotency_key" not in item for item in raw_list["items"])
+    assert all("prompt" not in item for item in raw_list["items"])
+    created_item = next(item for item in raw_list["items"] if item["id"] == sent)
+    assert created_item["name"] == generated
+    assert created_item["name"] != key
+    assert 23 <= len(created_item["name"]) <= 33
+
+    looked = adapter.lookup_runs(idempotency_key=key)
+    assert [run.run_id for run in looked] == [sent]
+    assert all(run.idempotency_key == key for run in looked)
+
+    second = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert second.status is EffectStatus.ADOPTED
+    assert second.provider_run_id == sent
+    assert len(transport.create_calls) == 1
