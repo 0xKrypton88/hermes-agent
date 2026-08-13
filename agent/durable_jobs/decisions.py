@@ -277,15 +277,17 @@ class DecisionLedger:
             )
 
         with self._connect() as conn:
-            existing = conn.execute(
-                """
-                SELECT * FROM job_decisions
-                 WHERE decision_idempotency_key = ?
-                """,
-                (decision_idempotency_key,),
-            ).fetchone()
-            if existing is not None:
-                record = self._row_to_decision(existing)
+            def _lookup() -> Optional[sqlite3.Row]:
+                return conn.execute(
+                    """
+                    SELECT * FROM job_decisions
+                     WHERE decision_idempotency_key = ?
+                    """,
+                    (decision_idempotency_key,),
+                ).fetchone()
+
+            def _result_from_existing(existing_row: sqlite3.Row) -> DecisionResult:
+                record = self._row_to_decision(existing_row)
                 same = (
                     record.job_id == job_id
                     and record.decision_type is dtype
@@ -324,6 +326,10 @@ class DecisionLedger:
                     reason_codes=("replayed",),
                 )
 
+            existing = _lookup()
+            if existing is not None:
+                return _result_from_existing(existing)
+
             reasons = self._authorization_reasons(
                 conn,
                 job_id=job_id,
@@ -347,37 +353,44 @@ class DecisionLedger:
             status = "rejected" if reasons else "accepted"
             now = self._now()
             decision_id = f"dd_{uuid.uuid4().hex}"
-            conn.execute(
-                """
-                INSERT INTO job_decisions(
-                    decision_id, job_id, decision_type, candidate_id,
-                    candidate_version, actor_id, policy_version,
-                    decision_idempotency_key, status, reason_codes_json,
-                    created_at, source_package_id, source_package_version,
-                    candidate_sha, target_environment, target_action,
-                    matrix_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision_id,
-                    job_id,
-                    dtype.value,
-                    candidate_id,
-                    candidate_version,
-                    actor_id,
-                    policy_version,
-                    decision_idempotency_key,
-                    status,
-                    json.dumps(list(reasons), sort_keys=True),
-                    now,
-                    source_package_id,
-                    source_package_version,
-                    candidate_sha,
-                    target_environment,
-                    target_action,
-                    matrix_version,
-                ),
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO job_decisions(
+                        decision_id, job_id, decision_type, candidate_id,
+                        candidate_version, actor_id, policy_version,
+                        decision_idempotency_key, status, reason_codes_json,
+                        created_at, source_package_id, source_package_version,
+                        candidate_sha, target_environment, target_action,
+                        matrix_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision_id,
+                        job_id,
+                        dtype.value,
+                        candidate_id,
+                        candidate_version,
+                        actor_id,
+                        policy_version,
+                        decision_idempotency_key,
+                        status,
+                        json.dumps(list(reasons), sort_keys=True),
+                        now,
+                        source_package_id,
+                        source_package_version,
+                        candidate_sha,
+                        target_environment,
+                        target_action,
+                        matrix_version,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raced = _lookup()
+                if raced is None:
+                    raise
+                return _result_from_existing(raced)
             DurableJobStore._append_event(
                 conn,
                 job_id=job_id,
