@@ -61,15 +61,21 @@ class MemoryCursorTransport:
     status_calls: list = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def create(self, *, idempotency_key: str, job_id: str) -> Any:
+    def create(self, *, idempotency_key: str, job_id: str, name: str = "") -> Any:
         with self._lock:
             self.create_calls.append(
-                {"idempotency_key": idempotency_key, "job_id": job_id}
+                {
+                    "idempotency_key": idempotency_key,
+                    "job_id": job_id,
+                    "name": name,
+                }
             )
             if callable(self.create_payload) and not isinstance(
                 self.create_payload, type
             ):
-                return self.create_payload(idempotency_key=idempotency_key, job_id=job_id)
+                return self.create_payload(
+                    idempotency_key=idempotency_key, job_id=job_id, name=name
+                )
             if isinstance(self.create_payload, BaseException):
                 raise self.create_payload
             return self.create_payload
@@ -139,7 +145,7 @@ def test_adapter_seam_requires_injected_transport_and_preserves_null_isolation()
 
 
 class _FakeTransport:
-    def create(self, *, idempotency_key: str, job_id: str):
+    def create(self, *, idempotency_key: str, job_id: str, name: str = ""):
         raise AssertionError("transport must not be called in isolation test")
 
     def lookup(self, *, idempotency_key: str):
@@ -713,18 +719,62 @@ def _official_v0_agent(*, agent_id: str, name: str, status: str) -> dict:
     }
 
 
-def test_official_cursor_payloads_lost_create_adopts_unique_name_marker(tmp_path):
-    """Real v0 create/list shapes: correlation is the preserved ``name`` marker.
+@dataclass
+class OfficialNameMarkerTransport:
+    """Create stores the supplied ``name``; lookup echoes official list/get.
 
-    The Cloud Agents API does not echo a custom idempotency field. After an
-    accepted-but-lost create, unique list match on that marker must be adopted.
+    Lookup payloads never include ``idempotency_key``. Agents are listed only
+    from the ``name`` argument actually passed to ``create``.
     """
-    from agent.durable_jobs.cursor_cloud import (
-        CursorCloudAdapter,
-        CursorCreateKind,
-        cursor_correlation_name,
-        normalize_create_result,
-    )
+
+    extra_agents: List[Any] = field(default_factory=list)
+    create_calls: list = field(default_factory=list)
+    lookup_calls: list = field(default_factory=list)
+    status_calls: list = field(default_factory=list)
+    _agents: list = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def create(self, *, idempotency_key: str, job_id: str, name: str) -> Any:
+        with self._lock:
+            self.create_calls.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "job_id": job_id,
+                    "name": name,
+                }
+            )
+            agent = _official_v0_agent(
+                agent_id="bc_abc123", name=name, status="CREATING"
+            )
+            assert "idempotency_key" not in agent
+            self._agents.append(agent)
+            return {"kind": "lost_response"}
+
+    def lookup(self, *, idempotency_key: str) -> Any:
+        with self._lock:
+            self.lookup_calls.append(idempotency_key)
+            listed = [{**agent, "status": "RUNNING"} for agent in self._agents]
+            listed.extend(self.extra_agents)
+            envelope = {"agents": listed, "nextCursor": "bc_ghi789"}
+            assert all("idempotency_key" not in item for item in envelope["agents"])
+            return envelope
+
+    def status(self, *, run_id: str) -> Any:
+        with self._lock:
+            self.status_calls.append(run_id)
+            for agent in self._agents:
+                if agent.get("id") == run_id:
+                    return dict(agent)
+            return None
+
+
+def test_official_cursor_payloads_lost_create_adopts_unique_name_marker(tmp_path):
+    """Official v0 list/get: exact ledger key is create ``name``, then adopted.
+
+    Overlay-safe: imports only symbols present on parent deab218. Does not
+    import cursor_correlation_name or other post-parent production helpers.
+    """
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
     from agent.durable_jobs.effects import (
         EffectStatus,
         ProviderEffectLedger,
@@ -735,28 +785,24 @@ def test_official_cursor_payloads_lost_create_adopts_unique_name_marker(tmp_path
     store, job = _make_job(tmp_path)
     ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
     key = provider_idempotency_key(job.job_id, "create_run")
-    marker = cursor_correlation_name(key)
-    created_id = "bc_abc123"
-    official_create = _official_v0_agent(
-        agent_id=created_id, name=marker, status="CREATING"
-    )
-    official_list = {
-        "agents": [
-            _official_v0_agent(
-                agent_id=created_id, name=marker, status="RUNNING"
-            ),
+    transport = OfficialNameMarkerTransport(
+        extra_agents=[
             _official_v0_agent(
                 agent_id="bc_unrelated",
                 name="Add README Documentation",
                 status="FINISHED",
             ),
-        ],
-        "nextCursor": "bc_ghi789",
-    }
-
-    transport = MemoryCursorTransport(
-        create_payload={"kind": "lost_response"},
-        lookups=official_list,
+            _official_v0_agent(
+                agent_id="bc_substring",
+                name=f"ENG-26 disposable {key} leftover",
+                status="RUNNING",
+            ),
+            _official_v0_agent(
+                agent_id="bc_foreign",
+                name="cursor:other-job:create_run",
+                status="RUNNING",
+            ),
+        ]
     )
     adapter = CursorCloudAdapter(transport=transport)
     claim = reconcile_cursor_create(
@@ -767,18 +813,49 @@ def test_official_cursor_payloads_lost_create_adopts_unique_name_marker(tmp_path
         **_origin_kwargs(job),
     )
     assert claim.status is EffectStatus.ADOPTED
-    assert claim.provider_run_id == created_id
+    assert claim.provider_run_id == "bc_abc123"
     assert claim.provider_idempotency_key == key
-    assert ledger.get_mapping(job.job_id).provider_run_id == created_id
+    assert ledger.get_mapping(job.job_id).provider_run_id == "bc_abc123"
     assert len(transport.create_calls) == 1
     assert transport.create_calls[0]["idempotency_key"] == key
+    assert transport.create_calls[0]["name"] == key
     assert transport.lookup_calls == [key]
-
-    normalized = normalize_create_result(official_create, expected_key=key)
-    assert normalized.kind is CursorCreateKind.ACCEPTED
-    assert normalized.run is not None
-    assert normalized.run.run_id == created_id
-    assert normalized.run.idempotency_key == key
+    raw_list = transport.lookup(idempotency_key=key)
+    assert isinstance(raw_list, dict)
+    assert all("idempotency_key" not in item for item in raw_list["agents"])
     looked = adapter.lookup_runs(idempotency_key=key)
-    assert [run.run_id for run in looked] == [created_id]
+    assert [run.run_id for run in looked] == ["bc_abc123"]
     assert all(run.idempotency_key == key for run in looked)
+
+
+def test_overlong_provider_key_is_rejected_without_truncated_dispatch():
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        CursorCreateKind,
+    )
+
+    long_key = "cursor:" + ("j" * 120) + ":create_run"
+    assert len(long_key) > 100
+    transport = MemoryCursorTransport(
+        create_payload={
+            "kind": "accepted",
+            "run": {"run_id": "run-trunc", "idempotency_key": long_key},
+        }
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    created = adapter.create_run(idempotency_key=long_key, job_id="job")
+    assert created.kind is CursorCreateKind.UNKNOWN
+    assert created.kind is not CursorCreateKind.ACCEPTED
+    assert transport.create_calls == []
+    assert adapter.lookup_runs(idempotency_key=long_key) == []
+
+
+def test_cursor_correlation_name_equals_untruncated_ledger_key():
+    from agent.durable_jobs.cursor_cloud import cursor_correlation_name
+    from agent.durable_jobs.effects import provider_idempotency_key
+
+    key = provider_idempotency_key("dj_" + ("a" * 32), "create_run")
+    assert len(key) <= 100
+    assert cursor_correlation_name(key) == key
+    with pytest.raises(ValueError, match="name limit"):
+        cursor_correlation_name("cursor:" + ("j" * 120) + ":create_run")

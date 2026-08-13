@@ -84,22 +84,32 @@ class CursorStatusReconcileResult:
 class CursorCloudTransport(Protocol):
     """Injected transport. Tests supply an in-memory fake; no default client."""
 
-    def create(self, *, idempotency_key: str, job_id: str) -> Any: ...
+    def create(self, *, idempotency_key: str, job_id: str, name: str) -> Any: ...
 
     def lookup(self, *, idempotency_key: str) -> Sequence[Any]: ...
 
     def status(self, *, run_id: str) -> Any: ...
 
 
-# Ledger key ``cursor:{job_id}:{action_id}`` fits the v0/v1 ``name`` limit (100).
-_CURSOR_KEY_RE = re.compile(r"cursor:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+")
+# v0/v1 Cloud Agents ``name`` max is 100. Ledger keys must fit exactly; never truncate.
+CURSOR_AGENT_NAME_MAX = 100
+_CURSOR_KEY_RE = re.compile(r"^cursor:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
 _CURSOR_AGENT_ID_RE = re.compile(r"^bc[-_][A-Za-z0-9-]+$")
 _OFFICIAL_LIST_KEYS = ("agents", "items")
 
 
 def cursor_correlation_name(idempotency_key: str) -> str:
-    """Provider-preserved Cloud Agents ``name`` carrying the ledger key."""
-    return str(idempotency_key).strip()[:100]
+    """Provider-preserved Cloud Agents ``name``. Equals the ledger key or raises.
+
+    Keys longer than ``CURSOR_AGENT_NAME_MAX`` are rejected fail-closed. This
+    function never silently truncates (truncation would collide distinct keys).
+    """
+    key = str(idempotency_key).strip()
+    if not key or len(key) > CURSOR_AGENT_NAME_MAX:
+        raise ValueError(
+            "provider idempotency key exceeds Cursor agent name limit"
+        )
+    return key
 
 
 def cursor_correlation_prompt(idempotency_key: str, text: str = "") -> str:
@@ -117,44 +127,49 @@ def _display_name(raw: Any) -> str:
     return name.strip() if isinstance(name, str) else ""
 
 
-def _extract_preserved_correlation(raw: Any) -> Optional[str]:
-    """Recover the ledger key from documented preserved fields (name/prompt)."""
-    texts: list[str] = []
+def _prompt_first_line(raw: Any) -> str:
+    prompt: Any = None
     if isinstance(raw, dict):
-        for field in ("idempotency_key", "name"):
-            val = raw.get(field)
-            if isinstance(val, str) and val.strip():
-                texts.append(val.strip())
         prompt = raw.get("prompt")
-        if isinstance(prompt, dict):
-            ptext = prompt.get("text")
-            if isinstance(ptext, str) and ptext.strip():
-                texts.append(ptext.strip())
-        elif isinstance(prompt, str) and prompt.strip():
-            texts.append(prompt.strip())
         source = raw.get("source")
-        if isinstance(source, dict):
-            sp = source.get("prompt")
-            if isinstance(sp, str) and sp.strip():
-                texts.append(sp.strip())
+        if prompt is None and isinstance(source, dict):
+            prompt = source.get("prompt")
     else:
-        for attr in ("idempotency_key", "name"):
-            val = getattr(raw, attr, None)
-            if isinstance(val, str) and val.strip():
-                texts.append(val.strip())
         prompt = getattr(raw, "prompt", None)
-        if isinstance(prompt, dict):
-            ptext = prompt.get("text")
-            if isinstance(ptext, str) and ptext.strip():
-                texts.append(ptext.strip())
-        elif isinstance(prompt, str) and prompt.strip():
-            texts.append(prompt.strip())
-    for text in texts:
-        if text.startswith("cursor:"):
-            return text.split()[0][:100]
-        found = _CURSOR_KEY_RE.search(text)
-        if found:
-            return found.group(0)
+    if isinstance(prompt, dict):
+        prompt = prompt.get("text")
+    if not isinstance(prompt, str):
+        return ""
+    return prompt.strip().splitlines()[0].strip() if prompt.strip() else ""
+
+
+def _exact_cursor_key(text: str) -> Optional[str]:
+    """Whole-field key only. Substrings and foreign markers do not match."""
+    if not text or len(text) > CURSOR_AGENT_NAME_MAX:
+        return None
+    if _CURSOR_KEY_RE.fullmatch(text):
+        return text
+    return None
+
+
+def _extract_preserved_correlation(
+    raw: Any, *, expected_key: str = ""
+) -> Optional[str]:
+    """Recover the ledger key from documented preserved fields (name/prompt).
+
+    Matching is exact on the whole ``name`` (or prompt first line). A human
+    sentence that merely contains the key is not a match.
+    """
+    fields = (_display_name(raw), _prompt_first_line(raw))
+    expected = str(expected_key).strip()
+    for text in fields:
+        if not text:
+            continue
+        if expected and text == expected:
+            return expected
+        extracted = _exact_cursor_key(text)
+        if extracted:
+            return extracted
     return None
 
 
@@ -195,11 +210,11 @@ def _correlation_for_record(raw: Any, *, fallback_key: str) -> str:
         explicit = getattr(raw, "idempotency_key", None)
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
-    extracted = _extract_preserved_correlation(raw)
+    extracted = _extract_preserved_correlation(raw, expected_key=fallback_key)
     if extracted:
         return extracted
     if _looks_like_official_cursor_record(raw):
-        # Display names without our marker are not the ledger key.
+        # Display names without an exact marker are not the ledger key.
         return _display_name(raw)
     return fallback_key
 
@@ -416,11 +431,16 @@ class CursorCloudAdapter:
         self._transport = transport
 
     def create_run(self, *, idempotency_key: str, job_id: str) -> CursorCreateResult:
-        # Transport must persist this key as Cloud Agents ``name`` (and may
-        # prefix prompt text). List/lookup recovers that exact marker.
+        try:
+            name = cursor_correlation_name(idempotency_key)
+        except ValueError as exc:
+            return CursorCreateResult(
+                kind=CursorCreateKind.UNKNOWN,
+                error=redact_provider_error(exc),
+            )
         try:
             raw = self._transport.create(
-                idempotency_key=idempotency_key, job_id=job_id
+                idempotency_key=idempotency_key, job_id=job_id, name=name
             )
         except Exception as exc:
             return CursorCreateResult(
@@ -430,6 +450,10 @@ class CursorCloudAdapter:
         return normalize_create_result(raw, expected_key=idempotency_key)
 
     def lookup_runs(self, *, idempotency_key: str) -> list[CursorRun]:
+        try:
+            cursor_correlation_name(idempotency_key)
+        except ValueError:
+            return []
         try:
             raw = self._transport.lookup(idempotency_key=idempotency_key)
         except Exception as exc:
