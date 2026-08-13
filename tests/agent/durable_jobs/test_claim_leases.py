@@ -638,6 +638,9 @@ def test_reopen_candidate_v2_db_evolves_lease_columns_null_expiry_is_stale(tmp_p
     assert "claim_owner_token" not in before
 
     DurableJobStore(sqlite_path=path)
+    from agent.durable_jobs.eng29 import install_default_adapter_authorization
+
+    install_default_adapter_authorization(path, "dj_v2legacy")
     after_provider = _table_columns(path, "provider_effect_claims")
     after_slack = _table_columns(path, "slack_job_bindings")
     for cols in (after_provider, after_slack):

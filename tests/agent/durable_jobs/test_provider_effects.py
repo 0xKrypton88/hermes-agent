@@ -163,6 +163,7 @@ def test_mapping_job_id_equals_langgraph_thread_id_and_freezes_origin_candidate_
     tmp_path,
 ):
     from agent.durable_jobs.effects import ProviderEffectLedger
+    from agent.durable_jobs.eng29 import AuthorizationDenied
 
     store, job = _make_job(tmp_path)
     ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
@@ -186,7 +187,7 @@ def test_mapping_job_id_equals_langgraph_thread_id_and_freezes_origin_candidate_
     assert mapping.candidate_id == "cand-1"
     assert mapping.candidate_version == "v1"
 
-    with pytest.raises(ValueError):
+    with pytest.raises(AuthorizationDenied):
         ledger.claim_effect(
             job_id=job.job_id,
             action_id="other_action",

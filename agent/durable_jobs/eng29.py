@@ -8,6 +8,7 @@ implemented — those categories are enforced by the classifier and guard.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -75,6 +76,8 @@ class AuthorizationTuple:
     source_package_id: str
     source_package_version: str
     candidate_sha: str
+    candidate_id: str
+    candidate_version: str
     target_environment: str
     target_action: str
     authorized_actor: str
@@ -142,12 +145,23 @@ def _connect(sqlite_path: Path, *, immediate: bool = False) -> sqlite3.Connectio
     return conn
 
 
+def _row_text(row: sqlite3.Row, key: str, *, default: str = "") -> str:
+    if key not in row.keys():
+        return default
+    value = row[key]
+    if value is None:
+        return default
+    return str(value)
+
+
 def _row_to_tuple(row: sqlite3.Row) -> AuthorizationTuple:
     return AuthorizationTuple(
         job_id=row["job_id"],
         source_package_id=row["source_package_id"],
         source_package_version=row["source_package_version"],
         candidate_sha=row["candidate_sha"],
+        candidate_id=_row_text(row, "candidate_id"),
+        candidate_version=_row_text(row, "candidate_version"),
         target_environment=row["target_environment"],
         target_action=row["target_action"],
         authorized_actor=row["authorized_actor"],
@@ -168,6 +182,8 @@ def _tuple_payload_equal(
     source_package_id: str,
     source_package_version: str,
     candidate_sha: str,
+    candidate_id: str,
+    candidate_version: str,
     target_environment: str,
     target_action: str,
     authorized_actor: str,
@@ -183,6 +199,8 @@ def _tuple_payload_equal(
         and record.source_package_id == source_package_id
         and record.source_package_version == source_package_version
         and record.candidate_sha == candidate_sha
+        and record.candidate_id == candidate_id
+        and record.candidate_version == candidate_version
         and record.target_environment == target_environment
         and record.target_action == target_action
         and record.authorized_actor == authorized_actor
@@ -236,6 +254,8 @@ def register_authorization_tuple(
     source_package_id: str,
     source_package_version: str,
     candidate_sha: str,
+    candidate_id: str,
+    candidate_version: str,
     target_environment: str,
     target_action: str,
     authorized_actor: str,
@@ -260,6 +280,8 @@ def register_authorization_tuple(
         source_package_id=source_package_id,
         source_package_version=source_package_version,
         candidate_sha=candidate_sha,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
         target_environment=target_environment,
         target_action=target_action,
         authorized_actor=authorized_actor,
@@ -318,18 +340,21 @@ def register_authorization_tuple(
                 """
                 INSERT INTO job_authorization_tuples(
                     job_id, source_package_id, source_package_version,
-                    candidate_sha, target_environment, target_action,
+                    candidate_sha, candidate_id, candidate_version,
+                    target_environment, target_action,
                     authorized_actor, expires_at, policy_version,
                     matrix_version, authorization_idempotency_key,
                     prerequisites_satisfied, provider_ambiguity_resolved,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     source_package_id,
                     source_package_version,
                     candidate_sha,
+                    candidate_id,
+                    candidate_version,
                     target_environment,
                     target_action,
                     authorized_actor,
@@ -387,6 +412,36 @@ def _optional_text(row: sqlite3.Row, key: str) -> Optional[str]:
     return str(value)
 
 
+def _required_identity_missing(
+    *,
+    job_id: str,
+    source_package_id: str,
+    source_package_version: str,
+    target_environment: str,
+    target_action: str,
+    actor_id: str,
+    policy_version: str,
+    matrix_version: str,
+    candidate_id: str,
+    candidate_version: str,
+) -> bool:
+    return any(
+        not str(value).strip()
+        for value in (
+            job_id,
+            source_package_id,
+            source_package_version,
+            target_environment,
+            target_action,
+            actor_id,
+            policy_version,
+            matrix_version,
+            candidate_id,
+            candidate_version,
+        )
+    )
+
+
 def evaluate_authorization(
     sqlite_path: SqlitePath,
     *,
@@ -394,6 +449,8 @@ def evaluate_authorization(
     source_package_id: str,
     source_package_version: str,
     candidate_sha: str,
+    candidate_id: str,
+    candidate_version: str,
     target_environment: str,
     target_action: str,
     actor_id: str,
@@ -402,6 +459,20 @@ def evaluate_authorization(
     now_iso: Optional[str] = None,
 ) -> GuardResult:
     """Exact matching, unexpired ACCEPTED Go. Fail closed otherwise."""
+    if _required_identity_missing(
+        job_id=job_id,
+        source_package_id=source_package_id,
+        source_package_version=source_package_version,
+        target_environment=target_environment,
+        target_action=target_action,
+        actor_id=actor_id,
+        policy_version=policy_version,
+        matrix_version=matrix_version,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
+    ):
+        return GuardResult(ok=False, reason_codes=("unauthorized",))
+
     path = _ensure_store(sqlite_path)
     now = now_iso or utcnow_iso()
     classified = classify_target_action(target_action)
@@ -455,6 +526,8 @@ def evaluate_authorization(
             tup.source_package_id != source_package_id,
             tup.source_package_version != source_package_version,
             tup.candidate_sha != candidate_sha,
+            tup.candidate_id != candidate_id,
+            tup.candidate_version != candidate_version,
             tup.target_environment != target_environment,
             tup.target_action != target_action,
             tup.authorized_actor != actor_id,
@@ -500,6 +573,8 @@ def evaluate_authorization(
                 and _optional_text(row, "source_package_version")
                 == source_package_version
                 and _optional_text(row, "candidate_sha") == candidate_sha
+                and _optional_text(row, "candidate_id") == candidate_id
+                and _optional_text(row, "candidate_version") == candidate_version
                 and _optional_text(row, "target_environment")
                 == target_environment
                 and _optional_text(row, "target_action") == target_action
@@ -521,6 +596,8 @@ def raise_unless_authorized_go(
     source_package_id: str,
     source_package_version: str,
     candidate_sha: str,
+    candidate_id: str,
+    candidate_version: str,
     target_environment: str,
     target_action: str,
     actor_id: str,
@@ -535,6 +612,8 @@ def raise_unless_authorized_go(
         source_package_id=source_package_id,
         source_package_version=source_package_version,
         candidate_sha=candidate_sha,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
         target_environment=target_environment,
         target_action=target_action,
         actor_id=actor_id,
@@ -551,26 +630,83 @@ def raise_unless_authorized_go(
     raise AuthorizationDenied(result.reason_codes)
 
 
+def _live_policy_actor(
+    conn: sqlite3.Connection, job_id: str
+) -> tuple[str, str]:
+    row = conn.execute(
+        """
+        SELECT policy_version, allowed_actors_json
+          FROM job_authz_policies
+         WHERE job_id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return "", ""
+    policy_version = str(row["policy_version"] or "")
+    try:
+        actors = json.loads(row["allowed_actors_json"] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "", policy_version
+    if not isinstance(actors, list) or not actors:
+        return "", policy_version
+    return str(actors[0] or ""), policy_version
+
+
 def raise_unless_adapter_go(
     sqlite_path: SqlitePath,
     *,
     job_id: str,
     target_action: str,
+    candidate_id: str,
+    candidate_version: str,
     now_iso: Optional[str] = None,
     action: str = "adapter effect",
 ) -> GuardResult:
-    """Bind current provider create / Slack post_root to the ENG-29 tuple."""
-    tup = get_authorization_tuple(sqlite_path, job_id, target_action)
+    """Bind provider create / Slack post_root to the effect's authorization tuple.
+
+    Identity is derived from the job row, live policy, and the caller-supplied
+    candidate/version. Hardcoded DEFAULT_* values and the stored tuple actor
+    are never used as the requested identity.
+    """
+    denied = GuardResult(ok=False, reason_codes=("unauthorized",))
+    if not (
+        str(job_id).strip()
+        and str(target_action).strip()
+        and str(candidate_id).strip()
+        and str(candidate_version).strip()
+    ):
+        raise AuthorizationDenied(denied.reason_codes)
+
+    path = _ensure_store(sqlite_path)
+    with _connect(path) as conn:
+        job_row = conn.execute(
+            "SELECT * FROM durable_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job_row is None:
+            raise AuthorizationDenied(denied.reason_codes)
+        source_package_id = str(job_row["repository_identity"] or "")
+        candidate_sha = (
+            ""
+            if job_row["frozen_baseline_sha"] is None
+            else str(job_row["frozen_baseline_sha"])
+        )
+        target_environment = str(job_row["origin_platform"] or "")
+        actor_id, policy_version = _live_policy_actor(conn, job_id)
+
     return raise_unless_authorized_go(
-        sqlite_path,
+        path,
         job_id=job_id,
-        source_package_id=DEFAULT_SOURCE_PACKAGE_ID,
-        source_package_version=DEFAULT_SOURCE_PACKAGE_VERSION,
-        candidate_sha=DEFAULT_CANDIDATE_SHA,
-        target_environment=DEFAULT_TARGET_ENVIRONMENT,
-        target_action=target_action,
-        actor_id=tup.authorized_actor if tup is not None else "",
-        policy_version=tup.policy_version if tup is not None else "",
+        source_package_id=source_package_id,
+        source_package_version=str(candidate_version).strip(),
+        candidate_sha=candidate_sha,
+        candidate_id=str(candidate_id).strip(),
+        candidate_version=str(candidate_version).strip(),
+        target_environment=target_environment,
+        target_action=str(target_action).strip(),
+        actor_id=actor_id,
+        policy_version=policy_version,
         matrix_version=MATRIX_VERSION,
         now_iso=now_iso,
         action=action,
@@ -580,15 +716,22 @@ def raise_unless_adapter_go(
 def install_default_adapter_authorization(
     sqlite_path: SqlitePath, job_id: str
 ) -> None:
-    """Grant exact default Go for provider create + Slack post_root.
+    """Grant exact Go for provider create + Slack post_root from job+binding.
 
     Used by existing effect/fencing fixtures so they keep exercising claim
-    fencing after ENG-29. ENG-29 no-Go tests must not call this.
+    fencing after ENG-29. Derives the immutable tuple from the job row and
+    Slack binding (or binds cand-1/v1 when none exists). ENG-29 no-Go tests
+    must not call this. Production adapter paths never call this helper.
     """
     from agent.durable_jobs.decisions import DecisionLedger
     from agent.durable_jobs.slack_contract import BindingConflict, SlackBindingLedger
 
     path = _ensure_store(sqlite_path)
+    jobs = DurableJobStore(sqlite_path=path)
+    job = jobs.get_job(job_id)
+    if job is None:
+        return
+
     slack = SlackBindingLedger(sqlite_path=path)
     bound = slack.get_binding(job_id)
     if bound is None:
@@ -603,6 +746,9 @@ def install_default_adapter_authorization(
             )
         except BindingConflict:
             return
+        bound = slack.get_binding(job_id)
+    if bound is None:
+        return
 
     decisions = DecisionLedger(sqlite_path=path)
     with _connect(path) as conn:
@@ -618,6 +764,11 @@ def install_default_adapter_authorization(
             expires_at="2099-01-01T00:00:00+00:00",
         )
 
+    with _connect(path) as conn:
+        actor_id, policy_version = _live_policy_actor(conn, job_id)
+    if not str(actor_id).strip() or not str(policy_version).strip():
+        return
+
     expires_at = "2099-01-01T00:00:00+00:00"
     for target_action in (
         PROVIDER_CREATE_TARGET_ACTION,
@@ -626,14 +777,16 @@ def install_default_adapter_authorization(
         register_authorization_tuple(
             path,
             job_id=job_id,
-            source_package_id=DEFAULT_SOURCE_PACKAGE_ID,
-            source_package_version=DEFAULT_SOURCE_PACKAGE_VERSION,
-            candidate_sha=DEFAULT_CANDIDATE_SHA,
-            target_environment=DEFAULT_TARGET_ENVIRONMENT,
+            source_package_id=job.repository_identity,
+            source_package_version=bound.candidate_version,
+            candidate_sha=job.frozen_baseline_sha,
+            candidate_id=bound.candidate_id,
+            candidate_version=bound.candidate_version,
+            target_environment=job.origin_platform,
             target_action=target_action,
-            authorized_actor="U-alice",
+            authorized_actor=actor_id,
             expires_at=expires_at,
-            policy_version="pol-1",
+            policy_version=policy_version,
             matrix_version=MATRIX_VERSION,
             authorization_idempotency_key=f"tuple:{job_id}:{target_action}",
             prerequisites_satisfied=True,
@@ -642,15 +795,15 @@ def install_default_adapter_authorization(
         decisions.record_decision(
             job_id=job_id,
             decision_type="go",
-            candidate_id="cand-1",
-            candidate_version="v1",
-            actor_id="U-alice",
-            policy_version="pol-1",
+            candidate_id=bound.candidate_id,
+            candidate_version=bound.candidate_version,
+            actor_id=actor_id,
+            policy_version=policy_version,
             decision_idempotency_key=f"go:{job_id}:{target_action}",
-            source_package_id=DEFAULT_SOURCE_PACKAGE_ID,
-            source_package_version=DEFAULT_SOURCE_PACKAGE_VERSION,
-            candidate_sha=DEFAULT_CANDIDATE_SHA,
-            target_environment=DEFAULT_TARGET_ENVIRONMENT,
+            source_package_id=job.repository_identity,
+            source_package_version=bound.candidate_version,
+            candidate_sha=job.frozen_baseline_sha,
+            target_environment=job.origin_platform,
             target_action=target_action,
             matrix_version=MATRIX_VERSION,
         )

@@ -194,6 +194,8 @@ class ProviderEffectLedger:
                 self.sqlite_path,
                 job_id=job_id,
                 target_action=PROVIDER_CREATE_TARGET_ACTION,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
                 now_iso=now,
                 action="provider claim",
             )
@@ -339,6 +341,20 @@ class ProviderEffectLedger:
                 return ClaimResult(claim=claim, won=False)
             if not claim_is_expired(claim.claim_expires_at, now):
                 return ClaimResult(claim=claim, won=False)
+            from agent.durable_jobs.eng29 import (
+                PROVIDER_CREATE_TARGET_ACTION,
+                raise_unless_adapter_go,
+            )
+
+            raise_unless_adapter_go(
+                self.sqlite_path,
+                job_id=job_id,
+                target_action=PROVIDER_CREATE_TARGET_ACTION,
+                candidate_id=claim.candidate_id,
+                candidate_version=claim.candidate_version,
+                now_iso=now,
+                action="provider stale takeover",
+            )
             cur = conn.execute(
                 """
                 UPDATE provider_effect_claims
@@ -1103,6 +1119,8 @@ def reconcile_cursor_create(
             ledger.sqlite_path,
             job_id=job_id,
             target_action=PROVIDER_CREATE_TARGET_ACTION,
+            candidate_id=claim.candidate_id,
+            candidate_version=claim.candidate_version,
             now_iso=ledger._now(),
             action="provider create_run",
         )
@@ -1251,6 +1269,8 @@ def _recover_claimed_provider(
         ledger.sqlite_path,
         job_id=claim.job_id,
         target_action=PROVIDER_CREATE_TARGET_ACTION,
+        candidate_id=claim.candidate_id,
+        candidate_version=claim.candidate_version,
         now_iso=ledger._now(),
         action="provider lookup",
     )

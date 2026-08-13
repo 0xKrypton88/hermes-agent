@@ -26,7 +26,7 @@ from agent.durable_jobs.models import (
     JobPhase,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS durable_jobs_meta (
@@ -169,6 +169,8 @@ CREATE TABLE IF NOT EXISTS job_authorization_tuples (
     source_package_id TEXT NOT NULL,
     source_package_version TEXT NOT NULL,
     candidate_sha TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_version TEXT NOT NULL,
     target_environment TEXT NOT NULL,
     authorized_actor TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -207,6 +209,10 @@ _DECISION_AUTHZ_COLUMNS = (
     ("target_environment", "TEXT"),
     ("target_action", "TEXT"),
     ("matrix_version", "TEXT"),
+)
+_TUPLE_CANDIDATE_COLUMNS = (
+    ("candidate_id", "TEXT NOT NULL DEFAULT ''"),
+    ("candidate_version", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -272,6 +278,16 @@ def _ensure_eng29_authz(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(
                     f"ALTER TABLE job_decisions ADD COLUMN {name} {decl}"
+                )
+    tuple_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(job_authorization_tuples)")
+    }
+    if tuple_cols:
+        for name, decl in _TUPLE_CANDIDATE_COLUMNS:
+            if name not in tuple_cols:
+                conn.execute(
+                    f"ALTER TABLE job_authorization_tuples ADD COLUMN {name} {decl}"
                 )
 
 

@@ -28,6 +28,8 @@ TUPLE_MISMATCH_FIELDS = (
     "source_package_id",
     "source_package_version",
     "candidate_sha",
+    "candidate_id",
+    "candidate_version",
     "target_environment",
     "target_action",
     "actor_id",
@@ -143,49 +145,58 @@ def _provider_kwargs(job):
     )
 
 
-def _default_tuple_kwargs(job_id: str, **overrides):
+def _payload_identity(job, *, candidate_id: str = "cand-1", candidate_version: str = "v1"):
+    return dict(
+        source_package_id=job.repository_identity,
+        source_package_version=candidate_version,
+        candidate_sha=job.frozen_baseline_sha,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
+        target_environment=job.origin_platform,
+    )
+
+
+def _default_tuple_kwargs(job, **overrides):
     from agent.durable_jobs.eng29 import (
-        DEFAULT_CANDIDATE_SHA,
-        DEFAULT_SOURCE_PACKAGE_ID,
-        DEFAULT_SOURCE_PACKAGE_VERSION,
-        DEFAULT_TARGET_ENVIRONMENT,
         MATRIX_VERSION,
         PROVIDER_CREATE_TARGET_ACTION,
     )
 
+    ident = _payload_identity(job)
     base = dict(
-        job_id=job_id,
-        source_package_id=DEFAULT_SOURCE_PACKAGE_ID,
-        source_package_version=DEFAULT_SOURCE_PACKAGE_VERSION,
-        candidate_sha=DEFAULT_CANDIDATE_SHA,
-        target_environment=DEFAULT_TARGET_ENVIRONMENT,
+        job_id=job.job_id,
+        source_package_id=ident["source_package_id"],
+        source_package_version=ident["source_package_version"],
+        candidate_sha=ident["candidate_sha"],
+        candidate_id=ident["candidate_id"],
+        candidate_version=ident["candidate_version"],
+        target_environment=ident["target_environment"],
         target_action=PROVIDER_CREATE_TARGET_ACTION,
         authorized_actor="U-alice",
         expires_at="2099-01-01T00:00:00+00:00",
         policy_version="pol-1",
         matrix_version=MATRIX_VERSION,
-        authorization_idempotency_key=f"tuple:{job_id}:default",
+        authorization_idempotency_key=f"tuple:{job.job_id}:default",
     )
     base.update(overrides)
     return base
 
 
-def _guard_kwargs(job_id: str, **overrides):
+def _guard_kwargs(job, **overrides):
     from agent.durable_jobs.eng29 import (
-        DEFAULT_CANDIDATE_SHA,
-        DEFAULT_SOURCE_PACKAGE_ID,
-        DEFAULT_SOURCE_PACKAGE_VERSION,
-        DEFAULT_TARGET_ENVIRONMENT,
         MATRIX_VERSION,
         PROVIDER_CREATE_TARGET_ACTION,
     )
 
+    ident = _payload_identity(job)
     base = dict(
-        job_id=job_id,
-        source_package_id=DEFAULT_SOURCE_PACKAGE_ID,
-        source_package_version=DEFAULT_SOURCE_PACKAGE_VERSION,
-        candidate_sha=DEFAULT_CANDIDATE_SHA,
-        target_environment=DEFAULT_TARGET_ENVIRONMENT,
+        job_id=job.job_id,
+        source_package_id=ident["source_package_id"],
+        source_package_version=ident["source_package_version"],
+        candidate_sha=ident["candidate_sha"],
+        candidate_id=ident["candidate_id"],
+        candidate_version=ident["candidate_version"],
+        target_environment=ident["target_environment"],
         target_action=PROVIDER_CREATE_TARGET_ACTION,
         actor_id="U-alice",
         policy_version="pol-1",
@@ -196,11 +207,68 @@ def _guard_kwargs(job_id: str, **overrides):
     return base
 
 
+def _seed_authorized_go_despite_binding(store, job, *, target_action: str):
+    """Tuple + accepted Go for cand-1/v1 even when the Slack binding differs.
+
+    DecisionLedger correctly refuses to record that Go against a mismatched
+    binding. This helper only plants the authorized tuple/Go so the adapter
+    guard can be shown not to replay it onto a different binding candidate.
+    """
+    import sqlite3
+    import uuid
+
+    from agent.durable_jobs.eng29 import register_authorization_tuple
+
+    tuple_kwargs = _default_tuple_kwargs(
+        job,
+        target_action=target_action,
+        candidate_id="cand-1",
+        candidate_version="v1",
+        authorization_idempotency_key=f"tuple:{job.job_id}:{target_action}",
+    )
+    registered = register_authorization_tuple(
+        sqlite_path=store.sqlite_path, **tuple_kwargs
+    )
+    assert registered.ok is True
+    conn = sqlite3.connect(store.sqlite_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO job_decisions(
+                decision_id, job_id, decision_type, candidate_id,
+                candidate_version, actor_id, policy_version,
+                decision_idempotency_key, status, reason_codes_json,
+                created_at, source_package_id, source_package_version,
+                candidate_sha, target_environment, target_action,
+                matrix_version
+            ) VALUES (?, ?, 'go', 'cand-1', 'v1', ?, ?, ?, 'accepted', '[]',
+                      ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"dd_{uuid.uuid4().hex}",
+                job.job_id,
+                tuple_kwargs["authorized_actor"],
+                tuple_kwargs["policy_version"],
+                f"go:{job.job_id}:{target_action}",
+                "2026-01-01T00:00:00+00:00",
+                tuple_kwargs["source_package_id"],
+                tuple_kwargs["source_package_version"],
+                tuple_kwargs["candidate_sha"],
+                tuple_kwargs["target_environment"],
+                target_action,
+                tuple_kwargs["matrix_version"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _register_and_go(store, job, decisions, *, target_action: str, **tuple_overrides):
     from agent.durable_jobs.eng29 import register_authorization_tuple
 
     tuple_kwargs = _default_tuple_kwargs(
-        job.job_id,
+        job,
         target_action=target_action,
         authorization_idempotency_key=f"tuple:{job.job_id}:{target_action}",
         **tuple_overrides,
@@ -212,8 +280,8 @@ def _register_and_go(store, job, decisions, *, target_action: str, **tuple_overr
     go = decisions.record_decision(
         job_id=job.job_id,
         decision_type="go",
-        candidate_id="cand-1",
-        candidate_version="v1",
+        candidate_id=tuple_kwargs["candidate_id"],
+        candidate_version=tuple_kwargs["candidate_version"],
         actor_id=tuple_kwargs["authorized_actor"],
         policy_version=tuple_kwargs["policy_version"],
         decision_idempotency_key=f"go:{job.job_id}:{target_action}",
@@ -338,7 +406,7 @@ def test_guard_no_go_denies_every_mandatory_category(tmp_path, category):
     _bind_and_policy(store, job)
     result = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, target_action=category),
+        **_guard_kwargs(job, target_action=category),
     )
     assert result.ok is False
     assert "no_go" in result.reason_codes or "unauthorized" in result.reason_codes
@@ -358,7 +426,7 @@ def test_guard_exact_matching_unexpired_go_allows_category(tmp_path, category):
     _register_and_go(store, job, decisions, target_action=category, **extra)
     result = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, target_action=category),
+        **_guard_kwargs(job, target_action=category),
     )
     assert result.ok is True
     assert result.reason_codes == ()
@@ -381,6 +449,8 @@ def test_guard_rejects_every_tuple_field_mismatch(tmp_path, field):
         "source_package_id": "other-package",
         "source_package_version": "other-ver",
         "candidate_sha": "sha-other",
+        "candidate_id": "cand-NOT-AUTHORIZED",
+        "candidate_version": "v999",
         "target_environment": "prod",
         "target_action": "deploy",
         "actor_id": "U-eve",
@@ -389,7 +459,7 @@ def test_guard_rejects_every_tuple_field_mismatch(tmp_path, field):
     }
     result = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, **{field: wrong[field]}),
+        **_guard_kwargs(job, **{field: wrong[field]}),
     )
     assert result.ok is False
     assert "mismatch" in result.reason_codes or "unauthorized" in result.reason_codes
@@ -412,7 +482,7 @@ def test_guard_rejects_expired_tuple(tmp_path):
     )
     result = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, now_iso="2026-01-02T00:00:00+00:00"),
+        **_guard_kwargs(job, now_iso="2026-01-02T00:00:00+00:00"),
     )
     assert result.ok is False
     assert "expired" in result.reason_codes
@@ -428,7 +498,7 @@ def test_guard_hold_fail_closed(tmp_path):
     store, job = _make_job(tmp_path, idempotency_key="idem-eng29-hold")
     decisions = _bind_and_policy(store, job)
     tuple_kwargs = _default_tuple_kwargs(
-        job.job_id, target_action=PROVIDER_CREATE_TARGET_ACTION
+        job, target_action=PROVIDER_CREATE_TARGET_ACTION
     )
     assert register_authorization_tuple(
         sqlite_path=store.sqlite_path, **tuple_kwargs
@@ -450,7 +520,7 @@ def test_guard_hold_fail_closed(tmp_path):
     )
     assert hold.ok is True
     result = evaluate_authorization(
-        sqlite_path=store.sqlite_path, **_guard_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job),
     )
     assert result.ok is False
     assert "hold" in result.reason_codes
@@ -478,7 +548,7 @@ def test_guard_cancel_fail_closed_and_later_go_rejected(tmp_path):
     )
     assert canceled.ok is True
     result = evaluate_authorization(
-        sqlite_path=store.sqlite_path, **_guard_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job),
     )
     assert result.ok is False
     assert "canceled" in result.reason_codes
@@ -506,17 +576,17 @@ def test_tuple_replay_conflict_and_exact_duplicate(tmp_path):
     store, job = _make_job(tmp_path, idempotency_key="idem-eng29-replay")
     _bind_and_policy(store, job)
     first = register_authorization_tuple(
-        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job)
     )
     assert first.ok is True
     dup = register_authorization_tuple(
-        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job)
     )
     assert dup.ok is True
     assert dup.status == "duplicate"
     conflict = register_authorization_tuple(
         sqlite_path=store.sqlite_path,
-        **_default_tuple_kwargs(job.job_id, candidate_sha="sha-other"),
+        **_default_tuple_kwargs(job, candidate_sha="sha-other"),
     )
     assert conflict.ok is False
     assert "replayed" in conflict.reason_codes
@@ -531,12 +601,12 @@ def test_immutable_policy_and_matrix_re_registration_rejected(tmp_path):
     store, job = _make_job(tmp_path, idempotency_key="idem-eng29-immutable")
     _bind_and_policy(store, job)
     assert register_authorization_tuple(
-        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_default_tuple_kwargs(job)
     ).ok
     policy_change = register_authorization_tuple(
         sqlite_path=store.sqlite_path,
         **_default_tuple_kwargs(
-            job.job_id,
+            job,
             policy_version="pol-2",
             authorization_idempotency_key=f"tuple:{job.job_id}:pol2",
         ),
@@ -545,7 +615,7 @@ def test_immutable_policy_and_matrix_re_registration_rejected(tmp_path):
     matrix_change = register_authorization_tuple(
         sqlite_path=store.sqlite_path,
         **_default_tuple_kwargs(
-            job.job_id,
+            job,
             matrix_version=MATRIX_VERSION + "-2",
             authorization_idempotency_key=f"tuple:{job.job_id}:mx2",
         ),
@@ -554,7 +624,7 @@ def test_immutable_policy_and_matrix_re_registration_rejected(tmp_path):
     unknown_matrix = register_authorization_tuple(
         sqlite_path=store.sqlite_path,
         **_default_tuple_kwargs(
-            job.job_id,
+            job,
             target_action="deploy",
             matrix_version="not-the-pinned-matrix",
             authorization_idempotency_key=f"tuple:{job.job_id}:bad-mx",
@@ -577,7 +647,7 @@ def test_missing_prerequisites_fail_closed_until_flag_set(tmp_path):
     )
     denied = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, target_action="missing_prerequisites"),
+        **_guard_kwargs(job, target_action="missing_prerequisites"),
     )
     assert denied.ok is False
     assert "missing_prerequisites" in denied.reason_codes
@@ -593,7 +663,7 @@ def test_missing_prerequisites_fail_closed_until_flag_set(tmp_path):
     )
     allowed = evaluate_authorization(
         sqlite_path=store2.sqlite_path,
-        **_guard_kwargs(job2.job_id, target_action="missing_prerequisites"),
+        **_guard_kwargs(job2, target_action="missing_prerequisites"),
     )
     assert allowed.ok is True
 
@@ -612,7 +682,7 @@ def test_unresolved_provider_ambiguity_fail_closed_until_resolved(tmp_path):
     )
     denied = evaluate_authorization(
         sqlite_path=store.sqlite_path,
-        **_guard_kwargs(job.job_id, target_action="unresolved_provider_ambiguity"),
+        **_guard_kwargs(job, target_action="unresolved_provider_ambiguity"),
     )
     assert denied.ok is False
     assert "unresolved_provider_ambiguity" in denied.reason_codes
@@ -629,7 +699,7 @@ def test_unresolved_provider_ambiguity_fail_closed_until_resolved(tmp_path):
     allowed = evaluate_authorization(
         sqlite_path=store2.sqlite_path,
         **_guard_kwargs(
-            job2.job_id, target_action="unresolved_provider_ambiguity"
+            job2, target_action="unresolved_provider_ambiguity"
         ),
     )
     assert allowed.ok is True
@@ -658,7 +728,7 @@ def test_authorization_tuple_and_go_reopen_persistence(tmp_path):
     assert latest is not None
     assert latest.decision_type is DecisionType.GO
     result = evaluate_authorization(
-        sqlite_path=store.sqlite_path, **_guard_kwargs(job.job_id)
+        sqlite_path=store.sqlite_path, **_guard_kwargs(job),
     )
     assert result.ok is True
 
@@ -707,3 +777,125 @@ def test_slack_post_with_exact_go_succeeds(tmp_path):
     result = deliver_slack_root(ledger, port, job_id=job.job_id)
     assert result.status is SlackRootStatus.DELIVERED
     assert port.posts
+
+
+def test_provider_create_rejects_unauthorized_candidate_identity(tmp_path):
+    """Cross-candidate replay: default Go must not authorize a different candidate."""
+    from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        install_default_adapter_authorization,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-cand-replay")
+    _bind_and_policy(store, job)
+    install_default_adapter_authorization(store.sqlite_path, job.job_id)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    provider = CountingProvider()
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(
+            ledger,
+            provider,
+            **{
+                **_provider_kwargs(job),
+                "candidate_id": "cand-NOT-AUTHORIZED",
+                "candidate_version": "v999",
+            },
+        )
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert provider.create_calls == [], (
+        "provider create executed for unauthorized candidate"
+    )
+    assert provider.lookup_calls == [], (
+        "provider lookup executed for unauthorized candidate"
+    )
+    assert ledger.get_claim(job.job_id, "create_run") is None
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+
+def test_provider_create_rejects_blank_candidate_identity(tmp_path):
+    """Missing candidate/version must default-deny before claim or create."""
+    from agent.durable_jobs.effects import ProviderEffectLedger, reconcile_cursor_create
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        PROVIDER_CREATE_TARGET_ACTION,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-cand-blank")
+    decisions = _bind_and_policy(store, job)
+    _register_and_go(
+        store, job, decisions, target_action=PROVIDER_CREATE_TARGET_ACTION
+    )
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    provider = CountingProvider()
+    caught: list[BaseException] = []
+    try:
+        reconcile_cursor_create(
+            ledger,
+            provider,
+            **{
+                **_provider_kwargs(job),
+                "candidate_id": "",
+                "candidate_version": "",
+            },
+        )
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    assert ledger.get_claim(job.job_id, "create_run") is None
+    assert caught and isinstance(caught[0], AuthorizationDenied)
+
+
+def test_slack_post_rejects_unauthorized_binding_candidate(tmp_path):
+    """Slack effect identity is the binding candidate/version; mismatch fail-closed."""
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.eng29 import (
+        AuthorizationDenied,
+        SLACK_POST_ROOT_TARGET_ACTION,
+    )
+    from agent.durable_jobs.slack_contract import (
+        SlackBindingLedger,
+        SlackRootStatus,
+        deliver_slack_root,
+    )
+
+    store, job = _make_job(tmp_path, idempotency_key="idem-eng29-slack-cand-mismatch")
+    ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+    ledger.bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-NOT-AUTHORIZED",
+        candidate_version="v999",
+    )
+    decisions = DecisionLedger(sqlite_path=store.sqlite_path)
+    decisions.set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    _seed_authorized_go_despite_binding(
+        store, job, target_action=SLACK_POST_ROOT_TARGET_ACTION
+    )
+    port = CountingPort()
+    caught: list[BaseException] = []
+    try:
+        deliver_slack_root(ledger, port, job_id=job.job_id)
+    except BaseException as exc:  # noqa: BLE001
+        caught.append(exc)
+
+    assert port.posts == [], "slack post executed for unauthorized binding candidate"
+    assert port.lookup_calls == [], (
+        "slack lookup executed for unauthorized binding candidate"
+    )
+    persisted = ledger.get_binding(job.job_id)
+    assert persisted is not None
+    assert persisted.status is SlackRootStatus.BOUND
+    assert caught and isinstance(caught[0], AuthorizationDenied)

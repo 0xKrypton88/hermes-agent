@@ -386,6 +386,8 @@ class SlackBindingLedger:
             self.sqlite_path,
             job_id=job_id,
             target_action=SLACK_POST_ROOT_TARGET_ACTION,
+            candidate_id=peeked.candidate_id,
+            candidate_version=peeked.candidate_version,
             now_iso=now,
             action="slack delivery claim",
         )
@@ -484,6 +486,20 @@ class SlackBindingLedger:
                 return DeliveryClaimResult(binding=binding, won=False)
             if not claim_is_expired(binding.claim_expires_at, now):
                 return DeliveryClaimResult(binding=binding, won=False)
+            from agent.durable_jobs.eng29 import (
+                SLACK_POST_ROOT_TARGET_ACTION,
+                raise_unless_adapter_go,
+            )
+
+            raise_unless_adapter_go(
+                self.sqlite_path,
+                job_id=job_id,
+                target_action=SLACK_POST_ROOT_TARGET_ACTION,
+                candidate_id=binding.candidate_id,
+                candidate_version=binding.candidate_version,
+                now_iso=now,
+                action="slack stale takeover",
+            )
             cur = conn.execute(
                 """
                 UPDATE slack_job_bindings
@@ -1094,6 +1110,8 @@ def deliver_slack_root(
             ledger.sqlite_path,
             job_id=job_id,
             target_action=SLACK_POST_ROOT_TARGET_ACTION,
+            candidate_id=binding.candidate_id,
+            candidate_version=binding.candidate_version,
             now_iso=ledger._now(),
             action="slack post_root",
         )
@@ -1211,6 +1229,8 @@ def _lookup_slack_root(
         ledger.sqlite_path,
         job_id=binding.job_id,
         target_action=SLACK_POST_ROOT_TARGET_ACTION,
+        candidate_id=binding.candidate_id,
+        candidate_version=binding.candidate_version,
         now_iso=ledger._now(),
         action="slack lookup",
     )

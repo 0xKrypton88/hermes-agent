@@ -41,6 +41,8 @@ A durable authorization tuple is bound to:
 - `source_package_id`
 - `source_package_version`
 - `candidate_sha`
+- `candidate_id`
+- `candidate_version`
 - `target_environment`
 - `target_action`
 - authorized actor
@@ -55,11 +57,15 @@ There is no upsert that changes authority.
 
 ## Guard
 
-A single reusable guard runs **before** provider/Slack effect claim, recovery
-lookup, `create_run`, and `post_root`. Mandatory and unknown actions require
-an **exact matching, unexpired ACCEPTED Go**. Hold, Cancel, tuple mismatch,
-expiry, missing prerequisites, or unresolved provider ambiguity fail closed:
-zero new claim persistence and zero injected adapter calls.
+A single reusable guard runs **before** provider/Slack effect claim, stale
+takeover, recovery lookup, `create_run`, and `post_root`. Adapter identity is
+derived from the job row, live policy, and the effect/binding
+`candidate_id`/`candidate_version` — never from hardcoded defaults or the
+stored tuple actor. Missing or mismatching identity fields default-deny.
+Mandatory and unknown actions require an **exact matching, unexpired ACCEPTED
+Go**. Hold, Cancel, tuple mismatch, expiry, missing prerequisites, or
+unresolved provider ambiguity fail closed: zero new claim persistence and
+zero injected adapter calls.
 
 Terminal Cancel remains authoritative. Existing owner-token / lease / inflight
 fencing is unchanged. This SQLite path does not claim distributed isolation.
