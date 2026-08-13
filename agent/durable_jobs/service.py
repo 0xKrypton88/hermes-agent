@@ -140,10 +140,14 @@ class DurableJobService:
     def attempt_dispatch(self, job_id: str) -> dict:
         """Hard-disabled in Package 1 — never invokes any adapter.
 
-        Records a rejected intent when a job exists, then always raises.
+        PostgreSQL: raise immediately with zero store/network/adapter effects.
+        SQLite: may record a rejected intent when a job exists, then raise.
         Config flags and injected adapters cannot enable dispatch here.
         """
-        if self.config.sqlite_path is not None or self.config.resolved_backend == "postgresql":
+        if (
+            self.config.resolved_backend != "postgresql"
+            and self.config.sqlite_path is not None
+        ):
             try:
                 store = self._require_store()
                 if store.get_job(job_id) is not None:

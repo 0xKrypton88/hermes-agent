@@ -406,20 +406,75 @@ def test_lane_postgresql_does_not_fall_back_to_sqlite(tmp_path, monkeypatch):
     assert "supersecret" not in str(exc.value)
 
 
-def test_dispatch_remains_hard_disabled_for_postgresql_config():
+def test_dispatch_remains_hard_disabled_for_postgresql_config(monkeypatch):
+    """Hard-disabled dispatch must raise before any store or adapter effect.
+
+    The fixture uses a non-live redacted DSN on purpose. Connecting would hang
+    on some platforms (Windows TCP timeout). Fail closed with zero I/O.
+    """
+    import time
+
+    from agent.durable_jobs import backend as dj_backend
     from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.postgres_store import PostgresDurableJobStore
     from agent.durable_jobs.service import DispatchDisabledError, DurableJobService
 
-    calls: list[str] = []
+    effects: list[str] = []
+
+    def _record(name: str):
+        def _fn(*_a, **_k):
+            effects.append(name)
+            raise AssertionError(f"hard-disabled dispatch must not call {name}")
+
+        return _fn
+
+    monkeypatch.setattr(dj_backend, "open_application_store", _record("open_application_store"))
+    monkeypatch.setattr(
+        PostgresDurableJobStore, "__init__", _record("PostgresDurableJobStore.__init__")
+    )
+    monkeypatch.setattr(PostgresDurableJobStore, "get_job", _record("PostgresDurableJobStore.get_job"))
+    monkeypatch.setattr(
+        PostgresDurableJobStore, "append_intent", _record("PostgresDurableJobStore.append_intent")
+    )
+    monkeypatch.setattr(
+        PostgresDurableJobStore, "create_job", _record("PostgresDurableJobStore.create_job")
+    )
+    monkeypatch.setattr("psycopg.connect", _record("psycopg.connect"))
+
+    class SentinelStore:
+        def get_job(self, job_id: str):
+            effects.append("sentinel.get_job")
+            return object()
+
+        def append_intent(self, *args, **kwargs):
+            effects.append("sentinel.append_intent")
+            return True
+
+        def create_job(self, *args, **kwargs):
+            effects.append("sentinel.create_job")
+            return object()
 
     class FakeDispatch:
         def dispatch(self, job_id: str) -> None:
-            calls.append(job_id)
+            effects.append(f"adapter.dispatch:{job_id}")
 
     cfg = load_durable_jobs_config(
         {"durable_jobs": {"enabled": True, "dispatch_enabled": True, **_pg_section()}}
     )
-    service = DurableJobService(config=cfg, dispatch_adapter=FakeDispatch())
+    adapter = FakeDispatch()
+
+    injected = DurableJobService(
+        config=cfg, dispatch_adapter=adapter, store=SentinelStore()
+    )
+    uninjected = DurableJobService(config=cfg, dispatch_adapter=adapter)
+
+    started = time.monotonic()
     with pytest.raises(DispatchDisabledError):
-        service.attempt_dispatch("job-pg")
-    assert calls == []
+        injected.attempt_dispatch("job-pg")
+    with pytest.raises(DispatchDisabledError):
+        uninjected.attempt_dispatch("job-pg")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"dispatch must fail closed promptly, took {elapsed:.3f}s"
+    assert effects == []
+    assert "supersecret" not in repr(cfg)
