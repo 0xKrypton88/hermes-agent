@@ -91,6 +91,119 @@ class CursorCloudTransport(Protocol):
     def status(self, *, run_id: str) -> Any: ...
 
 
+# Ledger key ``cursor:{job_id}:{action_id}`` fits the v0/v1 ``name`` limit (100).
+_CURSOR_KEY_RE = re.compile(r"cursor:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+")
+_CURSOR_AGENT_ID_RE = re.compile(r"^bc[-_][A-Za-z0-9-]+$")
+_OFFICIAL_LIST_KEYS = ("agents", "items")
+
+
+def cursor_correlation_name(idempotency_key: str) -> str:
+    """Provider-preserved Cloud Agents ``name`` carrying the ledger key."""
+    return str(idempotency_key).strip()[:100]
+
+
+def cursor_correlation_prompt(idempotency_key: str, text: str = "") -> str:
+    """Optional prompt prefix; list endpoints echo ``name``, not prompt text."""
+    marker = cursor_correlation_name(idempotency_key)
+    body = str(text or "").strip()
+    return marker if not body else f"{marker}\n{body}"
+
+
+def _display_name(raw: Any) -> str:
+    if isinstance(raw, dict):
+        name = raw.get("name")
+    else:
+        name = getattr(raw, "name", None)
+    return name.strip() if isinstance(name, str) else ""
+
+
+def _extract_preserved_correlation(raw: Any) -> Optional[str]:
+    """Recover the ledger key from documented preserved fields (name/prompt)."""
+    texts: list[str] = []
+    if isinstance(raw, dict):
+        for field in ("idempotency_key", "name"):
+            val = raw.get(field)
+            if isinstance(val, str) and val.strip():
+                texts.append(val.strip())
+        prompt = raw.get("prompt")
+        if isinstance(prompt, dict):
+            ptext = prompt.get("text")
+            if isinstance(ptext, str) and ptext.strip():
+                texts.append(ptext.strip())
+        elif isinstance(prompt, str) and prompt.strip():
+            texts.append(prompt.strip())
+        source = raw.get("source")
+        if isinstance(source, dict):
+            sp = source.get("prompt")
+            if isinstance(sp, str) and sp.strip():
+                texts.append(sp.strip())
+    else:
+        for attr in ("idempotency_key", "name"):
+            val = getattr(raw, attr, None)
+            if isinstance(val, str) and val.strip():
+                texts.append(val.strip())
+        prompt = getattr(raw, "prompt", None)
+        if isinstance(prompt, dict):
+            ptext = prompt.get("text")
+            if isinstance(ptext, str) and ptext.strip():
+                texts.append(ptext.strip())
+        elif isinstance(prompt, str) and prompt.strip():
+            texts.append(prompt.strip())
+    for text in texts:
+        if text.startswith("cursor:"):
+            return text.split()[0][:100]
+        found = _CURSOR_KEY_RE.search(text)
+        if found:
+            return found.group(0)
+    return None
+
+
+def _looks_like_official_cursor_record(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if isinstance(raw.get("agent"), dict):
+        return True
+    rid = raw.get("id") or raw.get("run_id")
+    if isinstance(rid, str) and _CURSOR_AGENT_ID_RE.match(rid):
+        return True
+    if raw.get("latestRunId") or raw.get("agentId"):
+        return True
+    if isinstance(raw.get("source"), dict) or isinstance(raw.get("target"), dict):
+        return True
+    return False
+
+
+def _provider_records(raw: Any) -> Sequence[Any]:
+    """Unwrap v0 ``{agents: []}`` / v1 ``{items: []}`` list envelopes."""
+    if raw is None:
+        return ()
+    if isinstance(raw, (list, tuple)):
+        return raw
+    if isinstance(raw, dict):
+        for envelope in _OFFICIAL_LIST_KEYS:
+            inner = raw.get(envelope)
+            if isinstance(inner, (list, tuple)):
+                return inner
+        return (raw,)
+    return (raw,)
+
+
+def _correlation_for_record(raw: Any, *, fallback_key: str) -> str:
+    if isinstance(raw, dict):
+        explicit = raw.get("idempotency_key")
+    else:
+        explicit = getattr(raw, "idempotency_key", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    extracted = _extract_preserved_correlation(raw)
+    if extracted:
+        return extracted
+    if _looks_like_official_cursor_record(raw):
+        # Display names without our marker are not the ledger key.
+        return _display_name(raw)
+    return fallback_key
+
+
 def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
     if raw is None:
         return None
@@ -98,9 +211,7 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
         return raw
     if isinstance(raw, dict):
         run_id = raw.get("run_id") or raw.get("id")
-        key = raw.get("idempotency_key")
-        if key is None or (isinstance(key, str) and not key.strip()):
-            key = fallback_key
+        key = _correlation_for_record(raw, fallback_key=fallback_key)
         if not run_id:
             return None
         return CursorRun(
@@ -111,9 +222,7 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
     run_id = getattr(raw, "run_id", None) or getattr(raw, "id", None)
     if not run_id:
         return None
-    key = getattr(raw, "idempotency_key", None)
-    if key is None or (isinstance(key, str) and not key.strip()):
-        key = fallback_key
+    key = _correlation_for_record(raw, fallback_key=fallback_key)
     state = getattr(raw, "state", None) or getattr(raw, "status", None)
     return CursorRun(
         run_id=str(run_id),
@@ -131,8 +240,11 @@ def _parse_run_state(raw: Any) -> CursorRunState:
     aliases = {
         "creating": CursorRunState.CREATING,
         "queued": CursorRunState.CREATING,
+        "not_yet_started": CursorRunState.CREATING,
         "running": CursorRunState.RUNNING,
         "in_progress": CursorRunState.RUNNING,
+        "active": CursorRunState.RUNNING,
+        "idle": CursorRunState.RUNNING,
         "completed": CursorRunState.COMPLETED,
         "finished": CursorRunState.COMPLETED,
         "succeeded": CursorRunState.COMPLETED,
@@ -140,6 +252,8 @@ def _parse_run_state(raw: Any) -> CursorRunState:
         "error": CursorRunState.FAILED,
         "canceled": CursorRunState.CANCELED,
         "cancelled": CursorRunState.CANCELED,
+        "expired": CursorRunState.CANCELED,
+        "archived": CursorRunState.CANCELED,
         "unknown": CursorRunState.UNKNOWN,
         "ambiguous": CursorRunState.AMBIGUOUS,
     }
@@ -186,6 +300,10 @@ def normalize_create_result(raw: Any, *, expected_key: str) -> CursorCreateResul
     error_raw: Any = None
     if isinstance(raw, dict):
         kind_raw = raw.get("kind")
+        if not kind_raw:
+            official = _accepted_from_official_create(raw, expected_key=expected_key)
+            if official is not None:
+                return _fail_closed_create(official, expected_key=expected_key)
         run_raw = raw.get("run")
         candidates_raw = raw.get("candidates") or ()
         error_raw = raw.get("error")
@@ -256,6 +374,33 @@ def _fail_closed_create(
     return CursorCreateResult(kind=CursorCreateKind.UNKNOWN, error=result.error)
 
 
+def _accepted_from_official_create(
+    raw: dict, *, expected_key: str
+) -> Optional[CursorCreateResult]:
+    """Map v0 agent / v1 {agent, run} create bodies. No custom idempotency field."""
+    record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
+    if not isinstance(record, dict):
+        return None
+    if not _looks_like_official_cursor_record(raw) and not _looks_like_official_cursor_record(
+        record
+    ):
+        return None
+    parsed = _parse_run(record, fallback_key=expected_key)
+    if parsed is None or not parsed.run_id:
+        inner = raw.get("run") if isinstance(raw.get("run"), dict) else None
+        if inner is None:
+            return None
+        agent_id = inner.get("agentId") or record.get("id")
+        if not agent_id:
+            return None
+        merged = dict(record)
+        merged["id"] = agent_id
+        parsed = _parse_run(merged, fallback_key=expected_key)
+    if parsed is None or not parsed.run_id:
+        return None
+    return CursorCreateResult(kind=CursorCreateKind.ACCEPTED, run=parsed)
+
+
 class CursorCloudAdapter:
     """Fail-closed Cursor Cloud adapter. Transport is dependency-injected.
 
@@ -271,6 +416,8 @@ class CursorCloudAdapter:
         self._transport = transport
 
     def create_run(self, *, idempotency_key: str, job_id: str) -> CursorCreateResult:
+        # Transport must persist this key as Cloud Agents ``name`` (and may
+        # prefix prompt text). List/lookup recovers that exact marker.
         try:
             raw = self._transport.create(
                 idempotency_key=idempotency_key, job_id=job_id
@@ -350,12 +497,14 @@ class CursorCloudAdapter:
 def parse_lookup_runs(raw: Any, *, expected_key: str) -> list[CursorRun]:
     if raw is None:
         return []
-    items: Sequence[Any] = raw if isinstance(raw, (list, tuple)) else [raw]
     runs: list[CursorRun] = []
-    for item in items:
+    for item in _provider_records(raw):
         parsed = _parse_run(item, fallback_key=expected_key)
-        if parsed is not None:
-            runs.append(parsed)
+        if parsed is None or not parsed.run_id:
+            continue
+        if expected_key and parsed.idempotency_key not in ("", expected_key):
+            continue
+        runs.append(parsed)
     return runs
 
 

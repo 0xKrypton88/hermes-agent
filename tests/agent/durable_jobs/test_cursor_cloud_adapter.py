@@ -74,11 +74,14 @@ class MemoryCursorTransport:
                 raise self.create_payload
             return self.create_payload
 
-    def lookup(self, *, idempotency_key: str) -> list[Any]:
+    def lookup(self, *, idempotency_key: str) -> Any:
         with self._lock:
             self.lookup_calls.append(idempotency_key)
             if isinstance(self.lookups, BaseException):
                 raise self.lookups
+            # Official Cursor list envelopes are dicts ({"agents"|"items": [...]}).
+            if isinstance(self.lookups, dict):
+                return self.lookups
             return list(self.lookups)
 
     def status(self, *, run_id: str) -> Any:
@@ -687,3 +690,95 @@ def test_reconcile_status_does_not_report_stale_success_when_provider_is_fail_cl
     assert still.status is EffectStatus.ACCEPTED
     assert still.provider_run_id == "run-status"
     assert ledger.get_mapping(job.job_id).provider_run_id == "run-status"
+
+
+def _official_v0_agent(*, agent_id: str, name: str, status: str) -> dict:
+    """Cursor Cloud Agents API v0 agent record (no top-level idempotency_key)."""
+    return {
+        "id": agent_id,
+        "name": name,
+        "status": status,
+        "source": {
+            "repository": "https://github.com/example/repo",
+            "ref": "main",
+        },
+        "target": {
+            "branchName": "cursor/eng26-repair",
+            "url": f"https://cursor.com/agents?id={agent_id}",
+            "autoCreatePr": False,
+            "openAsCursorGithubApp": False,
+            "skipReviewerRequest": False,
+        },
+        "createdAt": "2024-01-15T10:30:00Z",
+    }
+
+
+def test_official_cursor_payloads_lost_create_adopts_unique_name_marker(tmp_path):
+    """Real v0 create/list shapes: correlation is the preserved ``name`` marker.
+
+    The Cloud Agents API does not echo a custom idempotency field. After an
+    accepted-but-lost create, unique list match on that marker must be adopted.
+    """
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        CursorCreateKind,
+        cursor_correlation_name,
+        normalize_create_result,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    marker = cursor_correlation_name(key)
+    created_id = "bc_abc123"
+    official_create = _official_v0_agent(
+        agent_id=created_id, name=marker, status="CREATING"
+    )
+    official_list = {
+        "agents": [
+            _official_v0_agent(
+                agent_id=created_id, name=marker, status="RUNNING"
+            ),
+            _official_v0_agent(
+                agent_id="bc_unrelated",
+                name="Add README Documentation",
+                status="FINISHED",
+            ),
+        ],
+        "nextCursor": "bc_ghi789",
+    }
+
+    transport = MemoryCursorTransport(
+        create_payload={"kind": "lost_response"},
+        lookups=official_list,
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is EffectStatus.ADOPTED
+    assert claim.provider_run_id == created_id
+    assert claim.provider_idempotency_key == key
+    assert ledger.get_mapping(job.job_id).provider_run_id == created_id
+    assert len(transport.create_calls) == 1
+    assert transport.create_calls[0]["idempotency_key"] == key
+    assert transport.lookup_calls == [key]
+
+    normalized = normalize_create_result(official_create, expected_key=key)
+    assert normalized.kind is CursorCreateKind.ACCEPTED
+    assert normalized.run is not None
+    assert normalized.run.run_id == created_id
+    assert normalized.run.idempotency_key == key
+    looked = adapter.lookup_runs(idempotency_key=key)
+    assert [run.run_id for run in looked] == [created_id]
+    assert all(run.idempotency_key == key for run in looked)
