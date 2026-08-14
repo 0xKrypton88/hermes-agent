@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import sys
 import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional, Sequence
@@ -167,7 +166,14 @@ class DurableLaneService:
             self._leases_by_thread[ident] = self._leases_by_thread.get(ident, 0) + 1
             self._active_leases += 1
 
-    def _release_mutation_lease(self) -> None:
+    def _release_mutation_lease(self, *, preserve_primary: bool = False) -> None:
+        """Drop one lease. Hook Exception is suppressed only if the body failed.
+
+        ``preserve_primary`` comes from explicit caller control flow, not
+        ``sys.exc_info()`` — an already-handled outer except would otherwise
+        look like a primary and swallow cleanup after a successful body.
+        Hook ``BaseException`` is not caught.
+        """
         idle_closed = False
         with self._lifecycle:
             ident = threading.get_ident()
@@ -181,11 +187,10 @@ class DurableLaneService:
             self._close_idle.notify_all()
             idle_closed = self._closed and self._active_leases == 0
         if idle_closed:
-            primary = sys.exc_info()[1]
             try:
                 self._after_idle_closed()
             except Exception:
-                if primary is not None:
+                if preserve_primary:
                     logger.debug(
                         "durable lane idle-closed cleanup failed during unwind",
                         exc_info=True,
@@ -196,10 +201,14 @@ class DurableLaneService:
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:
         self._acquire_mutation_lease()
+        body_failed = False
         try:
             yield
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            self._release_mutation_lease()
+            self._release_mutation_lease(preserve_primary=body_failed)
 
     def _require_enabled(self) -> None:
         if not self.config.enabled:
@@ -228,6 +237,7 @@ class DurableLaneService:
         # it must not hold ``_lifecycle`` and must run under a mutation lease
         # so close() cannot return until it finishes.
         self._acquire_mutation_lease()
+        body_failed = False
         try:
             with self._lifecycle:
                 if self._closed:
@@ -239,8 +249,11 @@ class DurableLaneService:
                 if self._store is None:
                     self._store = store
                 return self._store
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            self._release_mutation_lease()
+            self._release_mutation_lease(preserve_primary=body_failed)
 
     def _repository_identity_rejected(
         self, store: DurableJobStore, job_id: str
