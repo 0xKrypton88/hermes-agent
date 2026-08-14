@@ -1,10 +1,10 @@
 """ENG-30 inactive/fail-closed Cursor Cloud adapter contract.
 
 Production-shaped types and an injected-transport seam behind
-``CursorProviderPort``. No live HTTP client is constructed. Dispatch remains
-hard-disabled (``config.dispatch_allowed`` is always False). Job/action
-idempotency identity is the existing durable effect ledger — this module
-does not keep a second run map.
+``CursorProviderPort``. No live HTTP client is constructed. ``attempt_dispatch``
+remains hard-disabled. ``dispatch_allowed`` is a config capability flag only —
+it cannot mint a live client. Job/action idempotency identity is the existing
+durable effect ledger — this module does not keep a second run map.
 """
 
 from __future__ import annotations
@@ -840,12 +840,7 @@ def adapter_from_config(
     *,
     transport: Optional[CursorCloudTransport] = None,
 ) -> Any:
-    """Default factory stays fail-closed. Flags cannot mint a live client."""
-    if config.dispatch_allowed:
-        raise RuntimeError(
-            "live Cursor Cloud dispatch is not available; "
-            "dispatch_allowed cannot enable a network client"
-        )
+    """Factory stays fail-closed. Flags cannot mint a live client."""
     if transport is None:
         return NullCursorProvider()
     return CursorCloudAdapter(transport)

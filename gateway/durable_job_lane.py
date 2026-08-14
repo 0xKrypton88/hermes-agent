@@ -1,0 +1,295 @@
+"""Lifecycle-owned Gateway seam for Durable Job Lane (ENG-36 Package 2).
+
+Reads ``durable_jobs`` from active config and constructs the lane only when
+explicit validated gates pass. Default remains enabled=false / dispatch off.
+No implicit network client and no built-in credentials.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
+from agent.durable_jobs.config import (
+    DurableJobsConfig,
+    DurableJobsConfigError,
+    load_durable_jobs_config,
+)
+from agent.durable_jobs.coordinator import InboundActionResult
+from agent.durable_jobs.cursor_cloud import adapter_from_config as cursor_adapter_from_config
+from agent.durable_jobs.lane import DurableLaneService
+from agent.durable_jobs.preflight import DurableJobsPreflight, preflight_durable_jobs
+from agent.durable_jobs.redaction import redact_secret_text
+from agent.durable_jobs.slack_bridge import adapter_from_config as slack_adapter_from_config
+
+logger = logging.getLogger(__name__)
+
+DURABLE_SLACK_ACTION_IDS = (
+    "hermes_durable_go",
+    "hermes_durable_hold",
+    "hermes_durable_pause",
+    "hermes_durable_cancel",
+)
+_ACTION_TO_DECISION = {
+    "hermes_durable_go": "go",
+    "hermes_durable_hold": "hold",
+    "hermes_durable_pause": "pause",
+    "hermes_durable_cancel": "cancel",
+}
+
+_LOCK = threading.Lock()
+_ACTIVE: Optional["DurableJobLaneHandle"] = None
+
+
+class DurableJobLaneAlreadyAttached(RuntimeError):
+    """A process may own at most one constructed durable-job lane."""
+
+
+class _SilentAck:
+    def ack(self, *, inbound_id: str, job_id: str) -> str:
+        return "acked"
+
+
+@dataclass
+class DurableJobLaneHandle:
+    config: DurableJobsConfig
+    lane: DurableLaneService
+    cursor_adapter: Any
+    slack_adapter: Any
+    preflight: DurableJobsPreflight
+
+    def shutdown(self) -> None:
+        store = getattr(self.lane, "_store", None)
+        if store is not None and hasattr(store, "close"):
+            try:
+                store.close()
+            except Exception:
+                logger.debug("durable job store close failed", exc_info=True)
+        self.lane._store = None
+
+    def __repr__(self) -> str:
+        return redact_secret_text(
+            "DurableJobLaneHandle("
+            f"dispatch_allowed={self.config.dispatch_allowed!r}, "
+            f"enabled={self.config.enabled!r}, "
+            f"cursor_adapter={type(self.cursor_adapter).__name__}, "
+            f"slack_adapter={type(self.slack_adapter).__name__})"
+        )
+
+
+def get_active_durable_job_lane() -> Optional[DurableJobLaneHandle]:
+    return _ACTIVE
+
+
+def durable_job_lane_status() -> dict[str, Any]:
+    handle = _ACTIVE
+    status = {
+        "attached": handle is not None,
+        "enabled": bool(handle.config.enabled) if handle is not None else False,
+        "dispatch_allowed": (
+            bool(handle.config.dispatch_allowed) if handle is not None else False
+        ),
+        "cursor_adapter": (
+            type(handle.cursor_adapter).__name__ if handle is not None else None
+        ),
+        "slack_adapter": (
+            type(handle.slack_adapter).__name__ if handle is not None else None
+        ),
+        "backend": handle.config.resolved_backend if handle is not None else None,
+    }
+    return json.loads(redact_secret_text(json.dumps(status)))
+
+
+def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if raw_config is not None:
+        return raw_config
+    try:
+        from hermes_cli.config import load_config
+
+        loaded = load_config()
+        if isinstance(loaded, Mapping):
+            return loaded
+    except Exception:
+        logger.debug("durable_jobs active config load failed", exc_info=True)
+    return {}
+
+
+def attach_durable_job_lane(
+    *,
+    raw_config: Mapping[str, Any] | None = None,
+    cursor_transport: Any = None,
+    slack_transport: Any = None,
+) -> Optional[DurableJobLaneHandle]:
+    """Construct the lane only when validated gates pass. Fail closed otherwise."""
+    global _ACTIVE
+    raw = _load_raw_config(raw_config)
+    try:
+        report = preflight_durable_jobs(raw)
+        cfg = load_durable_jobs_config(raw) if report.constructible else None
+    except DurableJobsConfigError:
+        return None
+    except Exception:
+        logger.debug("durable job lane preflight failed", exc_info=True)
+        return None
+
+    if report is None or not report.constructible or cfg is None:
+        return None
+
+    with _LOCK:
+        if _ACTIVE is not None:
+            raise DurableJobLaneAlreadyAttached(
+                "durable job lane is already attached in this process"
+            )
+        try:
+            cursor_adapter = cursor_adapter_from_config(
+                cfg, transport=cursor_transport
+            )
+            slack_adapter = slack_adapter_from_config(
+                cfg, transport=slack_transport
+            )
+            handle = DurableJobLaneHandle(
+                config=cfg,
+                lane=DurableLaneService(config=cfg),
+                cursor_adapter=cursor_adapter,
+                slack_adapter=slack_adapter,
+                preflight=report,
+            )
+        except Exception:
+            logger.debug("durable job lane construct failed", exc_info=True)
+            return None
+        _ACTIVE = handle
+        logger.info(
+            "Durable job lane constructed (dispatch_allowed=%s, adapters=%s/%s)",
+            cfg.dispatch_allowed,
+            type(cursor_adapter).__name__,
+            type(slack_adapter).__name__,
+        )
+        return handle
+
+
+def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> None:
+    """Idempotent shutdown of the process-owned lane."""
+    global _ACTIVE
+    with _LOCK:
+        current = _ACTIVE
+        if current is None:
+            return
+        if handle is not None and handle is not current:
+            return
+        try:
+            current.shutdown()
+        finally:
+            _ACTIVE = None
+
+
+def attach_to_gateway_runner(
+    runner: Any,
+    raw_config: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> Optional[DurableJobLaneHandle]:
+    try:
+        handle = attach_durable_job_lane(raw_config=raw_config, **kwargs)
+    except DurableJobLaneAlreadyAttached:
+        handle = get_active_durable_job_lane()
+    except Exception:
+        logger.debug("durable job lane attach failed (fail-closed)", exc_info=True)
+        handle = None
+    runner._durable_job_lane = handle
+    return handle
+
+
+def detach_from_gateway_runner(runner: Any) -> None:
+    handle = getattr(runner, "_durable_job_lane", None)
+    if handle is not None:
+        detach_durable_job_lane(handle)
+    try:
+        runner._durable_job_lane = None
+    except Exception:
+        pass
+
+
+def _text(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return ""
+
+
+def _nested_id(raw: Any, *keys: str) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, Mapping):
+            found = _text(value.get("id"))
+            if found:
+                return found
+        found = _text(value)
+        if found:
+            return found
+    return ""
+
+
+def parse_slack_durable_action(
+    body: Mapping[str, Any] | None, action: Mapping[str, Any] | None
+) -> Optional[dict[str, str]]:
+    if not isinstance(action, Mapping):
+        return None
+    action_id = _text(action.get("action_id"))
+    if action_id not in _ACTION_TO_DECISION:
+        return None
+    raw_value = action.get("value")
+    payload: dict[str, Any]
+    if isinstance(raw_value, Mapping):
+        payload = dict(raw_value)
+    elif isinstance(raw_value, str) and raw_value.strip():
+        try:
+            loaded = json.loads(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        payload = loaded
+    else:
+        payload = {}
+    body = body if isinstance(body, Mapping) else {}
+    message = body.get("message") if isinstance(body.get("message"), Mapping) else {}
+    parsed = {
+        "job_id": _text(payload.get("job_id")),
+        "workspace_id": _text(payload.get("workspace_id"))
+        or _nested_id(body, "team", "team_id"),
+        "channel_id": _text(payload.get("channel_id"))
+        or _nested_id(body, "channel", "channel_id"),
+        "root_thread_ts": _text(payload.get("root_thread_ts"))
+        or _text(message.get("thread_ts"))
+        or _text(message.get("ts")),
+        "actor_id": _text(payload.get("actor_id")) or _nested_id(body, "user", "user_id"),
+        "decision_type": _text(payload.get("decision_type"))
+        or _ACTION_TO_DECISION[action_id],
+        "decision_idempotency_key": _text(payload.get("decision_idempotency_key")),
+        "policy_version": _text(payload.get("policy_version")),
+        "candidate_id": _text(payload.get("candidate_id")),
+        "candidate_version": _text(payload.get("candidate_version")),
+    }
+    return parsed
+
+
+def consume_slack_action_if_active(
+    body: Mapping[str, Any] | None,
+    action: Mapping[str, Any] | None,
+    *,
+    ack_port: Any = None,
+) -> Optional[InboundActionResult]:
+    """Reuse DurableLaneService inbound ingress. No parallel Slack router."""
+    handle = get_active_durable_job_lane()
+    if handle is None:
+        return None
+    parsed = parse_slack_durable_action(body, action)
+    if parsed is None:
+        return InboundActionResult(ok=False, ack_status="rejected")
+    return handle.lane.consume_inbound_action(
+        ack_port if ack_port is not None else _SilentAck(),
+        **parsed,
+    )

@@ -213,6 +213,21 @@ class TestSlackAdapterPluginActionWiring:
         assert "hermes_approve_once" in action_ids
 
 
+    def test_durable_job_actions_reuse_existing_slack_action_ingress(self):
+        """Package 2 couples durable Go/Hold/Cancel onto the built-in action path."""
+        from gateway.durable_job_lane import DURABLE_SLACK_ACTION_IDS
+
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        result, registered = _connect_with_recording_app(
+            adapter, plugin_handlers=[],
+        )
+        assert result is True
+        action_ids = [aid for aid, _cb in registered]
+        for action_id in DURABLE_SLACK_ACTION_IDS:
+            assert action_id in action_ids
+
+
     def test_plugin_loader_failure_does_not_break_connect(self):
         """If get_plugin_manager() blows up, connect() must still succeed.
 

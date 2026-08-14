@@ -6028,6 +6028,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
+        self._durable_job_lane = None
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -10882,6 +10883,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    def _maybe_attach_durable_job_lane(self) -> None:
+        """Construct Durable Job Lane only when validated config gates pass.
+
+        Default-off and fail-closed. Reads ``durable_jobs`` from active config.
+        Never injects an HTTP/SDK client or credential. Package 1 dispatch
+        remains hard-disabled even when the lane is constructed.
+        """
+        try:
+            from gateway.durable_job_lane import attach_to_gateway_runner
+
+            attach_to_gateway_runner(self)
+        except Exception:
+            logger.warning(
+                "Durable Job Lane construction failed; gateway continues without it",
+                exc_info=True,
+            )
+            self._durable_job_lane = None
+
+    def _maybe_detach_durable_job_lane(self) -> None:
+        """Idempotent shutdown of a lifecycle-owned durable-job lane."""
+        try:
+            from gateway.durable_job_lane import detach_from_gateway_runner
+
+            detach_from_gateway_runner(self)
+        except Exception:
+            logger.debug("Durable Job Lane detach failed", exc_info=True)
+            try:
+                self._durable_job_lane = None
+            except Exception:
+                pass
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -11016,6 +11048,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Gateway health OTLP export: enabled")
         except Exception:
             logger.debug("gateway health OTLP export startup failed", exc_info=True)
+
+        # Package 2: construct Durable Job Lane only when validated gates pass.
+        # Default-off / fail-closed; never injects a network client or secret.
+        self._maybe_attach_durable_job_lane()
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
@@ -12912,6 +12948,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Stop the gateway and disconnect all adapters."""
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
+        _detach_lane = getattr(self, "_maybe_detach_durable_job_lane", None)
+        if callable(_detach_lane):
+            try:
+                _detach_lane()
+            except Exception:
+                logger.debug("Durable Job Lane detach failed", exc_info=True)
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()

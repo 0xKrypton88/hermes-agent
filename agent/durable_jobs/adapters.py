@@ -3,12 +3,13 @@
 This package ships only protocols and inert null adapters. Live Slack / Cursor /
 network adapters are intentionally absent from this module. The ENG-30 Cursor
 Cloud adapter (``cursor_cloud.CursorCloudAdapter``) and ENG-31 Slack client
-bridge (``slack_bridge.SlackClientBridge``) are inactive/fail-closed and
-require an injected transport — they are not exported here and never enable
-Package 1 dispatch. Even when a fake is injected into
-``DurableJobService``, Package 1 hard-disables dispatch and never calls
-``dispatch()``. ENG-26/27 ledgers talk only to injected fakes after a durable
-claim/binding. It must be impossible for this slice to call Slack/Cursor/network.
+bridge (``slack_bridge.SlackClientBridge``) require an injected transport —
+they are not exported here. Package 2 production-shaped transports live in
+``injected_transports`` and still never construct an HTTP/SDK client or read
+credential values. Even when a fake is injected into ``DurableJobService``,
+``attempt_dispatch`` stays hard-disabled and never calls ``dispatch()``.
+ENG-26/27 ledgers talk only to injected fakes after a durable claim/binding.
+It must be impossible for this slice to call Slack/Cursor/network.
 """
 
 from __future__ import annotations

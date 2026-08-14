@@ -1,10 +1,10 @@
 """ENG-31 inactive/fail-closed Slack client bridge behind SlackMessagePort.
 
 Production-shaped types and an injected-transport seam. No live HTTP client,
-Slack SDK, gateway adapter, or token handling is constructed. Dispatch remains
-hard-disabled (``config.dispatch_allowed`` is always False). Job/thread
-identity stays in the existing Slack binding ledger — this module does not
-keep a second message map.
+Slack SDK, gateway adapter, or token handling is constructed. ``attempt_dispatch``
+remains hard-disabled. ``dispatch_allowed`` is a config capability flag only —
+it cannot mint a live client. Job/thread identity stays in the existing Slack
+binding ledger — this module does not keep a second message map.
 """
 
 from __future__ import annotations
@@ -493,12 +493,7 @@ def adapter_from_config(
     *,
     transport: Optional[SlackTransport] = None,
 ) -> Any:
-    """Default factory stays fail-closed. Flags cannot mint a live client."""
-    if config.dispatch_allowed:
-        raise RuntimeError(
-            "live Slack dispatch is not available; "
-            "dispatch_allowed cannot enable a network client"
-        )
+    """Factory stays fail-closed. Flags cannot mint a live client."""
     if transport is None:
         return NullSlackPort()
     return SlackClientBridge(transport)

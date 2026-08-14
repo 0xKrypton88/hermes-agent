@@ -2091,6 +2091,20 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_approval_action)
 
+            # Durable Job Lane Go/Hold/Pause/Cancel — same Block Kit action
+            # ingress as approval buttons. Inactive when the lane is not
+            # attached. Does not create a parallel Slack router.
+            try:
+                from gateway.durable_job_lane import DURABLE_SLACK_ACTION_IDS
+
+                for _action_id in DURABLE_SLACK_ACTION_IDS:
+                    self._app.action(_action_id)(self._handle_durable_job_action)
+            except Exception:
+                logger.debug(
+                    "[Slack] Durable job action handlers not registered",
+                    exc_info=True,
+                )
+
             # Register Block Kit action handlers for slash-confirm buttons
             # (generic three-option prompts; see tools/slash_confirm.py).
             for _action_id in (
@@ -7002,6 +7016,21 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
         # (approval already resolved above; state consumed by atomic pop)
+
+    async def _handle_durable_job_action(self, ack, body, action) -> None:
+        """Reuse existing Slack action ingress for durable Go/Hold/Pause/Cancel.
+
+        Acks first so Slack does not retry. Forwards to the lifecycle-owned
+        lane when attached; no-op otherwise. Does not log request bodies or
+        secret values.
+        """
+        await ack()
+        try:
+            from gateway.durable_job_lane import consume_slack_action_if_active
+
+            consume_slack_action_if_active(body, action)
+        except Exception:
+            logger.debug("[Slack] Durable job action handling failed", exc_info=True)
 
     async def _update_clarify_message(
         self,

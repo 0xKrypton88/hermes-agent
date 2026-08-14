@@ -1,15 +1,10 @@
-"""LangGraph durable-job pilot (ENG-3 Package 1 + ENG-26/ENG-27 + ENG-25 slice).
+"""LangGraph durable-job pilot (Package 1 + ENG-26/27/25 + Package 2 coupling).
 
-Isolated, disabled-by-default module. No gateway / Slack / Cursor wiring.
-Dispatch is hard-disabled (never invokes adapters). Provider and Slack
-effects use injected fakes only, after an explicit durable claim/binding
-with persisted owner token, lease fencing, owner-fenced heartbeat, and
-bounded recovering state after empty lookup.
-
-SQLite usage here is disposable, explicit-path, single-process, and
-dev/test-only. PostgreSQL persistence is an opt-in extra
-(`[langgraph-durable-postgres]`) selected only by an explicit backend;
-it does not silently fall back to SQLite.
+Isolated, disabled-by-default module. Package 2 adds one Gateway lifecycle
+seam that constructs the lane only when explicit validated gates pass.
+Default remains enabled=false / dispatch off. Live Slack/Cursor clients are
+never minted from flags; transports must be injected. Dispatch is still
+hard-disabled (never invokes adapters).
 """
 
 from __future__ import annotations

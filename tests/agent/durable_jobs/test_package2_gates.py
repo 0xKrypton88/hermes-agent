@@ -1,0 +1,410 @@
+"""ENG-36 Package 2 — fail-closed gates, preflight, and injected transports.
+
+No live Slack/Cursor/network. Secret values must never appear in status.
+"""
+
+from __future__ import annotations
+
+import socket
+import sys
+from pathlib import Path
+
+import pytest
+
+
+SECRET_DSN = "postgresql://hermes:supersecret@127.0.0.1:5432/durable_jobs"
+CURSOR_TOKEN = "cursor-secret-token-value"
+SLACK_TOKEN = "xoxb-super-secret-token"
+
+
+def _complete_sqlite(tmp_path: Path, **overrides) -> dict:
+    section = {
+        "enabled": True,
+        "dispatch_enabled": True,
+        "backend": "sqlite",
+        "sqlite_path": str(tmp_path / "jobs.sqlite"),
+        "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+        "cursor_adapter_mode": "injected",
+        "slack_adapter_mode": "injected",
+        "cursor_secret_ref": "CURSOR_API_KEY",
+        "slack_secret_ref": "SLACK_BOT_TOKEN",
+        "policy_version": "eng29-matrix-v1",
+        "identity_binding": {
+            "workspace_id": "T1",
+            "repository_identity": "github.com/example/repo",
+        },
+    }
+    section.update(overrides)
+    return {"durable_jobs": section}
+
+
+def test_default_config_root_keeps_durable_jobs_disabled():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    section = DEFAULT_CONFIG["durable_jobs"]
+    assert section["enabled"] is False
+    assert section["dispatch_enabled"] is False
+    assert section.get("cursor_adapter_mode") in (None, "")
+    assert section.get("slack_adapter_mode") in (None, "")
+
+
+def test_defaults_keep_enabled_and_dispatch_off():
+    from agent.durable_jobs.config import (
+        DEFAULT_DURABLE_JOBS_CONFIG,
+        load_durable_jobs_config,
+    )
+
+    assert DEFAULT_DURABLE_JOBS_CONFIG["enabled"] is False
+    assert DEFAULT_DURABLE_JOBS_CONFIG["dispatch_enabled"] is False
+    assert DEFAULT_DURABLE_JOBS_CONFIG.get("cursor_adapter_mode") in (None, "")
+    assert DEFAULT_DURABLE_JOBS_CONFIG.get("slack_adapter_mode") in (None, "")
+
+    cfg = load_durable_jobs_config({})
+    assert cfg.enabled is False
+    assert cfg.dispatch_enabled is False
+    assert cfg.dispatch_allowed is False
+
+
+def test_flags_alone_cannot_allow_dispatch(tmp_path):
+    from agent.durable_jobs.config import load_durable_jobs_config
+
+    cfg = load_durable_jobs_config(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": True,
+                "sqlite_path": str(tmp_path / "jobs.sqlite"),
+                "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+            }
+        }
+    )
+    assert cfg.enabled is True
+    assert cfg.dispatch_enabled is True
+    assert cfg.dispatch_allowed is False
+
+
+@pytest.mark.parametrize(
+    "drop_key",
+    [
+        "cursor_adapter_mode",
+        "slack_adapter_mode",
+        "cursor_secret_ref",
+        "slack_secret_ref",
+        "policy_version",
+        "identity_binding",
+        "sqlite_path",
+        "checkpoint_sqlite_path",
+        "dispatch_enabled",
+        "enabled",
+    ],
+)
+def test_partial_config_keeps_dispatch_closed(tmp_path, drop_key):
+    from agent.durable_jobs.config import load_durable_jobs_config
+
+    raw = _complete_sqlite(tmp_path)
+    if drop_key in ("enabled", "dispatch_enabled"):
+        raw["durable_jobs"][drop_key] = False
+    else:
+        raw["durable_jobs"].pop(drop_key, None)
+    cfg = load_durable_jobs_config(raw)
+    assert cfg.dispatch_allowed is False
+
+
+def test_unknown_adapter_mode_is_rejected(tmp_path):
+    from agent.durable_jobs.config import DurableJobsConfigError, load_durable_jobs_config
+
+    with pytest.raises(DurableJobsConfigError) as exc:
+        load_durable_jobs_config(
+            _complete_sqlite(tmp_path, cursor_adapter_mode="live")
+        )
+    msg = str(exc.value).lower()
+    assert "adapter" in msg
+    assert "live" in msg or "unknown" in msg or "injected" in msg
+
+
+def test_secret_like_ref_values_are_rejected_and_redacted(tmp_path):
+    from agent.durable_jobs.config import DurableJobsConfigError, load_durable_jobs_config
+
+    with pytest.raises(DurableJobsConfigError) as exc:
+        load_durable_jobs_config(
+            _complete_sqlite(tmp_path, slack_secret_ref=SLACK_TOKEN)
+        )
+    dumped = str(exc.value)
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+
+
+def test_partial_identity_binding_is_rejected(tmp_path):
+    from agent.durable_jobs.config import DurableJobsConfigError, load_durable_jobs_config
+
+    with pytest.raises(DurableJobsConfigError):
+        load_durable_jobs_config(
+            _complete_sqlite(
+                tmp_path,
+                identity_binding={"workspace_id": "T1"},
+            )
+        )
+
+
+def test_complete_sqlite_gates_allow_dispatch_flag_only(tmp_path):
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.service import DispatchDisabledError, DurableJobService
+
+    cfg = load_durable_jobs_config(_complete_sqlite(tmp_path))
+    assert cfg.dispatch_allowed is True
+
+    calls: list[str] = []
+
+    class FakeDispatch:
+        def dispatch(self, job_id: str) -> None:
+            calls.append(job_id)
+
+    service = DurableJobService(config=cfg, dispatch_adapter=FakeDispatch())
+    with pytest.raises(DispatchDisabledError):
+        service.attempt_dispatch("job-not-activated")
+    assert calls == []
+
+
+def test_postgresql_complete_config_does_not_allow_lane_dispatch(tmp_path):
+    from agent.durable_jobs.config import load_durable_jobs_config
+
+    cfg = load_durable_jobs_config(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": True,
+                "backend": "postgresql",
+                "postgres_dsn": SECRET_DSN,
+                "postgres_schema": "durable_jobs_app",
+                "checkpoint_postgres_dsn": (
+                    "postgresql://hermes:supersecret@127.0.0.1:5432/other_jobs"
+                ),
+                "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
+                "cursor_adapter_mode": "injected",
+                "slack_adapter_mode": "injected",
+                "cursor_secret_ref": "CURSOR_API_KEY",
+                "slack_secret_ref": "SLACK_BOT_TOKEN",
+                "policy_version": "eng29-matrix-v1",
+                "identity_binding": {
+                    "workspace_id": "T1",
+                    "repository_identity": "github.com/example/repo",
+                },
+            }
+        }
+    )
+    assert cfg.dispatch_allowed is False
+    assert "supersecret" not in repr(cfg)
+
+
+def test_preflight_default_off_has_no_external_effects(monkeypatch):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    def _deny(*_a, **_k):
+        raise AssertionError("preflight must not open sockets")
+
+    monkeypatch.setattr(socket.socket, "connect", _deny)
+    monkeypatch.setattr(socket.socket, "connect_ex", _deny)
+
+    report = preflight_durable_jobs({})
+    assert report.constructible is False
+    assert report.dispatch_allowed is False
+    assert report.runtime_ready is False
+    dumped = str(report)
+    assert "supersecret" not in dumped
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+
+
+def test_preflight_complete_sqlite_is_constructible_without_sockets(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    def _deny(*_a, **_k):
+        raise AssertionError("preflight must not open sockets")
+
+    monkeypatch.setattr(socket.socket, "connect", _deny)
+    monkeypatch.setattr(socket.socket, "connect_ex", _deny)
+
+    report = preflight_durable_jobs(_complete_sqlite(tmp_path))
+    assert report.constructible is True
+    assert report.dispatch_allowed is True
+    assert report.runtime_ready is True
+    assert report.cursor_adapter_mode == "injected"
+    assert report.slack_adapter_mode == "injected"
+    assert "supersecret" not in str(report)
+
+
+def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):
+    import types
+
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    def _boom(_name):
+        raise AssertionError("psycopg must not be imported on sqlite preflight")
+
+    fake = types.ModuleType("psycopg")
+    fake.connect = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("psycopg.connect")
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+    monkeypatch.setattr(
+        "importlib.import_module",
+        lambda name, *a, **k: _boom(name) if name == "psycopg" else __import__(name),
+    )
+
+    report = preflight_durable_jobs(_complete_sqlite(tmp_path))
+    assert report.constructible is True
+    assert "psycopg" not in sys.modules or sys.modules["psycopg"] is fake
+
+
+def test_adapter_from_config_never_mints_live_client_when_dispatch_allowed(
+    tmp_path,
+):
+    from agent.durable_jobs.adapters import NullCursorProvider, NullSlackPort
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        adapter_from_config as cursor_from_config,
+    )
+    from agent.durable_jobs.slack_bridge import (
+        SlackClientBridge,
+        adapter_from_config as slack_from_config,
+    )
+
+    cfg = load_durable_jobs_config(_complete_sqlite(tmp_path))
+    assert cfg.dispatch_allowed is True
+    assert isinstance(cursor_from_config(cfg), NullCursorProvider)
+    assert isinstance(slack_from_config(cfg), NullSlackPort)
+
+    class _CursorTransport:
+        def create(self, **_k):
+            raise AssertionError("no network")
+
+        def lookup(self, **_k):
+            raise AssertionError("no network")
+
+        def status(self, **_k):
+            raise AssertionError("no network")
+
+    class _SlackTransport:
+        def post_root(self, **_k):
+            raise AssertionError("no network")
+
+        def lookup_by_client_msg_id(self, client_msg_id: str):
+            raise AssertionError("no network")
+
+    assert isinstance(
+        cursor_from_config(cfg, transport=_CursorTransport()), CursorCloudAdapter
+    )
+    assert isinstance(
+        slack_from_config(cfg, transport=_SlackTransport()), SlackClientBridge
+    )
+
+
+def test_injected_transports_are_production_shaped_and_secret_ref_only():
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    calls: list[dict] = []
+
+    def request(*, operation: str, secret_ref: str, payload: dict):
+        calls.append(
+            {"operation": operation, "secret_ref": secret_ref, "payload": payload}
+        )
+        dumped = str(payload)
+        assert CURSOR_TOKEN not in dumped
+        assert SLACK_TOKEN not in dumped
+        assert "Authorization" not in dumped
+        assert "Bearer" not in dumped
+        if operation == "create":
+            return {
+                "id": "bc-11111111-1111-1111-1111-111111111111",
+                "latestRunId": "run-1",
+                "name": payload["name"],
+            }
+        if operation == "post_root":
+            return {"ok": True, "ts": "222.333", "channel": payload["channel_id"]}
+        return []
+
+    with pytest.raises((TypeError, RuntimeError)):
+        CursorCloudInjectedTransport()
+    with pytest.raises((TypeError, RuntimeError)):
+        SlackInjectedTransport()
+
+    cursor = CursorCloudInjectedTransport(
+        request=request, secret_ref="CURSOR_API_KEY"
+    )
+    slack = SlackInjectedTransport(request=request, secret_ref="SLACK_BOT_TOKEN")
+    created = cursor.create(
+        idempotency_key="cursor:job:create_run",
+        job_id="job-1",
+        name="cursor:job:create_run",
+        agent_id="bc-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    )
+    posted = slack.post_root(
+        client_msg_id="cmid-1",
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        job_id="job-1",
+    )
+    assert created is not None
+    assert posted is not None
+    assert {c["secret_ref"] for c in calls} == {"CURSOR_API_KEY", "SLACK_BOT_TOKEN"}
+    for call in calls:
+        assert CURSOR_TOKEN not in str(call)
+        assert SLACK_TOKEN not in str(call)
+
+
+def test_injected_transport_errors_redact_secrets():
+    from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter, CursorCreateKind
+
+    def boom(**_k):
+        raise RuntimeError(
+            f"upstream 401 token={CURSOR_TOKEN} dsn={SECRET_DSN} slack={SLACK_TOKEN}"
+        )
+
+    adapter = CursorCloudAdapter(
+        transport=CursorCloudInjectedTransport(
+            request=boom, secret_ref="CURSOR_API_KEY"
+        )
+    )
+    result = adapter.create_run(
+        idempotency_key="cursor:job:create_run", job_id="job-1"
+    )
+    assert result.kind is CursorCreateKind.UNKNOWN
+    dumped = str(result.error or "")
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "supersecret" not in dumped
+
+
+def test_injected_transport_modules_do_not_export_live_clients():
+    import agent.durable_jobs.injected_transports as transports
+
+    for banned in (
+        "CursorCloudHttpClient",
+        "LiveCursorCloudTransport",
+        "SlackSdkClient",
+        "LiveSlackTransport",
+        "SlackHttpClient",
+    ):
+        assert not hasattr(transports, banned)
+
+
+def test_package2_modules_do_not_import_psycopg_or_live_sdks():
+    for name in ("psycopg", "slack_sdk", "slack_bolt"):
+        sys.modules.pop(name, None)
+
+    import agent.durable_jobs.injected_transports  # noqa: F401
+    import agent.durable_jobs.preflight  # noqa: F401
+
+    assert "psycopg" not in sys.modules
+    assert "slack_sdk" not in sys.modules
+    assert "slack_bolt" not in sys.modules

@@ -1,7 +1,11 @@
-# ENG-3 LangGraph Durable-Job Pilot (Package 1 + ENG-26/ENG-27 slices)
+# ENG-3 LangGraph Durable-Job Pilot (Package 1 + ENG-26/27 + Package 2 coupling)
 
-Isolated, **disabled-by-default** durable-job pilot. Not wired into the gateway,
-Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
+Isolated, **disabled-by-default** durable-job pilot. Package 2 adds one
+Gateway lifecycle seam (`gateway/durable_job_lane.py`) that constructs the
+lane only when explicit validated gates pass. Default remains
+`enabled: false` / dispatch off. Flags cannot mint a live Slack/Cursor
+client. `attempt_dispatch` stays hard-disabled. Does not use production
+Hermes `state.db`.
 
 ## What this package does
 
@@ -56,7 +60,29 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
   and decision idempotency key; unauthorized / mismatch / expired / replayed
   fail closed. Cancel is terminal: later or replayed pre-Cancel Go/Hold stay
   rejected as canceled; Cancel replay remains idempotent
-- No Slack routing fork: gateway adapters are untouched
+- No parallel Slack router: Package 2 reuses existing Slack Block Kit action
+  ingress (`hermes_durable_go/hold/pause/cancel`) and forwards to
+  `DurableLaneService.consume_inbound_action` when the lane is attached
+
+### Package 2 — Gateway coupling without activation (default-off)
+
+- One lifecycle-owned Gateway seam reads `durable_jobs` from active config
+- Constructs `DurableLaneService` only when enabled, SQLite lane storage,
+  explicit adapter modes (`null` or `injected`), and policy/identity
+  bindings are complete. Missing/unknown/partial config is fail-closed
+- `dispatch_allowed` is True only for complete SQLite + both modes
+  `injected` + secret *references* (env var names) + policy/identity.
+  PostgreSQL lane storage cannot set the flag. `attempt_dispatch` still
+  raises `DispatchDisabledError`
+- Production-shaped `CursorCloudInjectedTransport` /
+  `SlackInjectedTransport` require an injected request callable and a
+  secret-ref name. No built-in credentials, no implicit HTTP/SDK client
+- Preflight validates config/backend/schema/path/adapter modes/bindings/
+  secret-ref names/runtime readiness with no sockets and no `psycopg`
+  import on the SQLite path
+- Process-global attach is exclusive; shutdown is idempotent; reconstruct
+  can reopen the same SQLite path (restart/takeover)
+- Status/errors redact DSN, token, and `xoxb-` values
 
 ### ENG-29 — mandatory Go guard (default-off, local policy-contract)
 
@@ -86,17 +112,21 @@ Slack actions, Cursor/cloud providers, or production Hermes `state.db`.
 - **Local policy-contract evidence only** — not Slack/live authorization,
   not gateway ingress, not PostgreSQL claims
 
-## Explicit non-goals (Package 1 + these slices)
+## Explicit non-goals (Package 1 + Package 2 coupling)
 
-- No production integration / gateway wiring / Slack action wiring
-- No Cursor or cloud provider calls (injected fakes in tests only)
-- No external dispatch capability whatsoever (not configuration-gated)
+- No activation: default `enabled: false`, dispatch off, no live Slack/Cursor
+  calls, no sandbox E2E
+- No OAuth/token/secret/permission changes and no production database/migration
+- No Cursor or cloud provider calls (injected request callable in tests only)
+- No external dispatch capability (`attempt_dispatch` is hard-disabled)
 - No service restarts, deployment, credentials, live trading, order mutation,
   arming/disarming, or live reconciliation
 - Does **not** touch existing completion/outbox modules or Hermes `state.db`
 - Does **not** add LangGraph to core dependencies (opt-in extra only)
 - SQLite here is **not** a substitute for the ENG-25 PostgreSQL extra when
   `backend: postgresql` is selected (no silent fallback)
+- PostgreSQL/psycopg remains opt-in; default install and default CI must not
+  import or require psycopg
 
 ## Storage boundaries
 
@@ -131,6 +161,12 @@ durable_jobs:
   checkpoint_postgres_schema: null
   postgres_storage_id: null
   checkpoint_postgres_storage_id: null
+  cursor_adapter_mode: null   # null | injected; unset is not explicit
+  slack_adapter_mode: null
+  cursor_secret_ref: null     # env var NAME only, never a token value
+  slack_secret_ref: null
+  policy_version: null
+  identity_binding: null      # {workspace_id, repository_identity}
 ```
 
 Install PostgreSQL support with the opt-in extra (not core, not `[all]`,
@@ -149,8 +185,8 @@ uv sync --extra langgraph-durable-postgres --locked
   policy beyond per-call `psycopg.connect`
 - No SERIALIZABLE isolation (this slice uses row locks + advisory xact
   locks + CAS)
-- Package 1 dispatch remains hard-disabled: zero Cursor/provider/Slack
-  calls, no gateway/platform wiring
+- Package 1 dispatch remains hard-disabled: `attempt_dispatch` never calls
+  adapters. Package 2 coupling does not activate live dispatch
 - ENG-29 Go/cancel/authorization semantics are unchanged and still
   local-policy-contract on SQLite ledgers
 - Not a production datastore cutover; not credentials, deploy, or restart
@@ -172,15 +208,20 @@ store I/O.
 ```yaml
 durable_jobs:
   enabled: false          # default; must be a real boolean (not "false")
-  dispatch_enabled: false # retained for shape only — Package 1 hard-disables dispatch
+  dispatch_enabled: false # required for dispatch_allowed; attempt_dispatch still hard-disabled
   sqlite_path: null       # must be set explicitly when enabling sqlite
   checkpoint_sqlite_path: null
+  cursor_adapter_mode: null
+  slack_adapter_mode: null
 ```
 
 `enabled` / `dispatch_enabled` reject non-bool values (strings/ints) to avoid
-`bool("false") == True` ambiguity. Even with both flags true, Package 1 never
+`bool("false") == True` ambiguity. `dispatch_allowed` is True only when every
+Package 2 gate is complete (SQLite lane, both adapter modes `injected`,
+secret-ref names, policy, identity). Even then `attempt_dispatch` never
 calls an injected dispatch adapter. ENG-26/27 lane methods also no-op unless
-`enabled` is true, and still never construct live Cursor/Slack clients.
+`enabled` is true, and still never construct live Cursor/Slack clients from
+flags.
 
 ## Tests (clean / release-venv safe)
 
