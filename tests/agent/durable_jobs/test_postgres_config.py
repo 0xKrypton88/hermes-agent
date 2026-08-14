@@ -430,7 +430,9 @@ def test_dispatch_remains_hard_disabled_for_postgresql_config(monkeypatch):
     The fixture uses a non-live redacted DSN on purpose. Connecting would hang
     on some platforms (Windows TCP timeout). Fail closed with zero I/O.
     """
+    import sys
     import time
+    import types
 
     from agent.durable_jobs import backend as dj_backend
     from agent.durable_jobs.config import load_durable_jobs_config
@@ -457,7 +459,12 @@ def test_dispatch_remains_hard_disabled_for_postgresql_config(monkeypatch):
     monkeypatch.setattr(
         PostgresDurableJobStore, "create_job", _record("PostgresDurableJobStore.create_job")
     )
-    monkeypatch.setattr("psycopg.connect", _record("psycopg.connect"))
+    # Standard CI intentionally omits the opt-in PostgreSQL extra. Install a
+    # sentinel module so this fail-closed test can prove that connect is never
+    # reached without making psycopg a dev dependency.
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = _record("psycopg.connect")
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
 
     class SentinelStore:
         def get_job(self, job_id: str):
