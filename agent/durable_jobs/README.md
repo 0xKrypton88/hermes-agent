@@ -76,9 +76,13 @@ Hermes `state.db`.
   config is fail-closed
 - Public `DurableLaneService` writers (`consume_inbound_action`,
   `bind_slack`, `deliver_slack_root`, `reconcile_cursor_create`,
-  `set_job_policy`, `record_decision`) verify persisted job
-  repository/workspace identity against `identity_binding` before the
-  first write, effect, or ACK. Platform wrappers are defense-in-depth.
+  `set_job_policy`, `record_decision`) verify repository identity and a
+  present, readable persisted Slack workspace binding equal to
+  `identity_binding.workspace_id` before the first write, effect, or ACK.
+  `bind_slack` is the sole bootstrap: it may create the initial binding
+  only when the caller workspace is non-empty and matches configured
+  authority. Missing/unreadable binding rows fail closed. Platform
+  wrappers are defense-in-depth.
 - `dispatch_allowed` is True only for complete SQLite + both modes
   `injected` + secret *references* (env var names) + policy/identity.
   PostgreSQL lane storage cannot set the flag. `attempt_dispatch` still

@@ -227,19 +227,21 @@ class DurableLaneService:
     def _persisted_workspace_id(
         self, store: DurableJobStore, job_id: str
     ) -> Optional[str]:
+        """Return the bound workspace id, or None when no binding row exists.
+
+        Schema/read failures propagate as ``sqlite3.OperationalError`` so
+        callers can fail closed instead of treating an unreadable table as
+        an unbound bootstrap.
+        """
         with store._connect() as conn:
-            try:
-                row = conn.execute(
-                    "SELECT workspace_id FROM slack_job_bindings WHERE job_id = ?",
-                    (job_id,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                return None
+            row = conn.execute(
+                "SELECT workspace_id FROM slack_job_bindings WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
         if row is None:
             return None
         value = row["workspace_id"] if isinstance(row, sqlite3.Row) else row[0]
-        text = str(value or "").strip()
-        return text or None
+        return str(value or "").strip()
 
     def _identity_rejected(
         self,
@@ -247,6 +249,7 @@ class DurableLaneService:
         job_id: str,
         *,
         workspace_id: Optional[str] = None,
+        allow_missing_workspace: bool = False,
     ) -> bool:
         if self._repository_identity_rejected(store, job_id):
             return True
@@ -258,8 +261,13 @@ class DurableLaneService:
             return True
         if workspace_id is not None and str(workspace_id).strip() != expected_ws:
             return True
-        persisted = self._persisted_workspace_id(store, job_id)
-        if persisted is not None and persisted != expected_ws:
+        try:
+            persisted = self._persisted_workspace_id(store, job_id)
+        except sqlite3.OperationalError:
+            return True
+        if persisted is None:
+            return not allow_missing_workspace
+        if persisted != expected_ws:
             return True
         return False
 
@@ -277,9 +285,15 @@ class DurableLaneService:
         job_id: str,
         *,
         workspace_id: Optional[str] = None,
+        allow_missing_workspace: bool = False,
     ) -> DurableJobStore:
         store = self._checkout_for_mutation()
-        if self._identity_rejected(store, job_id, workspace_id=workspace_id):
+        if self._identity_rejected(
+            store,
+            job_id,
+            workspace_id=workspace_id,
+            allow_missing_workspace=allow_missing_workspace,
+        ):
             raise LaneIdentityRejected(
                 "durable lane rejected unbound repository/workspace identity"
             )
@@ -300,7 +314,9 @@ class DurableLaneService:
         candidate_version: str,
     ) -> SlackJobBinding:
         store = self._acquire_authorized_mutation(
-            job_id, workspace_id=workspace_id
+            job_id,
+            workspace_id=workspace_id,
+            allow_missing_workspace=True,
         )
         with self._mutation_lease():
             return SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
