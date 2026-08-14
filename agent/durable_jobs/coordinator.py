@@ -607,7 +607,12 @@ def _consume_inbound_action_persist(
 
     try:
         ack_port.ack(inbound_id=inbound_id, job_id=persisted["job_id"])
-    except Exception:
+    except Exception as exc:
+        # Lazy import: lane.py imports this module at load time.
+        from agent.durable_jobs.lane import LaneClosedError
+
+        if isinstance(exc, LaneClosedError):
+            raise
         return InboundActionResult(
             ok=True,
             ack_status="pending",
