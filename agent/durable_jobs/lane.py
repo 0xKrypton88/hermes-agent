@@ -40,7 +40,9 @@ it cannot deadlock with coordinator/SQLite.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import sys
 import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional, Sequence
@@ -69,6 +71,8 @@ from agent.durable_jobs.slack_contract import (
     resolve_provider_origin,
 )
 from agent.durable_jobs.store import DurableJobStore
+
+logger = logging.getLogger(__name__)
 
 
 class LaneClosedError(RuntimeError):
@@ -177,7 +181,17 @@ class DurableLaneService:
             self._close_idle.notify_all()
             idle_closed = self._closed and self._active_leases == 0
         if idle_closed:
-            self._after_idle_closed()
+            primary = sys.exc_info()[1]
+            try:
+                self._after_idle_closed()
+            except Exception:
+                if primary is not None:
+                    logger.debug(
+                        "durable lane idle-closed cleanup failed during unwind",
+                        exc_info=True,
+                    )
+                else:
+                    raise
 
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:
