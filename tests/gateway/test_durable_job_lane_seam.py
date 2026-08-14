@@ -59,7 +59,12 @@ def _count_rows(sqlite_path: Path, table: str) -> int:
         conn.close()
 
 
-def _seed_bound_job(handle, *, idempotency_key: str = "idem-seed"):
+def _seed_bound_job(
+    handle,
+    *,
+    idempotency_key: str = "idem-seed",
+    repository_identity: str = "github.com/example/repo",
+):
     from agent.durable_jobs.decisions import DecisionLedger
     from agent.durable_jobs.slack_contract import SlackBindingLedger
 
@@ -69,7 +74,7 @@ def _seed_bound_job(handle, *, idempotency_key: str = "idem-seed"):
         origin_chat_id="C123",
         origin_root_thread_id="111.222",
         objective="ingress",
-        repository_identity="github.com/example/repo",
+        repository_identity=repository_identity,
         idempotency_key=idempotency_key,
     )
     SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
@@ -670,6 +675,48 @@ def test_consume_after_shutdown_is_retryable_without_durable_write(tmp_path):
     assert result is not None
     assert result.ok is False
     assert result.retryable is True
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 0
+    assert _count_rows(store.sqlite_path, "job_decisions") == 0
+
+
+def test_cross_repo_slack_decision_is_rejected_with_zero_durable_writes(tmp_path):
+    from gateway.durable_job_lane import (
+        attach_durable_job_lane,
+        consume_slack_action_if_active,
+    )
+
+    handle = attach_durable_job_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    )
+    assert handle is not None
+    assert handle.config.identity_binding is not None
+    assert (
+        handle.config.identity_binding.repository_identity
+        == "github.com/example/repo"
+    )
+    job, store = _seed_bound_job(
+        handle,
+        idempotency_key="idem-cross-repo",
+        repository_identity="github.com/evil/other",
+    )
+    assert job.repository_identity == "github.com/evil/other"
+    result = consume_slack_action_if_active(
+        _verified_body(),
+        _action(
+            "hermes_durable_go",
+            {
+                "job_id": job.job_id,
+                "decision_idempotency_key": "dec-cross-repo",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert result is not None
+    assert result.ok is False
+    assert result.ack_status == "rejected"
+    assert getattr(result, "retryable", False) is False
     assert _count_rows(store.sqlite_path, "job_inbound_actions") == 0
     assert _count_rows(store.sqlite_path, "job_decisions") == 0
 

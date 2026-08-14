@@ -338,6 +338,66 @@ def test_preflight_runtime_ready_requires_injected_transport_capability(
     assert "transport_capability_missing" in cursor_only.reasons
 
 
+def test_preflight_runtime_ready_requires_transport_secret_ref_binding(
+    tmp_path, monkeypatch
+):
+    """Config env values must not make runtime_ready if transport refs differ."""
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    raw = _complete_sqlite(tmp_path)
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    monkeypatch.delenv("ACTUAL_CURSOR_REF_MISSING", raising=False)
+    monkeypatch.delenv("ACTUAL_SLACK_REF_MISSING", raising=False)
+
+    def _idle(**_k):
+        raise AssertionError("preflight/transport must not call the network")
+
+    mismatched = preflight_durable_jobs(
+        raw,
+        cursor_transport=CursorCloudInjectedTransport(
+            request=_idle, secret_ref="ACTUAL_CURSOR_REF_MISSING"
+        ),
+        slack_transport=SlackInjectedTransport(
+            request=_idle, secret_ref="ACTUAL_SLACK_REF_MISSING"
+        ),
+    )
+    assert mismatched.constructible is True
+    assert mismatched.runtime_ready is False
+    assert "transport_secret_ref_mismatch" in mismatched.reasons
+    dumped = str(mismatched)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "supersecret" not in dumped
+
+    other_cursor = "cursor-unbound-dummy-value"
+    other_slack = "xoxb-unbound-dummy-token"
+    monkeypatch.setenv("ACTUAL_CURSOR_REF_MISSING", other_cursor)
+    monkeypatch.setenv("ACTUAL_SLACK_REF_MISSING", other_slack)
+    still_unbound = preflight_durable_jobs(
+        raw,
+        cursor_transport=CursorCloudInjectedTransport(
+            request=_idle, secret_ref="ACTUAL_CURSOR_REF_MISSING"
+        ),
+        slack_transport=SlackInjectedTransport(
+            request=_idle, secret_ref="ACTUAL_SLACK_REF_MISSING"
+        ),
+    )
+    assert still_unbound.runtime_ready is False
+    assert "transport_secret_ref_mismatch" in still_unbound.reasons
+    dumped = str(still_unbound)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert other_cursor not in dumped
+    assert other_slack not in dumped
+    assert "xoxb-" not in dumped
+
+
 def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):
     import types
 

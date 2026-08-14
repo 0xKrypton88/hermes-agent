@@ -97,6 +97,44 @@ def _injected_transport_capability(
     return True
 
 
+def _transport_secret_ref(transport: Any) -> Optional[str]:
+    if transport is None:
+        return None
+    raw = getattr(transport, "secret_ref", None)
+    if callable(raw):
+        raw = None
+    if raw is None:
+        raw = getattr(transport, "_secret_ref", None)
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    return text or None
+
+
+def _injected_secret_ref_binding_reason(
+    cfg: DurableJobsConfig,
+    cursor_transport: Any,
+    slack_transport: Any,
+) -> Optional[str]:
+    """Fail-closed reason when an injected transport is not bound to config refs.
+
+    Reasons never include secret values or raw tokens.
+    """
+    if cfg.cursor_adapter_mode == ADAPTER_MODE_INJECTED:
+        declared = _transport_secret_ref(cursor_transport)
+        if declared is None or declared != cfg.cursor_secret_ref:
+            return "transport_secret_ref_mismatch"
+        if not _secret_ref_present(declared):
+            return "secret_refs_missing"
+    if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
+        declared = _transport_secret_ref(slack_transport)
+        if declared is None or declared != cfg.slack_secret_ref:
+            return "transport_secret_ref_mismatch"
+        if not _secret_ref_present(declared):
+            return "secret_refs_missing"
+    return None
+
+
 def preflight_durable_jobs(
     raw: Mapping[str, Any] | None,
     *,
@@ -160,9 +198,24 @@ def preflight_durable_jobs(
     transport_capability = _injected_transport_capability(
         cfg, cursor_transport, slack_transport
     )
+    binding_reason = (
+        _injected_secret_ref_binding_reason(
+            cfg, cursor_transport, slack_transport
+        )
+        if transport_capability
+        else None
+    )
     if constructible and secret_refs_present and not transport_capability:
         reasons.append("transport_capability_missing")
-    runtime_ready = constructible and secret_refs_present and transport_capability
+    if constructible and transport_capability and binding_reason:
+        if binding_reason not in reasons:
+            reasons.append(binding_reason)
+    runtime_ready = (
+        constructible
+        and secret_refs_present
+        and transport_capability
+        and binding_reason is None
+    )
     return DurableJobsPreflight(
         constructible=constructible,
         dispatch_allowed=bool(cfg.dispatch_allowed and constructible),

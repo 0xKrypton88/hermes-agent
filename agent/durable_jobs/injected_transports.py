@@ -50,6 +50,10 @@ class CursorCloudInjectedTransport:
         self._request = request
         self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
 
+    @property
+    def secret_ref(self) -> str:
+        return self._secret_ref
+
     def create(
         self, *, idempotency_key: str, job_id: str, name: str, agent_id: str
     ) -> Any:
@@ -104,6 +108,10 @@ class SlackInjectedTransport:
             )
         self._request = request
         self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
+
+    @property
+    def secret_ref(self) -> str:
+        return self._secret_ref
 
     def post_root(
         self,
