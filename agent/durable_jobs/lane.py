@@ -505,7 +505,7 @@ class DurableLaneService:
         self._before_mutation_lease()
         try:
             with self._mutation_lease():
-                return consume_durable_inbound_action(
+                result = consume_durable_inbound_action(
                     store.sqlite_path,
                     ack_port,
                     job_id=job_id,
@@ -519,6 +519,16 @@ class DurableLaneService:
                     candidate_id=candidate_id,
                     candidate_version=candidate_version,
                 )
+                with self._lifecycle:
+                    # Holder close/shutdown already dropped the store.
+                    # A concurrent closer still waiting has _closed True but
+                    # keeps the store until this lease releases (winner ACK).
+                    shutdown_completed = self._closed and self._store is None
+                if shutdown_completed:
+                    return InboundActionResult(
+                        ok=False, ack_status="pending", retryable=True
+                    )
+                return result
         except LaneClosedError:
             return InboundActionResult(
                 ok=False, ack_status="pending", retryable=True
