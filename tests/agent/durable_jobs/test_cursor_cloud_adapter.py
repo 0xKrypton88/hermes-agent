@@ -97,9 +97,9 @@ class MemoryCursorTransport:
                 return self.lookups
             return list(self.lookups)
 
-    def status(self, *, run_id: str) -> Any:
+    def status(self, *, run_id: str, agent_id: str = "") -> Any:
         with self._lock:
-            self.status_calls.append(run_id)
+            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
             if isinstance(self.status_payload, BaseException):
                 raise self.status_payload
             return self.status_payload
@@ -160,7 +160,7 @@ class _FakeTransport:
     def lookup(self, *, idempotency_key: str):
         raise AssertionError("transport must not be called in isolation test")
 
-    def status(self, *, run_id: str):
+    def status(self, *, run_id: str, agent_id: str = ""):
         raise AssertionError("transport must not be called in isolation test")
 
 
@@ -771,9 +771,9 @@ class OfficialNameMarkerTransport:
             assert all("idempotency_key" not in item for item in envelope["agents"])
             return envelope
 
-    def status(self, *, run_id: str) -> Any:
+    def status(self, *, run_id: str, agent_id: str = "") -> Any:
         with self._lock:
-            self.status_calls.append(run_id)
+            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
             for agent in self._agents:
                 if agent.get("id") == run_id:
                     return dict(agent)
@@ -954,12 +954,22 @@ class OfficialV1GeneratedNameTransport:
             assert all("prompt" not in item for item in envelope["items"])
             return envelope
 
-    def status(self, *, run_id: str) -> Any:
+    def status(self, *, run_id: str, agent_id: str = "") -> Any:
         with self._lock:
-            self.status_calls.append(run_id)
+            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
             for item in self._items:
-                if item.get("id") == run_id:
-                    return dict(item)
+                latest = item.get("latestRunId")
+                if latest != run_id:
+                    continue
+                if agent_id and str(item.get("id") or "").lower() != agent_id.lower():
+                    continue
+                return {
+                    "id": latest,
+                    "agentId": item.get("id"),
+                    "status": "RUNNING",
+                    "createdAt": item.get("createdAt"),
+                    "updatedAt": item.get("updatedAt"),
+                }
             return None
 
 
@@ -1020,10 +1030,11 @@ def test_v1_items_generated_name_lost_create_adopts_client_agent_id(tmp_path):
         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
         sent,
     )
-    assert claim.provider_run_id == sent
-    assert claim.provider_run_id != "run-00000000-0000-0000-0000-000000000099"
+    latest_run = "run-00000000-0000-0000-0000-000000000099"
+    assert claim.provider_run_id == latest_run
+    assert claim.provider_run_id != sent
     assert claim.provider_idempotency_key == key
-    assert ledger.get_mapping(job.job_id).provider_run_id == sent
+    assert ledger.get_mapping(job.job_id).provider_run_id == latest_run
     assert len(transport.create_calls) == 1
     assert transport.create_calls[0]["idempotency_key"] == key
     assert transport.lookup_calls == [key]
@@ -1041,8 +1052,9 @@ def test_v1_items_generated_name_lost_create_adopts_client_agent_id(tmp_path):
     assert 23 <= len(created_item["name"]) <= 33
 
     looked = adapter.lookup_runs(idempotency_key=key)
-    assert [run.run_id for run in looked] == [sent]
+    assert [run.run_id for run in looked] == [latest_run]
     assert all(run.idempotency_key == key for run in looked)
+    assert all(run.agent_id == sent for run in looked)
 
     second = reconcile_cursor_create(
         ledger,
@@ -1052,7 +1064,7 @@ def test_v1_items_generated_name_lost_create_adopts_client_agent_id(tmp_path):
         **_origin_kwargs(job),
     )
     assert second.status is EffectStatus.ADOPTED
-    assert second.provider_run_id == sent
+    assert second.provider_run_id == latest_run
     assert len(transport.create_calls) == 1
 
 
@@ -1173,20 +1185,21 @@ def test_typed_sdk_derived_id_adopts_and_matches_raw_dict(tmp_path):
     ):
         raw_parsed = parse_lookup_runs([raw], expected_key=key)
         typed_parsed = parse_lookup_runs([typed], expected_key=key)
-        assert [(r.run_id, r.idempotency_key) for r in raw_parsed] == [
-            (r.run_id, r.idempotency_key) for r in typed_parsed
-        ]
+        assert [
+            (r.run_id, r.idempotency_key, r.agent_id) for r in raw_parsed
+        ] == [(r.run_id, r.idempotency_key, r.agent_id) for r in typed_parsed]
     assert [
-        (r.run_id, r.idempotency_key)
+        (r.run_id, r.idempotency_key, r.agent_id)
         for r in parse_lookup_runs([typed_exact], expected_key=key)
-    ] == [(derived, key)]
+    ] == [(latest_run, key, derived)]
     assert parse_lookup_runs([typed_foreign], expected_key=key) == []
     assert parse_lookup_runs([typed_latest_trap], expected_key=key) == []
     mixed = parse_lookup_runs(
         [typed_foreign, typed_exact, typed_latest_trap], expected_key=key
     )
-    assert [r.run_id for r in mixed] == [derived]
+    assert [r.run_id for r in mixed] == [latest_run]
     assert all(r.idempotency_key == key for r in mixed)
+    assert all(r.agent_id == derived for r in mixed)
 
     transport = MemoryCursorTransport(
         create_payload={"kind": "lost_response"},
@@ -1201,8 +1214,8 @@ def test_typed_sdk_derived_id_adopts_and_matches_raw_dict(tmp_path):
         **_origin_kwargs(job),
     )
     assert claim.status is EffectStatus.ADOPTED
-    assert claim.provider_run_id == derived
-    assert claim.provider_run_id != latest_run
+    assert claim.provider_run_id == latest_run
+    assert claim.provider_run_id != derived
     assert claim.provider_idempotency_key == key
     assert len(transport.create_calls) == 1
     second = reconcile_cursor_create(
@@ -1213,5 +1226,206 @@ def test_typed_sdk_derived_id_adopts_and_matches_raw_dict(tmp_path):
         **_origin_kwargs(job),
     )
     assert second.status is EffectStatus.ADOPTED
-    assert second.provider_run_id == derived
+    assert second.provider_run_id == latest_run
+    assert len(transport.create_calls) == 1
+
+
+@dataclass
+class V1DistinctAgentRunTransport(OfficialV1GeneratedNameTransport):
+    """v1 create/list plus GET /agents/{agent_id}/runs/{run_id} recording."""
+
+    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+        with self._lock:
+            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
+            for item in self._items:
+                latest = item.get("latestRunId")
+                if latest != run_id:
+                    continue
+                if agent_id and str(item.get("id") or "").lower() != agent_id.lower():
+                    continue
+                return {
+                    "id": latest,
+                    "agentId": item.get("id"),
+                    "status": "RUNNING",
+                    "createdAt": item.get("createdAt"),
+                    "updatedAt": item.get("updatedAt"),
+                }
+            return None
+
+
+def test_v1_lost_create_persists_run_id_not_agent_id_for_status(tmp_path):
+    """v1 agent id correlates; persisted provider_run_id is the run id.
+
+    Live GET /v1/agents/{agent_id}/runs/{run_id} needs both. On e46384c the
+    adapter persists the deterministic agent id as provider_run_id and then
+    calls status with that agent id as the run id.
+    """
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    latest_run = "run-00000000-0000-0000-0000-000000000099"
+    transport = V1DistinctAgentRunTransport(
+        generated_name="ENG-26 disposable sandbox",
+        extra_items=[
+            _official_v1_list_item(
+                agent_id="bc-99999999-9999-4999-8999-999999999999",
+                name="Investigate flaky CI tests",
+            ),
+            _official_v1_list_item(
+                agent_id="bc-88888888-8888-4888-8888-888888888888",
+                name=f"leftover {key} sandbox",
+                latest_run_id="run-11111111-1111-4111-8111-111111111111",
+            ),
+        ],
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    kwargs = dict(job_id=job.job_id, action_id="create_run", **_origin_kwargs(job))
+    claim = reconcile_cursor_create(ledger, adapter, **kwargs)
+    assert claim.status is EffectStatus.ADOPTED
+    sent_agent = transport.create_calls[0]["agent_id"]
+    assert sent_agent
+    assert claim.provider_run_id == latest_run
+    assert claim.provider_run_id != sent_agent
+    assert ledger.get_mapping(job.job_id).provider_run_id == latest_run
+    assert len(transport.create_calls) == 1
+
+    looked = adapter.lookup_runs(idempotency_key=key)
+    assert [run.run_id for run in looked] == [latest_run]
+    assert all(getattr(run, "agent_id", sent_agent) == sent_agent for run in looked)
+
+    second = reconcile_cursor_create(ledger, adapter, **kwargs)
+    assert second.status is EffectStatus.ADOPTED
+    assert second.provider_run_id == latest_run
+    assert len(transport.create_calls) == 1
+
+    reopened = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    persisted = reopened.get_claim(job.job_id, "create_run")
+    assert persisted is not None
+    assert persisted.status is EffectStatus.ADOPTED
+    assert persisted.provider_run_id == latest_run
+    assert reopened.get_mapping(job.job_id).provider_run_id == latest_run
+
+    restarted = CursorCloudAdapter(transport=transport)
+    observed = restarted.reconcile_status(
+        reopened, job_id=job.job_id, action_id="create_run"
+    )
+    assert observed.ok is True
+    assert observed.claim.provider_run_id == latest_run
+    assert transport.status_calls[-1]["run_id"] == latest_run
+    assert transport.status_calls[-1]["agent_id"] == sent_agent
+    assert transport.status_calls[-1]["run_id"] != sent_agent
+
+
+def test_v1_matching_agent_without_distinct_run_id_is_not_adoptable(tmp_path):
+    """v1 client agent id without a distinct run id must not be stored as the run."""
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        cursor_correlation_agent_id,
+        parse_lookup_runs,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    derived = cursor_correlation_agent_id(key)
+    item = {
+        "id": derived,
+        "name": "ENG-26 disposable sandbox",
+        "status": "ACTIVE",
+        "env": {"type": "cloud"},
+        "url": f"https://cursor.com/agents/{derived}",
+        "createdAt": "2026-08-13T20:00:00.000Z",
+        "updatedAt": "2026-08-13T20:00:00.000Z",
+    }
+    assert "latestRunId" not in item
+    assert parse_lookup_runs({"items": [item]}, expected_key=key) == []
+
+    transport = MemoryCursorTransport(
+        create_payload={"kind": "lost_response"},
+        lookups={"items": [item], "nextCursor": "bc-ffffffff-ffff-4fff-8fff-ffffffffffff"},
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is not EffectStatus.ADOPTED
+    assert claim.status is EffectStatus.RECOVERING
+    assert claim.provider_run_id is None
+    assert claim.provider_run_id != derived
+    assert len(transport.create_calls) == 1
+    second = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert second.status is EffectStatus.RECOVERING
+    assert len(transport.create_calls) == 1
+
+
+def test_v1_duplicate_exact_matches_fail_closed_without_redispatch(tmp_path):
+    """Two exact v1 agent+run matches are ambiguous; create is not retried."""
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        cursor_correlation_agent_id,
+    )
+    from agent.durable_jobs.effects import (
+        EffectStatus,
+        ProviderEffectLedger,
+        UnknownReason,
+        provider_idempotency_key,
+        reconcile_cursor_create,
+    )
+
+    store, job = _make_job(tmp_path)
+    ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+    key = provider_idempotency_key(job.job_id, "create_run")
+    derived = cursor_correlation_agent_id(key)
+    item = _official_v1_list_item(
+        agent_id=derived,
+        name="ENG-26 disposable sandbox",
+        latest_run_id="run-00000000-0000-0000-0000-000000000099",
+    )
+    transport = MemoryCursorTransport(
+        create_payload={"kind": "lost_response"},
+        lookups={"items": [dict(item), dict(item)]},
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+    claim = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert claim.status is EffectStatus.UNKNOWN
+    assert claim.unknown_reason == UnknownReason.PROVIDER_AMBIGUOUS.value
+    assert claim.provider_run_id is None
+    second = reconcile_cursor_create(
+        ledger,
+        adapter,
+        job_id=job.job_id,
+        action_id="create_run",
+        **_origin_kwargs(job),
+    )
+    assert second.status is EffectStatus.UNKNOWN
     assert len(transport.create_calls) == 1

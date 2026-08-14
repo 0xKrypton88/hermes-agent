@@ -49,6 +49,7 @@ class CursorRun:
     run_id: str
     idempotency_key: str
     state: CursorRunState = CursorRunState.UNKNOWN
+    agent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,7 @@ class CursorCloudTransport(Protocol):
 
     def lookup(self, *, idempotency_key: str) -> Sequence[Any]: ...
 
-    def status(self, *, run_id: str) -> Any: ...
+    def status(self, *, run_id: str, agent_id: str) -> Any: ...
 
 
 # v0/v1 Cloud Agents ``name`` max is 100. Ledger keys must fit exactly; never truncate.
@@ -266,10 +267,50 @@ def _record_id(raw: Any) -> str:
     return ""
 
 
+def _cursor_agent_id(raw: Any) -> str:
+    """Durable Cloud Agent id (``bc-…``), never ``latestRunId``."""
+    nested = _record_get(raw, "agent")
+    if _is_mapping_like(nested):
+        aid = _record_get(nested, "id")
+        if isinstance(aid, str) and aid.strip():
+            return aid.strip()
+    for key in ("agentId", "agent_id"):
+        aid = _record_get(raw, key)
+        if isinstance(aid, str) and aid.strip():
+            return aid.strip()
+    rid = _record_get(raw, "id")
+    if isinstance(rid, str) and rid.strip() and _CURSOR_AGENT_ID_RE.match(rid.strip()):
+        return rid.strip()
+    return ""
+
+
+def _cursor_run_id(raw: Any) -> str:
+    """Cursor run id for GET /v1/agents/{agent_id}/runs/{run_id}."""
+    inner = _record_get(raw, "run")
+    if _is_mapping_like(inner):
+        rid = _record_get(inner, "id") or _record_get(inner, "run_id")
+        if isinstance(rid, str) and rid.strip():
+            return rid.strip()
+    latest = _record_get(raw, "latestRunId") or _record_get(raw, "latest_run_id")
+    if isinstance(latest, str) and latest.strip():
+        return latest.strip()
+    explicit = _record_get(raw, "run_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    rid = _record_get(raw, "id")
+    if isinstance(rid, str) and rid.strip() and not _CURSOR_AGENT_ID_RE.match(rid.strip()):
+        return rid.strip()
+    return ""
+
+
+def _is_v1_client_agent_id(value: str) -> bool:
+    return bool(value) and bool(_CURSOR_CLIENT_AGENT_ID_RE.fullmatch(value))
+
+
 def _matches_derived_agent_id(raw: Any, *, expected_key: str) -> bool:
     if not expected_key:
         return False
-    record_id = _record_id(raw)
+    record_id = _cursor_agent_id(raw)
     if not record_id:
         return False
     try:
@@ -313,7 +354,14 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
         return None
     if isinstance(raw, CursorRun):
         return raw
-    run_id = _record_id(raw)
+    agent_id = _cursor_agent_id(raw)
+    run_id = _cursor_run_id(raw)
+    if _is_v1_client_agent_id(agent_id):
+        if not run_id or run_id.lower() == agent_id.lower():
+            # v1 agent identity is not a run id; refuse agent-as-run confusion.
+            return None
+    elif not run_id:
+        run_id = agent_id or _record_id(raw)
     if not run_id:
         return None
     key = _correlation_for_record(raw, fallback_key=fallback_key)
@@ -322,6 +370,7 @@ def _parse_run(raw: Any, *, fallback_key: str = "") -> Optional[CursorRun]:
         run_id=run_id,
         idempotency_key=str(key or ""),
         state=_parse_run_state(state),
+        agent_id=agent_id,
     )
 
 
@@ -448,6 +497,7 @@ def _fail_closed_create(
                 run_id=result.run.run_id,
                 idempotency_key=expected_key,
                 state=result.run.state,
+                agent_id=result.run.agent_id,
             )
             return CursorCreateResult(
                 kind=CursorCreateKind.ACCEPTED,
@@ -482,17 +532,15 @@ def _accepted_from_official_create(
         record
     ):
         return None
-    parsed = _parse_run(record, fallback_key=expected_key)
-    if parsed is None or not parsed.run_id:
-        inner = raw.get("run") if isinstance(raw.get("run"), dict) else None
-        if inner is None:
-            return None
-        agent_id = inner.get("agentId") or record.get("id")
-        if not agent_id:
-            return None
+    inner = raw.get("run") if isinstance(raw.get("run"), dict) else None
+    if inner is not None:
         merged = dict(record)
-        merged["id"] = agent_id
-        parsed = _parse_run(merged, fallback_key=expected_key)
+        if inner.get("id") and not merged.get("latestRunId"):
+            merged["latestRunId"] = inner["id"]
+        if inner.get("agentId") and not merged.get("id"):
+            merged["id"] = inner["agentId"]
+        record = merged
+    parsed = _parse_run(record, fallback_key=expected_key)
     if parsed is None or not parsed.run_id:
         return None
     return CursorCreateResult(kind=CursorCreateKind.ACCEPTED, run=parsed)
@@ -546,15 +594,17 @@ class CursorCloudAdapter:
             return _fail_closed_lookup_error(idempotency_key, exc)
         return parse_lookup_runs(raw, expected_key=idempotency_key)
 
-    def status_run(self, *, run_id: str) -> CursorStatusResult:
+    def status_run(self, *, run_id: str, agent_id: str = "") -> CursorStatusResult:
         try:
-            raw = self._transport.status(run_id=run_id)
+            raw = self._transport.status(run_id=run_id, agent_id=agent_id)
         except Exception as exc:
             return CursorStatusResult(
                 kind=CursorStatusKind.UNKNOWN,
                 error=redact_provider_error(exc),
             )
-        return normalize_status_result(raw, expected_run_id=run_id)
+        return normalize_status_result(
+            raw, expected_run_id=run_id, expected_agent_id=agent_id or None
+        )
 
     def reconcile_create(self, ledger: Any, **kwargs: Any) -> Any:
         from agent.durable_jobs.effects import reconcile_cursor_create
@@ -581,7 +631,17 @@ class CursorCloudAdapter:
         ):
             observation: Optional[CursorStatusResult] = None
             if claim.provider_run_id:
-                observation = self.status_run(run_id=claim.provider_run_id)
+                status_agent_id = ""
+                claim_key = getattr(claim, "provider_idempotency_key", "") or ""
+                if claim_key:
+                    try:
+                        status_agent_id = cursor_correlation_agent_id(claim_key)
+                    except ValueError:
+                        status_agent_id = ""
+                observation = self.status_run(
+                    run_id=claim.provider_run_id,
+                    agent_id=status_agent_id,
+                )
             ok = _status_observation_confirms_claim(claim, observation)
             return CursorStatusReconcileResult(
                 claim=claim, observation=observation, ok=ok
@@ -640,10 +700,17 @@ def classify_lookup(
 
 
 def normalize_status_result(
-    raw: Any, *, expected_run_id: Optional[str] = None
+    raw: Any,
+    *,
+    expected_run_id: Optional[str] = None,
+    expected_agent_id: Optional[str] = None,
 ) -> CursorStatusResult:
     if isinstance(raw, CursorStatusResult):
-        return _fail_closed_status(raw, expected_run_id=expected_run_id)
+        return _fail_closed_status(
+            raw,
+            expected_run_id=expected_run_id,
+            expected_agent_id=expected_agent_id,
+        )
     if raw is None:
         return CursorStatusResult(kind=CursorStatusKind.UNKNOWN)
     if isinstance(raw, (list, tuple)):
@@ -656,22 +723,53 @@ def normalize_status_result(
                     kind=CursorStatusKind.AMBIGUOUS, candidates=tuple(runs)
                 ),
                 expected_run_id=expected_run_id,
+                expected_agent_id=expected_agent_id,
             )
-        return _status_from_known_run(runs[0], expected_run_id=expected_run_id)
+        return _status_from_known_run(
+            runs[0],
+            expected_run_id=expected_run_id,
+            expected_agent_id=expected_agent_id,
+        )
     run = _parse_run(raw, fallback_key="")
     if run is None:
         return CursorStatusResult(kind=CursorStatusKind.UNKNOWN)
-    return _status_from_known_run(run, expected_run_id=expected_run_id)
+    return _status_from_known_run(
+        run,
+        expected_run_id=expected_run_id,
+        expected_agent_id=expected_agent_id,
+    )
 
 
 def _fail_closed_status(
-    result: CursorStatusResult, *, expected_run_id: Optional[str]
+    result: CursorStatusResult,
+    *,
+    expected_run_id: Optional[str],
+    expected_agent_id: Optional[str] = None,
 ) -> CursorStatusResult:
-    if not expected_run_id:
+    if not expected_run_id and not expected_agent_id:
         return result
     if result.kind is CursorStatusKind.UNIQUE:
         run = result.run
-        if run is None or run.run_id != expected_run_id:
+        if run is None:
+            return CursorStatusResult(
+                kind=CursorStatusKind.UNKNOWN,
+                run=run,
+                candidates=result.candidates,
+                error=result.error,
+            )
+        if expected_run_id and run.run_id != expected_run_id:
+            return CursorStatusResult(
+                kind=CursorStatusKind.UNKNOWN,
+                run=run,
+                candidates=result.candidates,
+                error=result.error,
+            )
+        if (
+            expected_agent_id
+            and run.agent_id
+            and _is_v1_client_agent_id(run.agent_id)
+            and run.agent_id.lower() != expected_agent_id.lower()
+        ):
             return CursorStatusResult(
                 kind=CursorStatusKind.UNKNOWN,
                 run=run,
@@ -691,13 +789,33 @@ def _status_observation_confirms_claim(
     run = observation.run
     if not bound or run is None:
         return False
-    return run.run_id == bound
+    if run.run_id != bound:
+        return False
+    if run.agent_id and _is_v1_client_agent_id(run.agent_id):
+        claim_key = getattr(claim, "provider_idempotency_key", "") or ""
+        try:
+            expected_agent = cursor_correlation_agent_id(claim_key) if claim_key else ""
+        except ValueError:
+            expected_agent = ""
+        if expected_agent and run.agent_id.lower() != expected_agent.lower():
+            return False
+    return True
 
 
 def _status_from_known_run(
-    run: CursorRun, *, expected_run_id: Optional[str] = None
+    run: CursorRun,
+    *,
+    expected_run_id: Optional[str] = None,
+    expected_agent_id: Optional[str] = None,
 ) -> CursorStatusResult:
     if expected_run_id and run.run_id != expected_run_id:
+        return CursorStatusResult(kind=CursorStatusKind.UNKNOWN, run=run)
+    if (
+        expected_agent_id
+        and run.agent_id
+        and _is_v1_client_agent_id(run.agent_id)
+        and run.agent_id.lower() != expected_agent_id.lower()
+    ):
         return CursorStatusResult(kind=CursorStatusKind.UNKNOWN, run=run)
     if run.state is CursorRunState.AMBIGUOUS:
         return CursorStatusResult(
