@@ -10,6 +10,7 @@ No live Slack/Cursor/network. Barriers use threading.Event, not sleeps.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -108,6 +109,37 @@ def _assert_no_reopen(lane):
     with pytest.raises(LaneClosedError):
         lane._require_sqlite_path()
     assert lane._store is None
+
+
+def _sqlite_data_version(path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return int(conn.execute("PRAGMA data_version").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _schema_meta_version(path) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM durable_jobs_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        return "" if row is None else str(row[0])
+    finally:
+        conn.close()
+
+
+def _force_schema_version(path, version: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE durable_jobs_meta SET value = ? WHERE key = 'schema_version'",
+            (version,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_A_close_before_admission_is_pending_zero_write(tmp_path):
@@ -607,6 +639,111 @@ def test_E2_close_immediately_before_lease_acquire(tmp_path):
         ack, **_inbound(job, decision_idempotency_key="dec-E2")
     )
     _assert_loser_consume(result, ack, store, lane)
+    _assert_no_reopen(lane)
+
+
+def test_reconcile_pre_lease_ledger_construction_does_not_write_after_close(
+    tmp_path,
+):
+    """Verified 3bd5ef09 gap: SlackBindingLedger.__init__ ran DurableJobStore
+    schema DDL after close() returned, then raised LaneClosedError.
+    """
+    from agent.durable_jobs.lane import LaneClosedError
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+    from tests.agent.durable_jobs.authz_fixtures import (
+        install_default_adapter_authorization,
+    )
+
+    lane, job, store = _seed(tmp_path, idempotency_key="idem-prelease-ledger")
+    install_default_adapter_authorization(store.sqlite_path, job.job_id)
+    path = store.sqlite_path
+    _force_schema_version(path, "1")
+    assert _schema_meta_version(path) == "1"
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    wrote_after_close = []
+    provider_after_close = []
+    real_init = SlackBindingLedger.__init__
+    armed = {"v": True}
+
+    class _Provider:
+        def create_run(self, *, idempotency_key: str, job_id: str):
+            if close_returned.is_set():
+                provider_after_close.append(True)
+            run = type(
+                "Run",
+                (),
+                {"run_id": "run-prelease", "idempotency_key": idempotency_key},
+            )()
+            return type(
+                "CreateResult",
+                (),
+                {"kind": "accepted", "run": run, "candidates": ()},
+            )()
+
+        def lookup_runs(self, *, idempotency_key: str):
+            if close_returned.is_set():
+                provider_after_close.append(True)
+            return []
+
+    def _init(self, *args, **kwargs):
+        if not armed["v"]:
+            return real_init(self, *args, **kwargs)
+        armed["v"] = False
+
+        def _closer():
+            close_entered.set()
+            lane.close()
+            close_returned.set()
+
+        threading.Thread(target=_closer, name="prelease-ledger-close").start()
+        assert close_entered.wait(timeout=5)
+        # Loser path (no lease): wait until close() has returned, then the
+        # real constructor is the write-after-close. Winner path (lease held):
+        # close waits for us — do not wait on close_returned (deadlock).
+        if getattr(lane, "_active_leases", 0) == 0:
+            assert close_returned.wait(timeout=5)
+        if close_returned.is_set():
+            data_before = _sqlite_data_version(path)
+            schema_before = _schema_meta_version(path)
+            real_init(self, *args, **kwargs)
+            if (
+                _sqlite_data_version(path) != data_before
+                or _schema_meta_version(path) != schema_before
+            ):
+                wrote_after_close.append(
+                    (
+                        data_before,
+                        _sqlite_data_version(path),
+                        schema_before,
+                        _schema_meta_version(path),
+                    )
+                )
+            return None
+        return real_init(self, *args, **kwargs)
+
+    SlackBindingLedger.__init__ = _init
+    try:
+        try:
+            lane.reconcile_cursor_create(
+                job_id=job.job_id,
+                action_id="create_run",
+                origin_platform="slack",
+                origin_chat_id="C123",
+                origin_root_thread_id="111.222",
+                candidate_id="cand-1",
+                candidate_version="v1",
+                provider=_Provider(),
+            )
+        except LaneClosedError:
+            pass
+    finally:
+        SlackBindingLedger.__init__ = real_init
+    assert close_returned.wait(timeout=5)
+    assert wrote_after_close == []
+    assert provider_after_close == []
+    assert lane._closed is True
+    assert lane._store is None
     _assert_no_reopen(lane)
 
 

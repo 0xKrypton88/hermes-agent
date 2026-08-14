@@ -15,11 +15,12 @@ event, decision, external effect, or ACK, and cannot reconstruct the
 store.
 
 A winner holds the lease through the first durable write and through ACK
-or external effect. ``close()`` waits for in-flight leases, then drops
-the store, then returns — so after ``close()`` returns, no winner remains
-in-flight. Already-committed winner work is left intact; a subsequent
-consume on the closed lane is a loser and must not ACK again or write a
-second decision.
+or external effect, including ledger/store constructors that run schema
+DDL. ``close()`` waits for in-flight leases, then drops the store, then
+returns — so after ``close()`` returns, no winner remains in-flight.
+Already-committed winner work is left intact; a subsequent consume on
+the closed lane is a loser and must not ACK again or write a second
+decision.
 
 Lock order: ``_lifecycle`` is never held across SQLite or adapter calls.
 ``close()`` waits on ``_close_idle`` (which releases ``_lifecycle``), so
@@ -147,8 +148,24 @@ class DurableLaneService:
                     "durable_jobs.sqlite_path must be set explicitly "
                     "(disposable / test path); refusing default Hermes state.db"
                 )
-            self._store = DurableJobStore(sqlite_path=self.config.sqlite_path)
-            return self._store
+            sqlite_path = self.config.sqlite_path
+        # DurableJobStore.__init__ runs schema DDL. That is a durable write, so
+        # it must not hold ``_lifecycle`` and must run under a mutation lease
+        # so close() cannot return until it finishes.
+        self._acquire_mutation_lease()
+        try:
+            with self._lifecycle:
+                if self._closed:
+                    raise LaneClosedError("durable lane is closed")
+                if self._store is not None:
+                    return self._store
+            store = DurableJobStore(sqlite_path=sqlite_path)
+            with self._lifecycle:
+                if self._store is None:
+                    self._store = store
+                return self._store
+        finally:
+            self._release_mutation_lease()
 
     def _repository_identity_rejected(
         self, store: DurableJobStore, job_id: str
@@ -222,30 +239,32 @@ class DurableLaneService:
         self._after_store_checkout()
         if self._closed:
             raise LaneClosedError("durable lane is closed")
-        binding = SlackBindingLedger(sqlite_path=store.sqlite_path).get_binding(job_id)
-        if binding is None:
-            raise BindingRequiredError(
-                f"Slack binding required before provider effect for {job_id}"
-            )
-        if (
-            binding.candidate_id != candidate_id
-            or binding.candidate_version != candidate_version
-        ):
-            raise BindingRequiredError(
-                f"provider effect candidate/version must match Slack binding for {job_id}"
-            )
-        origin_platform, origin_chat_id, origin_root_thread_id = (
-            resolve_provider_origin(
-                binding,
-                origin_platform=origin_platform,
-                origin_chat_id=origin_chat_id,
-                origin_root_thread_id=origin_root_thread_id,
-            )
-        )
-        if self._closed:
-            raise LaneClosedError("durable lane is closed")
         self._before_mutation_lease()
         with self._mutation_lease():
+            # SlackBindingLedger/ProviderEffectLedger construct DurableJobStore
+            # and run schema DDL. That is a durable write and must not race close.
+            binding = SlackBindingLedger(sqlite_path=store.sqlite_path).get_binding(
+                job_id
+            )
+            if binding is None:
+                raise BindingRequiredError(
+                    f"Slack binding required before provider effect for {job_id}"
+                )
+            if (
+                binding.candidate_id != candidate_id
+                or binding.candidate_version != candidate_version
+            ):
+                raise BindingRequiredError(
+                    f"provider effect candidate/version must match Slack binding for {job_id}"
+                )
+            origin_platform, origin_chat_id, origin_root_thread_id = (
+                resolve_provider_origin(
+                    binding,
+                    origin_platform=origin_platform,
+                    origin_chat_id=origin_chat_id,
+                    origin_root_thread_id=origin_root_thread_id,
+                )
+            )
             ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
             return reconcile_cursor_create(
                 ledger,
