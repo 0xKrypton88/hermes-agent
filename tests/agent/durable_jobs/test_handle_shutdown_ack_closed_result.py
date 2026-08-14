@@ -85,3 +85,49 @@ def test_handle_shutdown_inside_ack_must_not_return_accepted(tmp_path, monkeypat
     assert again.ok is False
     assert again.retryable is True
     assert replay.acks == []
+
+
+def test_ack_lane_closed_error_is_not_accepted_pending_while_store_remains(
+    tmp_path, monkeypatch
+):
+    """Joiner-shaped ACK: LaneClosedError before close() drops the store.
+
+    On 242fcdf0 the coordinator swallowed that into
+    ``ok=True, ack_status='pending', retryable=False`` because lane remap
+    only fires after ``_store is None``. A fenced holder must still be
+    ``ok=False`` / ``pending`` / ``retryable=True``.
+    """
+    from agent.durable_jobs.coordinator import consume_inbound_action
+    from agent.durable_jobs.lane import LaneClosedError
+
+    handle, job, store = _seed_handle(
+        tmp_path, monkeypatch, idempotency_key="idem-ack-joiner-fence"
+    )
+    events: list[str] = []
+
+    class AckJoinerFence:
+        def ack(self, *, inbound_id: str, job_id: str) -> str:
+            events.append("ack-enter")
+            raise LaneClosedError(
+                "durable job lane is retiring; active holder must fail closed"
+            )
+
+    inbound = _inbound(job, decision_idempotency_key="dec-ack-joiner-fence")
+    with pytest.raises(LaneClosedError):
+        consume_inbound_action(store.sqlite_path, AckJoinerFence(), **inbound)
+    assert events == ["ack-enter"]
+
+    events.clear()
+    result = handle.lane.consume_inbound_action(AckJoinerFence(), **inbound)
+    assert events == ["ack-enter"]
+    assert result.ok is False
+    assert result.ack_status == "pending"
+    assert result.retryable is True
+    assert handle.lane._store is not None
+    assert handle.lane._closed is False
+    replay = RecordingAckPort()
+    again = handle.lane.consume_inbound_action(
+        replay, **_inbound(job, decision_idempotency_key="dec-ack-joiner-replay")
+    )
+    assert again.ok is True
+    assert replay.acks
