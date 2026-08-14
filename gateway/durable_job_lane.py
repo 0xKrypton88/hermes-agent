@@ -12,6 +12,7 @@ import json
 import logging
 import sqlite3
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -44,6 +45,10 @@ _ACTION_TO_DECISION = {
 
 _LOCK = threading.Lock()
 _UNOWNED = 0
+# Keys are id(owner). The owner object is not stored here — id() cannot
+# recover it. Each published handle carries a weakref to its owner so the
+# public handle-based detach API can CAS-clear owner._durable_job_lane
+# only when that field still points at the exact retired handle.
 _LANES: dict[int, "DurableJobLaneHandle"] = {}
 _OWNER_OPLOCKS: dict[int, threading.Lock] = {}
 
@@ -121,11 +126,35 @@ def _owner_oplock(key: int) -> threading.Lock:
         return lock
 
 
+def _bind_handle_owner(handle: "DurableJobLaneHandle", owner: Any) -> None:
+    """Bind a weak owner ref so handle detach can CAS-clear the runner field."""
+    handle._owner_ref = weakref.ref(owner) if owner is not None else None
+
+
+def _owner_from_handle(handle: "DurableJobLaneHandle") -> Any:
+    ref = getattr(handle, "_owner_ref", None)
+    if ref is None:
+        return None
+    return ref()
+
+
+def _pop_handle_locked(handle: "DurableJobLaneHandle") -> bool:
+    """Remove ``handle`` from ``_LANES`` by identity. Caller holds ``_LOCK``."""
+    popped = False
+    for key, owned in list(_LANES.items()):
+        if owned is handle:
+            del _LANES[key]
+            popped = True
+    return popped
+
+
 def _publish_runner_field(
     owner: Any, handle: Optional["DurableJobLaneHandle"]
 ) -> None:
     if owner is None:
         return
+    if handle is not None:
+        _bind_handle_owner(handle, owner)
     try:
         owner._durable_job_lane = handle
     except Exception:
@@ -279,6 +308,7 @@ def attach_durable_job_lane(
                     "durable job lane is already attached for this owner"
                 )
             _LANES[key] = handle
+        _bind_handle_owner(handle, owner)
         _publish_runner_field(owner, handle)
         logger.info(
             "Durable job lane constructed (dispatch_allowed=%s, adapters=%s/%s)",
@@ -290,17 +320,40 @@ def attach_durable_job_lane(
 
 
 def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> None:
-    """Idempotent shutdown. No-arg clears every owned lane (tests)."""
-    with _LOCK:
-        if handle is None:
+    """Idempotent shutdown. No-arg clears every owned lane (tests).
+
+    Registry membership and ``owner._durable_job_lane`` stay consistent:
+    the runner field is CAS-cleared only when it still points at the
+    exact retired handle. Owner is recovered from the weakref bound at
+    publish time. Shutdown runs outside ``_LOCK`` and per-owner oplocks.
+    """
+    holder_closed: Optional[LaneClosedError] = None
+    if handle is None:
+        with _LOCK:
             victims = list(_LANES.items())
             _LANES.clear()
+            for _key, owned in victims:
+                _cas_clear_runner_field(_owner_from_handle(owned), owned)
+        to_close = [owned for _key, owned in victims]
+    else:
+        owner = _owner_from_handle(handle)
+        popped = False
+        if owner is not None:
+            oplock = _owner_oplock(_owner_key(owner))
+            with oplock:
+                with _LOCK:
+                    key = _owner_key(owner)
+                    if _LANES.get(key) is handle:
+                        _LANES.pop(key, None)
+                        popped = True
+                    else:
+                        popped = _pop_handle_locked(handle)
+                _cas_clear_runner_field(owner, handle)
         else:
-            victims = [(key, owned) for key, owned in _LANES.items() if owned is handle]
-            for key, _owned in victims:
-                del _LANES[key]
-    holder_closed: Optional[LaneClosedError] = None
-    for _key, owned in victims:
+            with _LOCK:
+                popped = _pop_handle_locked(handle)
+        to_close = [handle] if popped else []
+    for owned in to_close:
         try:
             owned.shutdown()
         except LaneClosedError as exc:
