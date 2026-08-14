@@ -16,16 +16,24 @@ store.
 
 A winner holds the lease through the first durable write and through ACK
 or external effect, including ledger/store constructors that run schema
-DDL. ``close()`` waits for in-flight leases, then drops the store, then
-returns — so after ``close()`` returns, no winner remains in-flight.
-Already-committed winner work is left intact; a subsequent consume on
-the closed lane is a loser and must not ACK again or write a second
-decision.
+DDL and child threads started in that interval (claim-lease heartbeat).
+``close()`` waits for in-flight leases held by *other* threads, then
+drops the store, then returns — so after ``close()`` returns, no
+non-owner remains able to write. Already-committed winner work is left
+intact; a subsequent consume on the closed lane is a loser and must not
+ACK again or write a second decision.
+
+A ``close()`` call on a thread that already holds a mutation lease does
+not wait for its own lease (that would deadlock with adapter/ACK
+injection). It still sets ``_closed``, waits only for other threads'
+leases, drops the store, and raises ``LaneClosedError`` so shutdown is
+bounded and fail-closed. After the lease context returns, heartbeat
+renews started under that ownership interval have finished: they cannot
+still mutate.
 
 Lock order: ``_lifecycle`` is never held across SQLite or adapter calls.
 ``close()`` waits on ``_close_idle`` (which releases ``_lifecycle``), so
-it cannot deadlock with coordinator/SQLite. Lease holders must not call
-``close()`` on the same thread.
+it cannot deadlock with coordinator/SQLite.
 """
 
 from __future__ import annotations
@@ -75,14 +83,20 @@ class DurableLaneService:
         self._store = store
         self._closed = False
         self._active_leases = 0
+        self._leases_by_thread: dict[int, int] = {}
         self._lifecycle = threading.Lock()
         self._close_idle = threading.Condition(self._lifecycle)
 
     def close(self) -> None:
-        """Idempotent shutdown. Waits for mutation-lease winners, then returns."""
+        """Idempotent shutdown. Waits for other threads' leases, then returns.
+
+        Same-thread lease holders cannot wait for their own lease. That path
+        drops the store and raises ``LaneClosedError`` instead of deadlocking.
+        """
         with self._lifecycle:
             self._closed = True
-            while self._active_leases > 0:
+            self_held = self._leases_by_thread.get(threading.get_ident(), 0)
+            while self._active_leases > self_held:
                 self._close_idle.wait()
             store = self._store
             self._store = None
@@ -91,6 +105,10 @@ class DurableLaneService:
                 store.close()
             except Exception:
                 pass
+        if self_held > 0:
+            raise LaneClosedError(
+                "close() from a mutation-lease holder is fail-closed"
+            )
 
     def _after_admission(self) -> None:
         return None
@@ -108,15 +126,21 @@ class DurableLaneService:
         with self._lifecycle:
             if self._closed:
                 raise LaneClosedError("durable lane is closed")
+            ident = threading.get_ident()
+            self._leases_by_thread[ident] = self._leases_by_thread.get(ident, 0) + 1
             self._active_leases += 1
 
     def _release_mutation_lease(self) -> None:
         with self._lifecycle:
+            ident = threading.get_ident()
+            held = self._leases_by_thread.get(ident, 0)
+            if held <= 1:
+                self._leases_by_thread.pop(ident, None)
+            else:
+                self._leases_by_thread[ident] = held - 1
             if self._active_leases > 0:
                 self._active_leases -= 1
-            if self._active_leases <= 0:
-                self._active_leases = 0
-                self._close_idle.notify_all()
+            self._close_idle.notify_all()
 
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:

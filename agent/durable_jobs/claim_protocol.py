@@ -31,6 +31,11 @@ class owner_lease_heartbeat:
     If ``now_fn`` exposes ``register_tick_listener`` (injected FrozenClock),
     renewal runs on clock ticks — no sleeps. Otherwise a daemon thread waits
     on an Event for ``lease_seconds / 3``.
+
+    The context does not return until every in-flight renew has finished and
+    no child thread started here can still write. ``join(timeout=…)`` then
+    dropping a live thread is forbidden: a blocked renew would complete
+    after ``__exit__`` returned.
     """
 
     def __init__(
@@ -46,6 +51,10 @@ class owner_lease_heartbeat:
         self._unregister: Optional[Callable[[], None]] = None
         self._stop: Optional[threading.Event] = None
         self._thread: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
+        self._renew_idle = threading.Condition(self._state_lock)
+        self._in_renew = 0
+        self._stopping = False
         self.last_ok: Optional[bool] = None
         self.last_error: Optional[BaseException] = None
 
@@ -60,7 +69,9 @@ class owner_lease_heartbeat:
             self._unregister = register(self._renew_safe)
             return self
         self._stop = threading.Event()
-        interval = max(1.0, self._lease_seconds / 3.0)
+        # 0 is allowed so tests can kick the next renew via Event.wait(0)
+        # without a wall-clock sleep. Production default 30s → 10s.
+        interval = max(0.0, self._lease_seconds / 3.0)
         self._thread = threading.Thread(
             target=self._loop,
             args=(interval,),
@@ -71,24 +82,38 @@ class owner_lease_heartbeat:
         return self
 
     def __exit__(self, *exc: object) -> bool:
+        with self._state_lock:
+            self._stopping = True
         if self._unregister is not None:
             self._unregister()
             self._unregister = None
         if self._stop is not None:
             self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            self._thread.join()
             self._thread = None
+        with self._renew_idle:
+            while self._in_renew > 0:
+                self._renew_idle.wait()
         return False
 
     def _renew_safe(self) -> None:
+        with self._state_lock:
+            if self._stopping:
+                return
+            self._in_renew += 1
         try:
-            self.last_ok = bool(self._renew_fn())
-            if self.last_ok:
-                self.last_error = None
-        except Exception as exc:
-            self.last_ok = False
-            self.last_error = exc
+            try:
+                self.last_ok = bool(self._renew_fn())
+                if self.last_ok:
+                    self.last_error = None
+            except Exception as exc:
+                self.last_ok = False
+                self.last_error = exc
+        finally:
+            with self._renew_idle:
+                self._in_renew -= 1
+                self._renew_idle.notify_all()
 
     def _loop(self, interval: float) -> None:
         assert self._stop is not None
