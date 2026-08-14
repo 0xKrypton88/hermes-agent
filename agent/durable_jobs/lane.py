@@ -25,11 +25,13 @@ ACK again or write a second decision.
 
 A ``close()`` call on a thread that already holds a mutation lease does
 not wait for its own lease (that would deadlock with adapter/ACK
-injection). It still sets ``_closed``, waits only for other threads'
-leases, drops the store, and raises ``LaneClosedError`` so shutdown is
-bounded and fail-closed. After the lease context returns, heartbeat
-renews started under that ownership interval have finished: they cannot
-still mutate.
+injection). Threads currently inside ``close()`` are excluded from the
+wait set: two holders that both call ``close()`` must not wait for each
+other. ``close()`` still sets ``_closed``, waits only for leases whose
+owners are not already in ``close()``, drops the store, and raises
+``LaneClosedError`` when invoked by a holder so shutdown is bounded and
+fail-closed. After the lease context returns, heartbeat renews started
+under that ownership interval have finished: they cannot still mutate.
 
 Lock order: ``_lifecycle`` is never held across SQLite or adapter calls.
 ``close()`` waits on ``_close_idle`` (which releases ``_lifecycle``), so
@@ -84,22 +86,40 @@ class DurableLaneService:
         self._closed = False
         self._active_leases = 0
         self._leases_by_thread: dict[int, int] = {}
+        # Leases held by threads currently executing close(). Those threads
+        # cannot release until close() returns, so waiters must not wait on
+        # them (two holder close() calls would otherwise deadlock).
+        self._close_claimed_leases = 0
         self._lifecycle = threading.Lock()
         self._close_idle = threading.Condition(self._lifecycle)
 
     def close(self) -> None:
-        """Idempotent shutdown. Waits for other threads' leases, then returns.
+        """Idempotent shutdown. Waits for leases not already inside close().
 
-        Same-thread lease holders cannot wait for their own lease. That path
-        drops the store and raises ``LaneClosedError`` instead of deadlocking.
+        Same-thread lease holders cannot wait for their own lease. Concurrent
+        holders that both call close() exclude each other from the wait set
+        so neither deadlocks. Holder paths drop the store and raise
+        ``LaneClosedError`` instead of hanging.
         """
+        store = None
+        self_held = 0
         with self._lifecycle:
             self._closed = True
             self_held = self._leases_by_thread.get(threading.get_ident(), 0)
-            while self._active_leases > self_held:
-                self._close_idle.wait()
-            store = self._store
-            self._store = None
+            if self_held > 0:
+                self._close_claimed_leases += self_held
+                self._close_idle.notify_all()
+            try:
+                while self._active_leases > self._close_claimed_leases:
+                    self._close_idle.wait()
+                store = self._store
+                self._store = None
+            finally:
+                if self_held > 0:
+                    self._close_claimed_leases -= self_held
+                    if self._close_claimed_leases < 0:
+                        self._close_claimed_leases = 0
+                    self._close_idle.notify_all()
         if store is not None and hasattr(store, "close"):
             try:
                 store.close()
