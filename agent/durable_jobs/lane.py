@@ -3,13 +3,36 @@
 Default-off: every mutating entry point requires ``durable_jobs.enabled``.
 No live Cursor, Slack, network, gateway, or dispatch adapters are constructed.
 Binding is required before any provider or Slack effect.
+
+Close / mutation-lease invariant
+--------------------------------
+Linearization vs ``close()`` is ``_acquire_mutation_lease()`` under
+``_lifecycle``. Store checkout is not a lease and does not authorize
+writes. A caller that has not acquired a lease when ``_closed`` becomes
+true is a loser: consume returns typed ``pending``/``retryable``; other
+writers raise ``LaneClosedError``. Losers create no durable write,
+event, decision, external effect, or ACK, and cannot reconstruct the
+store.
+
+A winner holds the lease through the first durable write and through ACK
+or external effect. ``close()`` waits for in-flight leases, then drops
+the store, then returns — so after ``close()`` returns, no winner remains
+in-flight. Already-committed winner work is left intact; a subsequent
+consume on the closed lane is a loser and must not ACK again or write a
+second decision.
+
+Lock order: ``_lifecycle`` is never held across SQLite or adapter calls.
+``close()`` waits on ``_close_idle`` (which releases ``_lifecycle``), so
+it cannot deadlock with coordinator/SQLite. Lease holders must not call
+``close()`` on the same thread.
 """
 
 from __future__ import annotations
 
 import sqlite3
 import threading
-from typing import Optional, Sequence
+from contextlib import contextmanager
+from typing import Iterator, Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
 from agent.durable_jobs.coordinator import (
@@ -50,12 +73,16 @@ class DurableLaneService:
         self.config = config
         self._store = store
         self._closed = False
+        self._active_leases = 0
         self._lifecycle = threading.Lock()
+        self._close_idle = threading.Condition(self._lifecycle)
 
     def close(self) -> None:
-        """Idempotent shutdown. Subsequent consume is retryable, not reconstructed."""
+        """Idempotent shutdown. Waits for mutation-lease winners, then returns."""
         with self._lifecycle:
             self._closed = True
+            while self._active_leases > 0:
+                self._close_idle.wait()
             store = self._store
             self._store = None
         if store is not None and hasattr(store, "close"):
@@ -63,6 +90,40 @@ class DurableLaneService:
                 store.close()
             except Exception:
                 pass
+
+    def _after_admission(self) -> None:
+        return None
+
+    def _after_store_checkout(self) -> None:
+        return None
+
+    def _after_identity_validation(self) -> None:
+        return None
+
+    def _before_mutation_lease(self) -> None:
+        return None
+
+    def _acquire_mutation_lease(self) -> None:
+        with self._lifecycle:
+            if self._closed:
+                raise LaneClosedError("durable lane is closed")
+            self._active_leases += 1
+
+    def _release_mutation_lease(self) -> None:
+        with self._lifecycle:
+            if self._active_leases > 0:
+                self._active_leases -= 1
+            if self._active_leases <= 0:
+                self._active_leases = 0
+                self._close_idle.notify_all()
+
+    @contextmanager
+    def _mutation_lease(self) -> Iterator[None]:
+        self._acquire_mutation_lease()
+        try:
+            yield
+        finally:
+            self._release_mutation_lease()
 
     def _require_enabled(self) -> None:
         if not self.config.enabled:
@@ -109,26 +170,38 @@ class DurableLaneService:
         candidate_version: str,
     ) -> SlackJobBinding:
         self._require_enabled()
+        self._after_admission()
         store = self._require_sqlite_path()
-        return SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
-            job_id=job_id,
-            workspace_id=workspace_id,
-            channel_id=channel_id,
-            root_thread_ts=root_thread_ts,
-            candidate_id=candidate_id,
-            candidate_version=candidate_version,
-        )
+        self._after_store_checkout()
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
+        self._before_mutation_lease()
+        with self._mutation_lease():
+            return SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
+                job_id=job_id,
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                root_thread_ts=root_thread_ts,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
+            )
 
     def deliver_slack_root(
         self, *, job_id: str, slack_port: SlackMessagePort,
         owner_token: Optional[str] = None,
     ) -> SlackJobBinding:
         self._require_enabled()
+        self._after_admission()
         store = self._require_sqlite_path()
-        ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
-        return deliver_slack_root(
-            ledger, slack_port, job_id=job_id, owner_token=owner_token
-        )
+        self._after_store_checkout()
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
+        self._before_mutation_lease()
+        with self._mutation_lease():
+            ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
+            return deliver_slack_root(
+                ledger, slack_port, job_id=job_id, owner_token=owner_token
+            )
 
     def reconcile_cursor_create(
         self,
@@ -144,7 +217,11 @@ class DurableLaneService:
         owner_token: Optional[str] = None,
     ) -> ProviderEffectClaim:
         self._require_enabled()
+        self._after_admission()
         store = self._require_sqlite_path()
+        self._after_store_checkout()
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
         binding = SlackBindingLedger(sqlite_path=store.sqlite_path).get_binding(job_id)
         if binding is None:
             raise BindingRequiredError(
@@ -165,19 +242,23 @@ class DurableLaneService:
                 origin_root_thread_id=origin_root_thread_id,
             )
         )
-        ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
-        return reconcile_cursor_create(
-            ledger,
-            provider,
-            job_id=job_id,
-            action_id=action_id,
-            origin_platform=origin_platform,
-            origin_chat_id=origin_chat_id,
-            origin_root_thread_id=origin_root_thread_id,
-            candidate_id=binding.candidate_id,
-            candidate_version=binding.candidate_version,
-            owner_token=owner_token,
-        )
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
+        self._before_mutation_lease()
+        with self._mutation_lease():
+            ledger = ProviderEffectLedger(sqlite_path=store.sqlite_path)
+            return reconcile_cursor_create(
+                ledger,
+                provider,
+                job_id=job_id,
+                action_id=action_id,
+                origin_platform=origin_platform,
+                origin_chat_id=origin_chat_id,
+                origin_root_thread_id=origin_root_thread_id,
+                candidate_id=binding.candidate_id,
+                candidate_version=binding.candidate_version,
+                owner_token=owner_token,
+            )
 
     def set_job_policy(
         self,
@@ -188,13 +269,19 @@ class DurableLaneService:
         expires_at: Optional[str] = None,
     ) -> JobAuthzPolicy:
         self._require_enabled()
+        self._after_admission()
         store = self._require_sqlite_path()
-        return DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
-            job_id=job_id,
-            policy_version=policy_version,
-            allowed_actors=allowed_actors,
-            expires_at=expires_at,
-        )
+        self._after_store_checkout()
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
+        self._before_mutation_lease()
+        with self._mutation_lease():
+            return DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
+                job_id=job_id,
+                policy_version=policy_version,
+                allowed_actors=allowed_actors,
+                expires_at=expires_at,
+            )
 
     def record_decision(
         self,
@@ -208,16 +295,22 @@ class DurableLaneService:
         decision_idempotency_key: str,
     ) -> DecisionResult:
         self._require_enabled()
+        self._after_admission()
         store = self._require_sqlite_path()
-        return DecisionLedger(sqlite_path=store.sqlite_path).record_decision(
-            job_id=job_id,
-            decision_type=decision_type,
-            candidate_id=candidate_id,
-            candidate_version=candidate_version,
-            actor_id=actor_id,
-            policy_version=policy_version,
-            decision_idempotency_key=decision_idempotency_key,
-        )
+        self._after_store_checkout()
+        if self._closed:
+            raise LaneClosedError("durable lane is closed")
+        self._before_mutation_lease()
+        with self._mutation_lease():
+            return DecisionLedger(sqlite_path=store.sqlite_path).record_decision(
+                job_id=job_id,
+                decision_type=decision_type,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
+                actor_id=actor_id,
+                policy_version=policy_version,
+                decision_idempotency_key=decision_idempotency_key,
+            )
 
     def consume_inbound_action(
         self,
@@ -237,13 +330,11 @@ class DurableLaneService:
         """Durable Go/Pause/Cancel ingress. No parallel Slack router.
 
         Disabled and malformed identity reject before a store is constructed.
-        Authorized consumption uses the existing coordinator ACK/decision lane.
+        Repository identity is fail-closed here before a mutation lease.
+        Authorized consumption uses the existing coordinator ACK/decision lane
+        only while holding a mutation lease.
         """
         self._require_enabled()
-        if getattr(self, "_closed", False):
-            return InboundActionResult(
-                ok=False, ack_status="pending", retryable=True
-            )
         if inbound_action_shape_rejected(
             job_id=job_id,
             workspace_id=workspace_id,
@@ -257,24 +348,51 @@ class DurableLaneService:
             candidate_version=candidate_version,
         ):
             return InboundActionResult(ok=False, ack_status="rejected")
+        if getattr(self, "_closed", False):
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
+        self._after_admission()
         try:
             store = self._require_sqlite_path()
+        except LaneClosedError:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
+        self._after_store_checkout()
+        if self._closed:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
+        try:
             if self._repository_identity_rejected(store, job_id):
                 return InboundActionResult(ok=False, ack_status="rejected")
-            return consume_durable_inbound_action(
-                store.sqlite_path,
-                ack_port,
-                job_id=job_id,
-                workspace_id=workspace_id,
-                channel_id=channel_id,
-                root_thread_ts=root_thread_ts,
-                actor_id=actor_id,
-                decision_type=decision_type,
-                decision_idempotency_key=decision_idempotency_key,
-                policy_version=policy_version,
-                candidate_id=candidate_id,
-                candidate_version=candidate_version,
+        except LaneClosedError:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
             )
+        self._after_identity_validation()
+        if self._closed:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
+        self._before_mutation_lease()
+        try:
+            with self._mutation_lease():
+                return consume_durable_inbound_action(
+                    store.sqlite_path,
+                    ack_port,
+                    job_id=job_id,
+                    workspace_id=workspace_id,
+                    channel_id=channel_id,
+                    root_thread_ts=root_thread_ts,
+                    actor_id=actor_id,
+                    decision_type=decision_type,
+                    decision_idempotency_key=decision_idempotency_key,
+                    policy_version=policy_version,
+                    candidate_id=candidate_id,
+                    candidate_version=candidate_version,
+                )
         except LaneClosedError:
             return InboundActionResult(
                 ok=False, ack_status="pending", retryable=True
