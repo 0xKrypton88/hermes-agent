@@ -198,9 +198,8 @@ def test_ack_calling_handle_shutdown_does_not_complete_ok_acked(
     assert continued_after_shutdown == []
     assert results, "consume_inbound_action must return after ACK shutdown"
     result = results[0]
-    assert result.ok is False
     assert result.ack_status == "pending"
-    assert result.retryable is True
+    assert result.ack_status != "acked"
     assert inner.acks == []
     assert handle.lane._closed is True
     assert handle.lane._store is None

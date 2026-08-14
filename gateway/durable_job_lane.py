@@ -22,7 +22,7 @@ from agent.durable_jobs.config import (
 )
 from agent.durable_jobs.coordinator import InboundActionResult
 from agent.durable_jobs.cursor_cloud import adapter_from_config as cursor_adapter_from_config
-from agent.durable_jobs.lane import DurableLaneService
+from agent.durable_jobs.lane import DurableLaneService, LaneClosedError
 from agent.durable_jobs.preflight import DurableJobsPreflight, preflight_durable_jobs
 from agent.durable_jobs.redaction import redact_secret_text
 from agent.durable_jobs.slack_bridge import adapter_from_config as slack_adapter_from_config
@@ -77,9 +77,15 @@ class DurableJobLaneHandle:
         if callable(closer):
             try:
                 closer()
-                return
+            except LaneClosedError:
+                # close() already dropped the store. Re-raise so a
+                # lease-holder ACK/adapter cannot complete after return.
+                self.lane._store = None
+                raise
             except Exception:
                 logger.debug("durable job lane close failed", exc_info=True)
+            else:
+                return
         store = getattr(self.lane, "_store", None)
         if store is not None and hasattr(store, "close"):
             try:
@@ -102,6 +108,32 @@ def _owner_key(owner: Any) -> int:
     if owner is None:
         return _UNOWNED
     return id(owner)
+
+
+def _clear_owner_runner_field(owner: Any) -> None:
+    if owner is None or not hasattr(owner, "_durable_job_lane"):
+        return
+    try:
+        owner._durable_job_lane = None
+    except Exception:
+        pass
+
+
+def _retire_owner_lane(owner: Any) -> None:
+    """Detach+shutdown the previously attached lane for this owner, if any.
+
+    Unauthorized/unready reattach must not leave a live handle in ``_LANES``
+    or keep Slack ingress active. Shutdown runs outside ``_LOCK``.
+    """
+    key = _owner_key(owner)
+    with _LOCK:
+        handle = _LANES.pop(key, None)
+    if handle is not None:
+        try:
+            handle.shutdown()
+        except Exception:
+            logger.debug("durable job lane retire failed", exc_info=True)
+    _clear_owner_runner_field(owner)
 
 
 def get_active_durable_job_lane() -> Optional[DurableJobLaneHandle]:
@@ -153,8 +185,8 @@ def attach_durable_job_lane(
     owner: Any = None,
 ) -> Optional[DurableJobLaneHandle]:
     """Construct the lane only when runtime capability is bound. Fail closed."""
-    raw = _load_raw_config(raw_config)
     try:
+        raw = _load_raw_config(raw_config)
         report = preflight_durable_jobs(
             raw,
             cursor_transport=cursor_transport,
@@ -162,18 +194,22 @@ def attach_durable_job_lane(
         )
         cfg = load_durable_jobs_config(raw) if report.constructible else None
     except DurableJobsConfigError:
+        _retire_owner_lane(owner)
         return None
     except Exception:
         logger.debug("durable job lane preflight failed", exc_info=True)
+        _retire_owner_lane(owner)
         return None
 
     if report is None or not report.constructible or cfg is None:
+        _retire_owner_lane(owner)
         return None
     if not report.runtime_ready:
         logger.debug(
             "durable job lane refusing attach; runtime capability unbound (%s)",
             report.reasons,
         )
+        _retire_owner_lane(owner)
         return None
 
     key = _owner_key(owner)
@@ -219,11 +255,16 @@ def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> No
             victims = [(key, owned) for key, owned in _LANES.items() if owned is handle]
             for key, _owned in victims:
                 del _LANES[key]
+    holder_closed: Optional[LaneClosedError] = None
     for _key, owned in victims:
         try:
             owned.shutdown()
+        except LaneClosedError as exc:
+            holder_closed = exc
         except Exception:
             logger.debug("durable job lane shutdown failed", exc_info=True)
+    if holder_closed is not None:
+        raise holder_closed
 
 
 def attach_to_gateway_runner(
@@ -250,15 +291,20 @@ def detach_from_gateway_runner(runner: Any) -> None:
     key = id(runner)
     with _LOCK:
         owned = _LANES.pop(key, None)
+    holder_closed: Optional[LaneClosedError] = None
     if owned is not None:
         try:
             owned.shutdown()
+        except LaneClosedError as exc:
+            holder_closed = exc
         except Exception:
             logger.debug("durable job lane detach failed", exc_info=True)
     try:
         runner._durable_job_lane = None
     except Exception:
         pass
+    if holder_closed is not None:
+        raise holder_closed
 
 
 def _text(value: Any) -> str:
