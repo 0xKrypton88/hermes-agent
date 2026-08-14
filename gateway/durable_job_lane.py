@@ -44,12 +44,14 @@ _ACTION_TO_DECISION = {
 
 _LOCK = threading.Lock()
 _UNOWNED = 0
-# Keys are id(owner). id() cannot recover the owner, and owners are not
-# required to be weakref-able, so each published handle stores a strong
-# owner ref. Handle-based detach CAS-clears owner._durable_job_lane only
-# when that field still points at the exact retired handle. Reshaping
-# ``_LANES`` is unnecessary: existing readers stay handle-valued.
+# Keys are id(owner). ``_LANES`` stays handle-valued for existing readers.
+# ``_LANE_OWNERS`` is the reverse map so handle/no-arg detach can CAS-clear
+# the correct runner field. ``_RETIRING`` keeps an unpublished handle visible
+# until its leases drain so a later holder joins close() instead of treating
+# an empty registry as success.
 _LANES: dict[int, "DurableJobLaneHandle"] = {}
+_LANE_OWNERS: dict[int, Any] = {}
+_RETIRING: dict[int, "DurableJobLaneHandle"] = {}
 _OWNER_OPLOCKS: dict[int, threading.Lock] = {}
 
 _IDENTITY_PAYLOAD_KEYS = (
@@ -135,16 +137,6 @@ def _owner_from_handle(handle: "DurableJobLaneHandle") -> Any:
     return getattr(handle, "_owner", None)
 
 
-def _pop_handle_locked(handle: "DurableJobLaneHandle") -> bool:
-    """Remove ``handle`` from ``_LANES`` by identity. Caller holds ``_LOCK``."""
-    popped = False
-    for key, owned in list(_LANES.items()):
-        if owned is handle:
-            del _LANES[key]
-            popped = True
-    return popped
-
-
 def _publish_runner_field(
     owner: Any, handle: Optional["DurableJobLaneHandle"]
 ) -> None:
@@ -170,28 +162,88 @@ def _cas_clear_runner_field(
         pass
 
 
-def _retire_owner_lane(owner: Any) -> None:
-    """Detach+shutdown the previously attached lane for this owner, if any.
+def _cas_unpublish(
+    *,
+    key: int,
+    owner: Any,
+    expected: Optional["DurableJobLaneHandle"] = None,
+) -> Optional["DurableJobLaneHandle"]:
+    """Owner-aware CAS unpublish. Caller holds the per-owner oplock.
 
-    Registry pop and runner-field CAS run under the per-owner lock.
-    Shutdown runs outside that lock so a concurrent valid attach can
-    publish without holding shutdown I/O, and a lease-holder reattach
-    cannot deadlock against a waiter.
+    Removes the registry entry only if it is the expected handle (or the
+    current handle when *expected* is None). Clears the owner field only
+    if it still references that same handle. Returns the unpublished
+    handle or the in-flight retiring handle so a later holder can join
+    ``close()``. Never shuts down; caller must release locks first.
     """
-    key = _owner_key(owner)
-    oplock = _owner_oplock(key)
-    with oplock:
-        with _LOCK:
-            handle = _LANES.pop(key, None)
-        _cas_clear_runner_field(owner, handle)
-    if handle is None:
-        return
+    with _LOCK:
+        current = _LANES.get(key)
+        if expected is not None and current is not None and current is not expected:
+            retiring = _RETIRING.get(key)
+            return retiring if retiring is expected else None
+        if current is not None and (expected is None or current is expected):
+            _LANES.pop(key, None)
+            mapped_owner = _LANE_OWNERS.pop(key, owner)
+            _RETIRING[key] = current
+            clear_owner = owner if owner is not None else mapped_owner
+            if clear_owner is None:
+                clear_owner = _owner_from_handle(current)
+            _cas_clear_runner_field(clear_owner, current)
+            return current
+        retiring = _RETIRING.get(key)
+        if retiring is not None and (expected is None or retiring is expected):
+            clear_owner = owner if owner is not None else _LANE_OWNERS.get(key)
+            if clear_owner is None:
+                clear_owner = _owner_from_handle(retiring)
+            _cas_clear_runner_field(clear_owner, retiring)
+            return retiring
+        return None
+
+
+def _clear_retiring_if_idle(key: int, handle: "DurableJobLaneHandle") -> None:
+    lane = getattr(handle, "lane", None)
+    idle = True
+    if lane is not None:
+        lifecycle = getattr(lane, "_lifecycle", None)
+        closed = bool(getattr(lane, "_closed", False))
+        active = int(getattr(lane, "_active_leases", 0) or 0)
+        if lifecycle is not None:
+            with lifecycle:
+                closed = bool(getattr(lane, "_closed", False))
+                active = int(getattr(lane, "_active_leases", 0) or 0)
+        idle = closed and active == 0
+    with _LOCK:
+        if idle and _RETIRING.get(key) is handle:
+            del _RETIRING[key]
+
+
+def _shutdown_retired(key: int, handle: "DurableJobLaneHandle") -> None:
+    """Close *handle* outside all registry locks, then drop idle retirement."""
     try:
         handle.shutdown()
     except LaneClosedError:
         raise
     except Exception:
         logger.debug("durable job lane retire failed", exc_info=True)
+    finally:
+        _clear_retiring_if_idle(key, handle)
+
+
+def _retire_owner_lane(owner: Any) -> None:
+    """Detach+shutdown the previously attached lane for this owner, if any.
+
+    Uses the shared CAS-unpublish primitive. If this owner already has an
+    in-flight retirement, join that close so a later lease holder is fenced
+    instead of treating an empty registry as success. Shutdown runs outside
+    the per-owner lock.
+    """
+    key = _owner_key(owner)
+    oplock = _owner_oplock(key)
+    with oplock:
+        handle = _cas_unpublish(key=key, owner=owner, expected=None)
+    if handle is None:
+        return
+    _shutdown_retired(key, handle)
 
 
 def get_active_durable_job_lane() -> Optional[DurableJobLaneHandle]:
@@ -305,6 +357,9 @@ def attach_durable_job_lane(
                     "durable job lane is already attached for this owner"
                 )
             _LANES[key] = handle
+            if owner is not None:
+                _LANE_OWNERS[key] = owner
+            _RETIRING.pop(key, None)
         _bind_handle_owner(handle, owner)
         _publish_runner_field(owner, handle)
         logger.info(
@@ -316,43 +371,65 @@ def attach_durable_job_lane(
         return handle
 
 
+def _lookup_handle_binding(
+    handle: "DurableJobLaneHandle",
+) -> tuple[int, Any]:
+    """Resolve owner key/object for a handle without holding oplock."""
+    owner = _owner_from_handle(handle)
+    if owner is not None:
+        return _owner_key(owner), owner
+    with _LOCK:
+        for key, owned in _LANES.items():
+            if owned is handle:
+                return key, _LANE_OWNERS.get(key)
+        for key, owned in _RETIRING.items():
+            if owned is handle:
+                return key, _LANE_OWNERS.get(key) or _owner_from_handle(owned)
+    return _UNOWNED, None
+
+
 def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> None:
     """Idempotent shutdown. No-arg clears every owned lane (tests).
 
-    Registry membership and ``owner._durable_job_lane`` stay consistent:
-    the runner field is CAS-cleared only when it still points at the
-    exact retired handle. Owner is recovered from the strong ref bound
-    at publish time. Shutdown runs outside ``_LOCK`` and per-owner oplocks.
+    Every path uses CAS-unpublish: registry and runner field change only
+    when they still name the exact retired handle. Handle-based detach
+    always joins ``shutdown()`` so a lease holder is fenced even after
+    the registry entry is already gone. Shutdown runs outside locks.
     """
     holder_closed: Optional[LaneClosedError] = None
     if handle is None:
         with _LOCK:
-            victims = list(_LANES.items())
-            _LANES.clear()
-            for _key, owned in victims:
-                _cas_clear_runner_field(_owner_from_handle(owned), owned)
-        to_close = [owned for _key, owned in victims]
-    else:
-        owner = _owner_from_handle(handle)
-        popped = False
-        if owner is not None:
-            oplock = _owner_oplock(_owner_key(owner))
+            snapshot = list(_LANES.items())
+            retiring = list(_RETIRING.items())
+            owners = dict(_LANE_OWNERS)
+        seen: set[int] = set()
+        to_close: list[tuple[int, DurableJobLaneHandle]] = []
+        for key, owned in snapshot + retiring:
+            if id(owned) in seen:
+                continue
+            owner = owners.get(key) or _owner_from_handle(owned)
+            oplock = _owner_oplock(key)
             with oplock:
-                with _LOCK:
-                    key = _owner_key(owner)
-                    if _LANES.get(key) is handle:
-                        _LANES.pop(key, None)
-                        popped = True
-                    else:
-                        popped = _pop_handle_locked(handle)
-                _cas_clear_runner_field(owner, handle)
-        else:
-            with _LOCK:
-                popped = _pop_handle_locked(handle)
-        to_close = [handle] if popped else []
-    for owned in to_close:
+                unpublished = _cas_unpublish(key=key, owner=owner, expected=owned)
+            target = unpublished if unpublished is not None else owned
+            if id(target) in seen:
+                continue
+            seen.add(id(target))
+            to_close.append((key, target))
+        for key, owned in to_close:
+            try:
+                _shutdown_retired(key, owned)
+            except LaneClosedError as exc:
+                holder_closed = exc
+            except Exception:
+                logger.debug("durable job lane shutdown failed", exc_info=True)
+    else:
+        key, owner = _lookup_handle_binding(handle)
+        oplock = _owner_oplock(key)
+        with oplock:
+            _cas_unpublish(key=key, owner=owner, expected=handle)
         try:
-            owned.shutdown()
+            _shutdown_retired(key, handle)
         except LaneClosedError as exc:
             holder_closed = exc
         except Exception:
@@ -389,20 +466,7 @@ def attach_to_gateway_runner(
 
 
 def detach_from_gateway_runner(runner: Any) -> None:
-    key = id(runner)
-    oplock = _owner_oplock(key)
-    with oplock:
-        with _LOCK:
-            owned = _LANES.pop(key, None)
-        _cas_clear_runner_field(runner, owned)
-    if owned is None:
-        return
-    try:
-        owned.shutdown()
-    except LaneClosedError:
-        raise
-    except Exception:
-        logger.debug("durable job lane detach failed", exc_info=True)
+    _retire_owner_lane(runner)
 
 
 def _text(value: Any) -> str:
