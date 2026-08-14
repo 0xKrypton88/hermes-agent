@@ -12,7 +12,6 @@ import json
 import logging
 import sqlite3
 import threading
-import weakref
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -45,10 +44,11 @@ _ACTION_TO_DECISION = {
 
 _LOCK = threading.Lock()
 _UNOWNED = 0
-# Keys are id(owner). The owner object is not stored here — id() cannot
-# recover it. Each published handle carries a weakref to its owner so the
-# public handle-based detach API can CAS-clear owner._durable_job_lane
-# only when that field still points at the exact retired handle.
+# Keys are id(owner). id() cannot recover the owner, and owners are not
+# required to be weakref-able, so each published handle stores a strong
+# owner ref. Handle-based detach CAS-clears owner._durable_job_lane only
+# when that field still points at the exact retired handle. Reshaping
+# ``_LANES`` is unnecessary: existing readers stay handle-valued.
 _LANES: dict[int, "DurableJobLaneHandle"] = {}
 _OWNER_OPLOCKS: dict[int, threading.Lock] = {}
 
@@ -127,15 +127,12 @@ def _owner_oplock(key: int) -> threading.Lock:
 
 
 def _bind_handle_owner(handle: "DurableJobLaneHandle", owner: Any) -> None:
-    """Bind a weak owner ref so handle detach can CAS-clear the runner field."""
-    handle._owner_ref = weakref.ref(owner) if owner is not None else None
+    """Remember the owner so handle detach can CAS-clear the runner field."""
+    handle._owner = owner
 
 
 def _owner_from_handle(handle: "DurableJobLaneHandle") -> Any:
-    ref = getattr(handle, "_owner_ref", None)
-    if ref is None:
-        return None
-    return ref()
+    return getattr(handle, "_owner", None)
 
 
 def _pop_handle_locked(handle: "DurableJobLaneHandle") -> bool:
@@ -324,8 +321,8 @@ def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> No
 
     Registry membership and ``owner._durable_job_lane`` stay consistent:
     the runner field is CAS-cleared only when it still points at the
-    exact retired handle. Owner is recovered from the weakref bound at
-    publish time. Shutdown runs outside ``_LOCK`` and per-owner oplocks.
+    exact retired handle. Owner is recovered from the strong ref bound
+    at publish time. Shutdown runs outside ``_LOCK`` and per-owner oplocks.
     """
     holder_closed: Optional[LaneClosedError] = None
     if handle is None:
