@@ -312,15 +312,19 @@ def _parse_adapter_mode(field: str, value: Any) -> Optional[str]:
     return text
 
 
+def validate_secret_ref_name(value: Any, *, field: str = "secret_ref") -> str:
+    """Require a reference *name*, never a raw token or credential value."""
+    text = str(value or "").strip()
+    if not _SECRET_REF_RE.fullmatch(text):
+        raise DurableJobsConfigError(f"{field} must be an environment variable name")
+    return text
+
+
 def _parse_secret_ref(field: str, value: Any) -> Optional[str]:
     text = _optional_text(value)
     if text is None:
         return None
-    if not _SECRET_REF_RE.fullmatch(text):
-        raise DurableJobsConfigError(
-            f"durable_jobs.{field} must be an environment variable name"
-        )
-    return text
+    return validate_secret_ref_name(text, field=f"durable_jobs.{field}")
 
 
 def _parse_identity_binding(value: Any) -> Optional[DurableJobsIdentityBinding]:

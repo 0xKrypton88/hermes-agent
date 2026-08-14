@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Optional, Protocol
 
+from agent.durable_jobs.config import validate_secret_ref_name
 from agent.durable_jobs.cursor_cloud import redact_provider_error
 from agent.durable_jobs.redaction import redact_secret_text
 from agent.durable_jobs.slack_bridge import redact_slack_error
@@ -46,10 +47,8 @@ class CursorCloudInjectedTransport:
                 "CursorCloudInjectedTransport requires an injected request "
                 "callable; no HTTP client is constructed"
             )
-        if not str(secret_ref or "").strip():
-            raise TypeError("cursor secret_ref name is required")
         self._request = request
-        self._secret_ref = str(secret_ref).strip()
+        self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
 
     def create(
         self, *, idempotency_key: str, job_id: str, name: str, agent_id: str
@@ -103,10 +102,8 @@ class SlackInjectedTransport:
                 "SlackInjectedTransport requires an injected request "
                 "callable; no Slack SDK client is constructed"
             )
-        if not str(secret_ref or "").strip():
-            raise TypeError("slack secret_ref name is required")
         self._request = request
-        self._secret_ref = str(secret_ref).strip()
+        self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
 
     def post_root(
         self,

@@ -31,6 +31,7 @@ class DurableJobsPreflight:
     slack_adapter_mode: Optional[str]
     secret_refs_configured: bool
     secret_refs_present: bool
+    transport_capability: bool = False
 
     def __repr__(self) -> str:
         return redact_secret_text(
@@ -43,7 +44,8 @@ class DurableJobsPreflight:
             f"cursor_adapter_mode={self.cursor_adapter_mode!r}, "
             f"slack_adapter_mode={self.slack_adapter_mode!r}, "
             f"secret_refs_configured={self.secret_refs_configured!r}, "
-            f"secret_refs_present={self.secret_refs_present!r})"
+            f"secret_refs_present={self.secret_refs_present!r}, "
+            f"transport_capability={self.transport_capability!r})"
         )
 
 
@@ -75,7 +77,32 @@ def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
     return reasons
 
 
-def preflight_durable_jobs(raw: Mapping[str, Any] | None) -> DurableJobsPreflight:
+def _injected_transport_capability(
+    cfg: DurableJobsConfig,
+    cursor_transport: Any,
+    slack_transport: Any,
+) -> bool:
+    if cfg.cursor_adapter_mode == ADAPTER_MODE_INJECTED:
+        if not all(
+            callable(getattr(cursor_transport, name, None))
+            for name in ("create", "lookup", "status")
+        ):
+            return False
+    if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
+        if not all(
+            callable(getattr(slack_transport, name, None))
+            for name in ("post_root", "lookup_by_client_msg_id")
+        ):
+            return False
+    return True
+
+
+def preflight_durable_jobs(
+    raw: Mapping[str, Any] | None,
+    *,
+    cursor_transport: Any = None,
+    slack_transport: Any = None,
+) -> DurableJobsPreflight:
     """Validate active config without external effects."""
     try:
         cfg = load_durable_jobs_config(raw)
@@ -91,6 +118,7 @@ def preflight_durable_jobs(raw: Mapping[str, Any] | None) -> DurableJobsPrefligh
             slack_adapter_mode=None,
             secret_refs_configured=False,
             secret_refs_present=False,
+            transport_capability=False,
         )
 
     reasons: list[str] = []
@@ -129,7 +157,12 @@ def preflight_durable_jobs(raw: Mapping[str, Any] | None) -> DurableJobsPrefligh
     )
     if constructible and not secret_refs_present:
         reasons.append("secret_refs_missing")
-    runtime_ready = constructible and secret_refs_present
+    transport_capability = _injected_transport_capability(
+        cfg, cursor_transport, slack_transport
+    )
+    if constructible and secret_refs_present and not transport_capability:
+        reasons.append("transport_capability_missing")
+    runtime_ready = constructible and secret_refs_present and transport_capability
     return DurableJobsPreflight(
         constructible=constructible,
         dispatch_allowed=bool(cfg.dispatch_allowed and constructible),
@@ -140,4 +173,5 @@ def preflight_durable_jobs(raw: Mapping[str, Any] | None) -> DurableJobsPrefligh
         slack_adapter_mode=cfg.slack_adapter_mode,
         secret_refs_configured=secret_refs_configured,
         secret_refs_present=secret_refs_present,
+        transport_capability=transport_capability,
     )

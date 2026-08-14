@@ -281,16 +281,61 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
 
     monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
-    ready = preflight_durable_jobs(raw)
-    assert ready.constructible is True
-    assert ready.runtime_ready is True
-    assert ready.secret_refs_present is True
-    assert "secret_refs_missing" not in ready.reasons
-    dumped = str(ready)
+    env_only = preflight_durable_jobs(raw)
+    assert env_only.constructible is True
+    assert env_only.secret_refs_present is True
+    assert env_only.runtime_ready is False
+    assert "transport_capability_missing" in env_only.reasons
+    dumped = str(env_only)
     assert CURSOR_TOKEN not in dumped
     assert SLACK_TOKEN not in dumped
     assert "xoxb-" not in dumped
     assert "supersecret" not in dumped
+
+
+def _idle_injected_transports():
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    def _idle(**_k):
+        raise AssertionError("preflight/transport must not call the network")
+
+    return (
+        CursorCloudInjectedTransport(request=_idle, secret_ref="CURSOR_API_KEY"),
+        SlackInjectedTransport(request=_idle, secret_ref="SLACK_BOT_TOKEN"),
+    )
+
+
+def test_preflight_runtime_ready_requires_injected_transport_capability(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    raw = _complete_sqlite(tmp_path)
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    cursor, slack = _idle_injected_transports()
+    ready = preflight_durable_jobs(
+        raw, cursor_transport=cursor, slack_transport=slack
+    )
+    assert ready.constructible is True
+    assert ready.secret_refs_present is True
+    assert ready.runtime_ready is True
+    assert "secret_refs_missing" not in ready.reasons
+    assert "transport_capability_missing" not in ready.reasons
+    dumped = str(ready)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+
+    cursor_only = preflight_durable_jobs(
+        raw, cursor_transport=cursor, slack_transport=None
+    )
+    assert cursor_only.constructible is True
+    assert cursor_only.runtime_ready is False
+    assert "transport_capability_missing" in cursor_only.reasons
 
 
 def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):
@@ -439,6 +484,26 @@ def test_injected_transport_errors_redact_secrets():
     assert CURSOR_TOKEN not in dumped
     assert SLACK_TOKEN not in dumped
     assert "supersecret" not in dumped
+
+
+def test_injected_transport_rejects_raw_token_secret_ref():
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    def _idle(**_k):
+        raise AssertionError("must not call network")
+
+    with pytest.raises((TypeError, ValueError, RuntimeError)) as cursor_exc:
+        CursorCloudInjectedTransport(request=_idle, secret_ref=CURSOR_TOKEN)
+    with pytest.raises((TypeError, ValueError, RuntimeError)) as slack_exc:
+        SlackInjectedTransport(request=_idle, secret_ref=SLACK_TOKEN)
+    for dumped in (str(cursor_exc.value), str(slack_exc.value)):
+        assert CURSOR_TOKEN not in dumped
+        assert SLACK_TOKEN not in dumped
+        assert "xoxb-" not in dumped
+        assert "supersecret" not in dumped
 
 
 def test_injected_transport_modules_do_not_export_live_clients():

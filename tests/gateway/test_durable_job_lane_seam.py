@@ -6,7 +6,10 @@ and secret redaction. No live Slack/Cursor/network.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import socket
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +48,72 @@ def _reset_lane_seam():
     detach_durable_job_lane()
     yield
     detach_durable_job_lane()
+
+
+def _count_rows(sqlite_path: Path, table: str) -> int:
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        (n,) = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(n)
+    finally:
+        conn.close()
+
+
+def _seed_bound_job(handle, *, idempotency_key: str = "idem-seed"):
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store = handle.lane._require_sqlite_path()
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="ingress",
+        repository_identity="github.com/example/repo",
+        idempotency_key=idempotency_key,
+    )
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    return job, store
+
+
+def _verified_body(**overrides):
+    body = {
+        "team": {"id": "T1"},
+        "user": {"id": "U-alice"},
+        "channel": {"id": "C123"},
+        "message": {"thread_ts": "111.222", "ts": "111.222"},
+    }
+    body.update(overrides)
+    return body
+
+
+def _action(action_id: str, payload: dict) -> dict:
+    return {"action_id": action_id, "value": json.dumps(payload)}
+
+
+def _write_active_config(tmp_path: Path, raw: dict) -> None:
+    import yaml
+    from hermes_cli import config as cfg
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
 
 
 def test_default_config_does_not_construct_lane():
@@ -400,6 +469,242 @@ def test_claim_takeover_survives_reconstructed_lane(tmp_path):
     assert adopted.provider_run_id == "run-unique"
 
 
+def test_spoofed_action_value_identity_is_rejected_with_zero_consumption(tmp_path):
+    from gateway.durable_job_lane import (
+        attach_durable_job_lane,
+        consume_slack_action_if_active,
+        parse_slack_durable_action,
+    )
+
+    handle = attach_durable_job_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    )
+    assert handle is not None
+    job, store = _seed_bound_job(handle, idempotency_key="idem-spoof")
+    spoof_payload = {
+        "job_id": job.job_id,
+        "workspace_id": "T1",
+        "channel_id": "C123",
+        "root_thread_ts": "111.222",
+        "actor_id": "U-alice",
+        "decision_type": "go",
+        "decision_idempotency_key": "dec-spoof",
+        "policy_version": "pol-1",
+        "candidate_id": "cand-1",
+        "candidate_version": "v1",
+    }
+    body = _verified_body(
+        team={"id": "T-EVIL"},
+        user={"id": "U-eve"},
+        channel={"id": "C-EVIL"},
+        message={"thread_ts": "999.000", "ts": "999.000"},
+    )
+    action = _action("hermes_durable_go", spoof_payload)
+    parsed = parse_slack_durable_action(body, action)
+    assert parsed is None
+    result = consume_slack_action_if_active(body, action)
+    assert result is not None
+    assert result.ok is False
+    assert result.ack_status == "rejected"
+    assert getattr(result, "retryable", False) is False
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 0
+    assert _count_rows(store.sqlite_path, "job_decisions") == 0
+
+
+def test_decision_type_and_identity_are_not_taken_from_action_value(tmp_path):
+    from gateway.durable_job_lane import parse_slack_durable_action
+
+    body = _verified_body()
+    parsed = parse_slack_durable_action(
+        body,
+        _action(
+            "hermes_durable_hold",
+            {
+                "job_id": "job-1",
+                "workspace_id": "T-SPOOF",
+                "channel_id": "C-SPOOF",
+                "root_thread_ts": "0.0",
+                "actor_id": "U-eve",
+                "decision_type": "go",
+                "decision_idempotency_key": "dec-1",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert parsed is None
+
+    matching = parse_slack_durable_action(
+        body,
+        _action(
+            "hermes_durable_go",
+            {
+                "job_id": "job-1",
+                "workspace_id": "T1",
+                "channel_id": "C123",
+                "root_thread_ts": "111.222",
+                "actor_id": "U-alice",
+                "decision_type": "go",
+                "decision_idempotency_key": "dec-1",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert matching is not None
+    assert matching["workspace_id"] == "T1"
+    assert matching["channel_id"] == "C123"
+    assert matching["root_thread_ts"] == "111.222"
+    assert matching["actor_id"] == "U-alice"
+    assert matching["decision_type"] == "go"
+    assert matching["job_id"] == "job-1"
+
+
+def test_identity_binding_mismatch_is_rejected_with_zero_consumption(tmp_path):
+    from gateway.durable_job_lane import (
+        attach_durable_job_lane,
+        consume_slack_action_if_active,
+    )
+
+    handle = attach_durable_job_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    )
+    assert handle is not None
+    job, store = _seed_bound_job(handle, idempotency_key="idem-binding")
+    body = _verified_body(team={"id": "T-OTHER"})
+    action = _action(
+        "hermes_durable_go",
+        {
+            "job_id": job.job_id,
+            "decision_idempotency_key": "dec-binding",
+            "policy_version": "pol-1",
+            "candidate_id": "cand-1",
+            "candidate_version": "v1",
+        },
+    )
+    result = consume_slack_action_if_active(body, action)
+    assert result is not None
+    assert result.ok is False
+    assert result.ack_status == "rejected"
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 0
+    assert _count_rows(store.sqlite_path, "job_decisions") == 0
+
+
+def test_old_runner_stop_does_not_shutdown_new_runner_lane(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.durable_job_lane import consume_slack_action_if_active
+    from gateway.run import GatewayRunner
+
+    old = GatewayRunner(
+        GatewayConfig(
+            platforms={},
+            sessions_dir=tmp_path / "sessions-old",
+            loop_watchdog=False,
+        )
+    )
+    new = GatewayRunner(
+        GatewayConfig(
+            platforms={},
+            sessions_dir=tmp_path / "sessions-new",
+            loop_watchdog=False,
+        )
+    )
+    from gateway.durable_job_lane import attach_to_gateway_runner
+
+    attach_to_gateway_runner(old, raw_config=_complete(tmp_path / "old"))
+    attach_to_gateway_runner(new, raw_config=_complete(tmp_path / "new"))
+    assert old._durable_job_lane is not None
+    assert new._durable_job_lane is not None
+    assert old._durable_job_lane is not new._durable_job_lane
+
+    job, store = _seed_bound_job(new._durable_job_lane, idempotency_key="idem-live")
+    old._maybe_detach_durable_job_lane()
+    assert getattr(old, "_durable_job_lane", None) is None
+    assert new._durable_job_lane is not None
+
+    result = consume_slack_action_if_active(
+        _verified_body(),
+        _action(
+            "hermes_durable_go",
+            {
+                "job_id": job.job_id,
+                "decision_idempotency_key": "dec-live",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert result is not None
+    assert result.ok is True
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 1
+
+
+def test_consume_after_shutdown_is_retryable_without_durable_write(tmp_path):
+    from gateway.durable_job_lane import (
+        attach_durable_job_lane,
+        consume_slack_action_if_active,
+    )
+
+    handle = attach_durable_job_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    )
+    assert handle is not None
+    job, store = _seed_bound_job(handle, idempotency_key="idem-closed")
+    handle.shutdown()
+    result = consume_slack_action_if_active(
+        _verified_body(),
+        _action(
+            "hermes_durable_go",
+            {
+                "job_id": job.job_id,
+                "decision_idempotency_key": "dec-closed",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert result is not None
+    assert result.ok is False
+    assert result.retryable is True
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 0
+    assert _count_rows(store.sqlite_path, "job_decisions") == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_runner_start_stop_constructs_and_releases_lane(
+    monkeypatch, tmp_path
+):
+    from gateway.config import GatewayConfig
+    from gateway.durable_job_lane import get_active_durable_job_lane
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = _complete(tmp_path)
+    raw["gateway"] = {"loop_watchdog": False}
+    _write_active_config(tmp_path, raw)
+    runner = GatewayRunner(
+        GatewayConfig(
+            platforms={},
+            sessions_dir=tmp_path / "sessions",
+            loop_watchdog=False,
+        )
+    )
+    ok = await asyncio.wait_for(runner.start(), timeout=60)
+    assert ok is True
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert handle.preflight.constructible is True
+    assert handle.preflight.runtime_ready is False
+    assert get_active_durable_job_lane() is handle
+    await asyncio.wait_for(runner.stop(), timeout=60)
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert get_active_durable_job_lane() is None
+
+
 def test_seam_import_does_not_load_psycopg_or_slack_sdk():
     for name in ("psycopg", "slack_sdk", "slack_bolt"):
         sys.modules.pop(name, None)
@@ -407,3 +712,4 @@ def test_seam_import_does_not_load_psycopg_or_slack_sdk():
 
     assert "psycopg" not in sys.modules
     assert "slack_sdk" not in sys.modules
+    assert "slack_bolt" not in sys.modules

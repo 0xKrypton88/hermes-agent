@@ -7020,17 +7020,20 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_durable_job_action(self, ack, body, action) -> None:
         """Reuse existing Slack action ingress for durable Go/Hold/Pause/Cancel.
 
-        Acks first so Slack does not retry. Forwards to the lifecycle-owned
-        lane when attached; no-op otherwise. Does not log request bodies or
-        secret values.
+        Persist/consume before Slack ACK. Retryable DB/shutdown failures do
+        not ACK so Slack can retry. Permanent reject/spoof/inactive ACK
+        without durable consumption. Does not log request bodies or secrets.
         """
-        await ack()
         try:
             from gateway.durable_job_lane import consume_slack_action_if_active
 
-            consume_slack_action_if_active(body, action)
+            result = consume_slack_action_if_active(body, action)
         except Exception:
             logger.debug("[Slack] Durable job action handling failed", exc_info=True)
+            return
+        if result is not None and result.retryable:
+            return
+        await ack()
 
     async def _update_clarify_message(
         self,

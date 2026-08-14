@@ -54,6 +54,7 @@ class InboundActionResult:
     ack_status: str
     inbound_id: Optional[str] = None
     decision_id: Optional[str] = None
+    retryable: bool = False
 
 
 class InboundAckPort(Protocol):
@@ -419,6 +420,40 @@ def consume_inbound_action(
     if normalized_type is None:
         return InboundActionResult(ok=False, ack_status="rejected")
     decision_type = normalized_type
+    try:
+        return _consume_inbound_action_persist(
+            sqlite_path,
+            ack_port,
+            job_id=job_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            root_thread_ts=root_thread_ts,
+            actor_id=actor_id,
+            decision_type=decision_type,
+            decision_idempotency_key=decision_idempotency_key,
+            policy_version=policy_version,
+            candidate_id=candidate_id,
+            candidate_version=candidate_version,
+        )
+    except sqlite3.OperationalError:
+        return InboundActionResult(ok=False, ack_status="pending", retryable=True)
+
+
+def _consume_inbound_action_persist(
+    sqlite_path: SqlitePath,
+    ack_port: InboundAckPort,
+    *,
+    job_id: str,
+    workspace_id: str,
+    channel_id: str,
+    root_thread_ts: str,
+    actor_id: str,
+    decision_type: str,
+    decision_idempotency_key: str,
+    policy_version: str,
+    candidate_id: str,
+    candidate_version: str,
+) -> InboundActionResult:
     path = Path(sqlite_path)
     DurableJobStore(sqlite_path=path)
     requested = _inbound_tuple(

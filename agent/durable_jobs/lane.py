@@ -7,6 +7,7 @@ Binding is required before any provider or Slack effect.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
@@ -43,6 +44,18 @@ class DurableLaneService:
     ) -> None:
         self.config = config
         self._store = store
+        self._closed = False
+
+    def close(self) -> None:
+        """Idempotent shutdown. Subsequent consume is retryable, not reconstructed."""
+        self._closed = True
+        store = self._store
+        self._store = None
+        if store is not None and hasattr(store, "close"):
+            try:
+                store.close()
+            except Exception:
+                pass
 
     def _require_enabled(self) -> None:
         if not self.config.enabled:
@@ -208,6 +221,10 @@ class DurableLaneService:
         Authorized consumption uses the existing coordinator ACK/decision lane.
         """
         self._require_enabled()
+        if getattr(self, "_closed", False):
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
         if inbound_action_shape_rejected(
             job_id=job_id,
             workspace_id=workspace_id,
@@ -221,18 +238,23 @@ class DurableLaneService:
             candidate_version=candidate_version,
         ):
             return InboundActionResult(ok=False, ack_status="rejected")
-        store = self._require_sqlite_path()
-        return consume_durable_inbound_action(
-            store.sqlite_path,
-            ack_port,
-            job_id=job_id,
-            workspace_id=workspace_id,
-            channel_id=channel_id,
-            root_thread_ts=root_thread_ts,
-            actor_id=actor_id,
-            decision_type=decision_type,
-            decision_idempotency_key=decision_idempotency_key,
-            policy_version=policy_version,
-            candidate_id=candidate_id,
-            candidate_version=candidate_version,
-        )
+        try:
+            store = self._require_sqlite_path()
+            return consume_durable_inbound_action(
+                store.sqlite_path,
+                ack_port,
+                job_id=job_id,
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                root_thread_ts=root_thread_ts,
+                actor_id=actor_id,
+                decision_type=decision_type,
+                decision_idempotency_key=decision_idempotency_key,
+                policy_version=policy_version,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
+            )
+        except sqlite3.OperationalError:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
+            )
