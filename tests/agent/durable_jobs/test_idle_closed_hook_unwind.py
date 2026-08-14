@@ -69,6 +69,40 @@ def test_idle_cleanup_error_propagates_when_no_primary_exception(tmp_path):
     assert lane._active_leases == 0
 
 
+def test_idle_cleanup_error_propagates_inside_unrelated_outer_except(tmp_path):
+    """Body success inside ``except ValueError`` must not swallow hook errors.
+
+    On 301f6272 ``sys.exc_info()`` still sees the already-handled outer
+    ValueError, so ``_release_mutation_lease`` treats it as a primary and
+    drops the cleanup RuntimeError.
+    """
+    lane, _job, _store = _seed(tmp_path, idempotency_key="idem-hook-outer-except")
+    lane._after_idle_closed = _explode
+    try:
+        raise ValueError("outer")
+    except ValueError:
+        with pytest.raises(RuntimeError, match="hook exploded"):
+            with lane._mutation_lease():
+                with lane._lifecycle:
+                    lane._closed = True
+    assert lane._active_leases == 0
+
+
+def test_holder_close_inside_outer_except_still_raises_lane_closed(tmp_path):
+    from agent.durable_jobs.lane import LaneClosedError
+
+    lane, _job, _store = _seed(tmp_path, idempotency_key="idem-hook-outer-lce")
+    lane._after_idle_closed = _explode
+    try:
+        raise ValueError("outer")
+    except ValueError:
+        with pytest.raises(LaneClosedError):
+            with lane._mutation_lease():
+                lane.close()
+    assert lane._closed is True
+    assert lane._active_leases == 0
+
+
 def test_exploding_idle_hook_does_not_bypass_ack_pending_mapping(
     tmp_path, monkeypatch
 ):
