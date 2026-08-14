@@ -12,7 +12,7 @@ import json
 import logging
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from agent.durable_jobs.config import (
@@ -46,13 +46,21 @@ _LOCK = threading.Lock()
 _UNOWNED = 0
 # Keys are id(owner). ``_LANES`` stays handle-valued for existing readers.
 # ``_LANE_OWNERS`` is the reverse map so handle/no-arg detach can CAS-clear
-# the correct runner field. ``_RETIRING`` keeps an unpublished handle visible
-# until its leases drain so a later holder joins close() instead of treating
-# an empty registry as success.
+# the correct runner field. ``_RETIRING`` keeps unpublished retirement
+# state visible until leases drain. A later holder must fail closed
+# without re-entering the leader's in-flight ``shutdown()``.
 _LANES: dict[int, "DurableJobLaneHandle"] = {}
 _LANE_OWNERS: dict[int, Any] = {}
-_RETIRING: dict[int, "DurableJobLaneHandle"] = {}
+_RETIRING: dict[int, "_RetirementState"] = {}
 _OWNER_OPLOCKS: dict[int, threading.Lock] = {}
+
+
+@dataclass
+class _RetirementState:
+    handle: "DurableJobLaneHandle"
+    owner: Any
+    leader_ident: int
+    done: threading.Event = field(default_factory=threading.Event)
 
 _IDENTITY_PAYLOAD_KEYS = (
     "workspace_id",
@@ -167,37 +175,48 @@ def _cas_unpublish(
     key: int,
     owner: Any,
     expected: Optional["DurableJobLaneHandle"] = None,
-) -> Optional["DurableJobLaneHandle"]:
+) -> tuple[Optional["DurableJobLaneHandle"], Optional["_RetirementState"], bool]:
     """Owner-aware CAS unpublish. Caller holds the per-owner oplock.
 
     Removes the registry entry only if it is the expected handle (or the
     current handle when *expected* is None). Clears the owner field only
-    if it still references that same handle. Returns the unpublished
-    handle or the in-flight retiring handle so a later holder can join
-    ``close()``. Never shuts down; caller must release locks first.
+    if it still references that same handle. Returns
+    ``(handle, state, is_leader)``. ``is_leader`` is True only for the
+    thread that unpublished from ``_LANES``. A later caller seeing
+    in-flight retirement is a joiner and must not re-enter ``shutdown()``.
+    Never shuts down; caller must release locks first.
     """
     with _LOCK:
         current = _LANES.get(key)
         if expected is not None and current is not None and current is not expected:
             retiring = _RETIRING.get(key)
-            return retiring if retiring is expected else None
+            if retiring is not None and retiring.handle is expected:
+                return retiring.handle, retiring, False
+            return None, None, False
         if current is not None and (expected is None or current is expected):
             _LANES.pop(key, None)
             mapped_owner = _LANE_OWNERS.pop(key, owner)
-            _RETIRING[key] = current
             clear_owner = owner if owner is not None else mapped_owner
             if clear_owner is None:
                 clear_owner = _owner_from_handle(current)
+            state = _RetirementState(
+                handle=current,
+                owner=clear_owner,
+                leader_ident=threading.get_ident(),
+            )
+            _RETIRING[key] = state
             _cas_clear_runner_field(clear_owner, current)
-            return current
+            return current, state, True
         retiring = _RETIRING.get(key)
-        if retiring is not None and (expected is None or retiring is expected):
+        if retiring is not None and (
+            expected is None or retiring.handle is expected
+        ):
             clear_owner = owner if owner is not None else _LANE_OWNERS.get(key)
             if clear_owner is None:
-                clear_owner = _owner_from_handle(retiring)
-            _cas_clear_runner_field(clear_owner, retiring)
-            return retiring
-        return None
+                clear_owner = retiring.owner or _owner_from_handle(retiring.handle)
+            _cas_clear_runner_field(clear_owner, retiring.handle)
+            return retiring.handle, retiring, False
+        return None, None, False
 
 
 def _clear_retiring_if_idle(key: int, handle: "DurableJobLaneHandle") -> None:
@@ -213,8 +232,25 @@ def _clear_retiring_if_idle(key: int, handle: "DurableJobLaneHandle") -> None:
                 active = int(getattr(lane, "_active_leases", 0) or 0)
         idle = closed and active == 0
     with _LOCK:
-        if idle and _RETIRING.get(key) is handle:
+        current = _RETIRING.get(key)
+        if idle and current is not None and current.handle is handle:
             del _RETIRING[key]
+
+
+def _thread_holds_mutation_lease(handle: "DurableJobLaneHandle") -> bool:
+    lane = getattr(handle, "lane", None)
+    if lane is None:
+        return False
+    lifecycle = getattr(lane, "_lifecycle", None)
+    leases = getattr(lane, "_leases_by_thread", None)
+    ident = threading.get_ident()
+    if lifecycle is not None:
+        with lifecycle:
+            held = getattr(lane, "_leases_by_thread", {}).get(ident, 0)
+            return int(held or 0) > 0
+    if not isinstance(leases, dict):
+        return False
+    return int(leases.get(ident, 0) or 0) > 0
 
 
 def _shutdown_retired(key: int, handle: "DurableJobLaneHandle") -> None:
@@ -229,21 +265,61 @@ def _shutdown_retired(key: int, handle: "DurableJobLaneHandle") -> None:
         _clear_retiring_if_idle(key, handle)
 
 
+def _drive_or_join_retirement(
+    key: int,
+    handle: "DurableJobLaneHandle",
+    state: Optional["_RetirementState"],
+    is_leader: bool,
+) -> None:
+    """Leader drives shutdown; holder joiners fail closed without re-entry.
+
+    A later lease holder must not call the in-flight ``shutdown()`` — that
+    circular-waits the leader. Non-holder cleanup waits for the leader or
+    performs idempotent close of a leftover handle. Never holds ``_LOCK``
+    or the per-owner oplock across shutdown/I/O.
+    """
+    if is_leader:
+        try:
+            _shutdown_retired(key, handle)
+        finally:
+            if state is not None:
+                state.done.set()
+        return
+    if _thread_holds_mutation_lease(handle):
+        raise LaneClosedError(
+            "durable job lane is retiring; active holder must fail closed"
+        )
+    if state is not None and not state.done.is_set():
+        state.done.wait(timeout=30.0)
+        return
+    lane = getattr(handle, "lane", None)
+    if lane is not None and bool(getattr(lane, "_closed", False)):
+        return
+    try:
+        handle.shutdown()
+    except LaneClosedError:
+        raise
+    except Exception:
+        logger.debug("durable job lane retire failed", exc_info=True)
+
+
 def _retire_owner_lane(owner: Any) -> None:
     """Detach+shutdown the previously attached lane for this owner, if any.
 
-    Uses the shared CAS-unpublish primitive. If this owner already has an
-    in-flight retirement, join that close so a later lease holder is fenced
-    instead of treating an empty registry as success. Shutdown runs outside
-    the per-owner lock.
+    Uses the shared CAS-unpublish primitive. The first unpublisher is the
+    retirement leader and drives ``shutdown()``. A later lease holder
+    fails closed without re-entering that in-flight close. Shutdown runs
+    outside the per-owner lock.
     """
     key = _owner_key(owner)
     oplock = _owner_oplock(key)
     with oplock:
-        handle = _cas_unpublish(key=key, owner=owner, expected=None)
+        handle, state, is_leader = _cas_unpublish(
+            key=key, owner=owner, expected=None
+        )
     if handle is None:
         return
-    _shutdown_retired(key, handle)
+    _drive_or_join_retirement(key, handle, state, is_leader)
 
 
 def get_active_durable_job_lane() -> Optional[DurableJobLaneHandle]:
@@ -359,7 +435,9 @@ def attach_durable_job_lane(
             _LANES[key] = handle
             if owner is not None:
                 _LANE_OWNERS[key] = owner
-            _RETIRING.pop(key, None)
+            previous = _RETIRING.pop(key, None)
+        if previous is not None:
+            previous.done.set()
         _bind_handle_owner(handle, owner)
         _publish_runner_field(owner, handle)
         logger.info(
@@ -382,9 +460,13 @@ def _lookup_handle_binding(
         for key, owned in _LANES.items():
             if owned is handle:
                 return key, _LANE_OWNERS.get(key)
-        for key, owned in _RETIRING.items():
-            if owned is handle:
-                return key, _LANE_OWNERS.get(key) or _owner_from_handle(owned)
+        for key, state in _RETIRING.items():
+            if state.handle is handle:
+                return key, (
+                    _LANE_OWNERS.get(key)
+                    or state.owner
+                    or _owner_from_handle(state.handle)
+                )
     return _UNOWNED, None
 
 
@@ -392,33 +474,37 @@ def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> No
     """Idempotent shutdown. No-arg clears every owned lane (tests).
 
     Every path uses CAS-unpublish: registry and runner field change only
-    when they still name the exact retired handle. Handle-based detach
-    always joins ``shutdown()`` so a lease holder is fenced even after
-    the registry entry is already gone. Shutdown runs outside locks.
+    when they still name the exact retired handle. The first unpublisher
+    drives ``shutdown()``; a later lease holder fails closed without
+    re-entering that in-flight close. Shutdown runs outside locks.
     """
     holder_closed: Optional[LaneClosedError] = None
     if handle is None:
         with _LOCK:
             snapshot = list(_LANES.items())
-            retiring = list(_RETIRING.items())
+            retiring = [(key, state.handle) for key, state in _RETIRING.items()]
             owners = dict(_LANE_OWNERS)
         seen: set[int] = set()
-        to_close: list[tuple[int, DurableJobLaneHandle]] = []
+        to_close: list[
+            tuple[int, DurableJobLaneHandle, Optional[_RetirementState], bool]
+        ] = []
         for key, owned in snapshot + retiring:
             if id(owned) in seen:
                 continue
             owner = owners.get(key) or _owner_from_handle(owned)
             oplock = _owner_oplock(key)
             with oplock:
-                unpublished = _cas_unpublish(key=key, owner=owner, expected=owned)
+                unpublished, state, is_leader = _cas_unpublish(
+                    key=key, owner=owner, expected=owned
+                )
             target = unpublished if unpublished is not None else owned
             if id(target) in seen:
                 continue
             seen.add(id(target))
-            to_close.append((key, target))
-        for key, owned in to_close:
+            to_close.append((key, target, state, is_leader))
+        for key, owned, state, is_leader in to_close:
             try:
-                _shutdown_retired(key, owned)
+                _drive_or_join_retirement(key, owned, state, is_leader)
             except LaneClosedError as exc:
                 holder_closed = exc
             except Exception:
@@ -427,9 +513,11 @@ def detach_durable_job_lane(handle: Optional[DurableJobLaneHandle] = None) -> No
         key, owner = _lookup_handle_binding(handle)
         oplock = _owner_oplock(key)
         with oplock:
-            _cas_unpublish(key=key, owner=owner, expected=handle)
+            _unpublished, state, is_leader = _cas_unpublish(
+                key=key, owner=owner, expected=handle
+            )
         try:
-            _shutdown_retired(key, handle)
+            _drive_or_join_retirement(key, handle, state, is_leader)
         except LaneClosedError as exc:
             holder_closed = exc
         except Exception:
