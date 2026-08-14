@@ -2,8 +2,9 @@
 
 This package ships only protocols and inert null adapters. Live Slack / Cursor /
 network adapters are intentionally absent from this module. The ENG-30 Cursor
-Cloud adapter (``cursor_cloud.CursorCloudAdapter``) is inactive/fail-closed and
-requires an injected transport — it is not exported here and never enables
+Cloud adapter (``cursor_cloud.CursorCloudAdapter``) and ENG-31 Slack client
+bridge (``slack_bridge.SlackClientBridge``) are inactive/fail-closed and
+require an injected transport — they are not exported here and never enable
 Package 1 dispatch. Even when a fake is injected into
 ``DurableJobService``, Package 1 hard-disables dispatch and never calls
 ``dispatch()``. ENG-26/27 ledgers talk only to injected fakes after a durable

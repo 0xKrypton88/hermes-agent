@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, Union
 
-from agent.durable_jobs.decisions import DecisionLedger
+from agent.durable_jobs.decisions import DecisionLedger, DecisionType
 from agent.durable_jobs.effects import EffectStatus, ProviderEffectLedger
 from agent.durable_jobs.slack_contract import SlackBindingLedger, SlackRootStatus
 from agent.durable_jobs.store import DurableJobStore
@@ -324,6 +324,49 @@ _INBOUND_TUPLE_FIELDS = (
 )
 
 
+def normalize_inbound_decision_type(raw: object) -> Optional[str]:
+    """Map Slack Pause to durable Hold. Unknown actions fail closed."""
+    text = str(raw or "").strip().lower()
+    if text == "pause":
+        return DecisionType.HOLD.value
+    try:
+        return DecisionType(text).value
+    except ValueError:
+        return None
+
+
+def inbound_action_shape_rejected(
+    *,
+    job_id: object = "",
+    workspace_id: object = "",
+    channel_id: object = "",
+    root_thread_ts: object = "",
+    actor_id: object = "",
+    decision_type: object = "",
+    decision_idempotency_key: object = "",
+    policy_version: object = "",
+    candidate_id: object = "",
+    candidate_version: object = "",
+) -> bool:
+    """True when identity/action is missing or malformed. Does not open a store."""
+    values = {
+        "job_id": job_id,
+        "workspace_id": workspace_id,
+        "channel_id": channel_id,
+        "root_thread_ts": root_thread_ts,
+        "actor_id": actor_id,
+        "decision_type": decision_type,
+        "decision_idempotency_key": decision_idempotency_key,
+        "policy_version": policy_version,
+        "candidate_id": candidate_id,
+        "candidate_version": candidate_version,
+    }
+    for value in values.values():
+        if not isinstance(value, str) or not value.strip():
+            return True
+    return normalize_inbound_decision_type(decision_type) is None
+
+
 def _inbound_tuple(**kwargs: str) -> dict[str, str]:
     return {field: str(kwargs[field]) for field in _INBOUND_TUPLE_FIELDS}
 
@@ -356,7 +399,26 @@ def consume_inbound_action(
     ``decision_idempotency_key`` reuse is bound to the immutable request
     tuple. Mismatch rejects with no decision mutation and no ACK. Replay
     uses the persisted tuple, never caller-supplied cross-job context.
+    Missing/malformed identity or an unknown action is rejected before
+    any store connection. Slack ``pause`` is stored as durable ``hold``.
     """
+    if inbound_action_shape_rejected(
+        job_id=job_id,
+        workspace_id=workspace_id,
+        channel_id=channel_id,
+        root_thread_ts=root_thread_ts,
+        actor_id=actor_id,
+        decision_type=decision_type,
+        decision_idempotency_key=decision_idempotency_key,
+        policy_version=policy_version,
+        candidate_id=candidate_id,
+        candidate_version=candidate_version,
+    ):
+        return InboundActionResult(ok=False, ack_status="rejected")
+    normalized_type = normalize_inbound_decision_type(decision_type)
+    if normalized_type is None:
+        return InboundActionResult(ok=False, ack_status="rejected")
+    decision_type = normalized_type
     path = Path(sqlite_path)
     DurableJobStore(sqlite_path=path)
     requested = _inbound_tuple(

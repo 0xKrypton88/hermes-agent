@@ -73,6 +73,7 @@ def test_no_live_dispatch_adapter_is_exported():
     assert hasattr(adapters, "NullSlackPort")
     assert not hasattr(adapters, "SlackDispatchAdapter")
     assert not hasattr(adapters, "CursorCloudAdapter")
+    assert not hasattr(adapters, "SlackClientBridge")
 
 
 def test_pilot_flow_and_dispatch_rejection_open_no_network_sockets(

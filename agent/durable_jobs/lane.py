@@ -10,6 +10,12 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
+from agent.durable_jobs.coordinator import (
+    InboundAckPort,
+    InboundActionResult,
+    consume_inbound_action as consume_durable_inbound_action,
+    inbound_action_shape_rejected,
+)
 from agent.durable_jobs.decisions import DecisionLedger, DecisionResult, JobAuthzPolicy
 from agent.durable_jobs.effects import (
     CursorProviderPort,
@@ -179,4 +185,54 @@ class DurableLaneService:
             actor_id=actor_id,
             policy_version=policy_version,
             decision_idempotency_key=decision_idempotency_key,
+        )
+
+    def consume_inbound_action(
+        self,
+        ack_port: InboundAckPort,
+        *,
+        job_id: str,
+        workspace_id: str,
+        channel_id: str,
+        root_thread_ts: str,
+        actor_id: str,
+        decision_type: str,
+        decision_idempotency_key: str,
+        policy_version: str,
+        candidate_id: str,
+        candidate_version: str,
+    ) -> InboundActionResult:
+        """Durable Go/Pause/Cancel ingress. No parallel Slack router.
+
+        Disabled and malformed identity reject before a store is constructed.
+        Authorized consumption uses the existing coordinator ACK/decision lane.
+        """
+        self._require_enabled()
+        if inbound_action_shape_rejected(
+            job_id=job_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            root_thread_ts=root_thread_ts,
+            actor_id=actor_id,
+            decision_type=decision_type,
+            decision_idempotency_key=decision_idempotency_key,
+            policy_version=policy_version,
+            candidate_id=candidate_id,
+            candidate_version=candidate_version,
+        ):
+            return InboundActionResult(ok=False, ack_status="rejected")
+        store = self._require_sqlite_path()
+        return consume_durable_inbound_action(
+            store.sqlite_path,
+            ack_port,
+            job_id=job_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            root_thread_ts=root_thread_ts,
+            actor_id=actor_id,
+            decision_type=decision_type,
+            decision_idempotency_key=decision_idempotency_key,
+            policy_version=policy_version,
+            candidate_id=candidate_id,
+            candidate_version=candidate_version,
         )

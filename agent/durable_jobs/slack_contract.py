@@ -1227,21 +1227,53 @@ def _finish_observed_slack_delivery(
     return ledger.bind_observed_delivery(job_id, message_ts, status=status)
 
 
+def _posted_field(posted: Any, *names: str) -> Optional[str]:
+    for name in names:
+        value = None
+        if isinstance(posted, dict):
+            value = posted.get(name)
+        else:
+            value = getattr(posted, name, None)
+        if isinstance(value, dict):
+            value = value.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _filter_slack_lookup_matches(
-    matches: list, expected_client_msg_id: str
+    matches: list, binding: SlackJobBinding
 ) -> tuple[list, bool]:
-    """Keep posts for the immutable client_msg_id. Foreign ids are never adopted."""
+    """Keep posts for the immutable binding. Foreign/mismatched ids are never adopted."""
     usable: list = []
     foreign = False
+    expected_client_msg_id = binding.outbound_client_msg_id
     for posted in matches:
-        message_ts = getattr(posted, "message_ts", None)
-        client_msg_id = getattr(posted, "client_msg_id", None)
+        message_ts = _posted_field(posted, "message_ts", "ts")
         if not message_ts:
             continue
-        if client_msg_id is None or client_msg_id == expected_client_msg_id:
-            usable.append(posted)
-        else:
+        client_msg_id = _posted_field(posted, "client_msg_id")
+        if client_msg_id is not None and client_msg_id != expected_client_msg_id:
             foreign = True
+            continue
+        mismatched = False
+        checks = (
+            (_posted_field(posted, "workspace_id", "team_id", "team"), binding.workspace_id),
+            (_posted_field(posted, "channel_id", "channel"), binding.channel_id),
+            (
+                _posted_field(posted, "root_thread_ts", "thread_ts"),
+                binding.root_thread_ts,
+            ),
+            (_posted_field(posted, "job_id"), binding.job_id),
+        )
+        for observed, expected in checks:
+            if observed is not None and observed != expected:
+                mismatched = True
+                break
+        if mismatched:
+            foreign = True
+            continue
+        usable.append(posted)
     return usable, foreign
 
 
@@ -1276,9 +1308,7 @@ def _lookup_slack_root(
     matches = list(
         slack_port.lookup_by_client_msg_id(binding.outbound_client_msg_id)
     )
-    usable, foreign = _filter_slack_lookup_matches(
-        matches, binding.outbound_client_msg_id
-    )
+    usable, foreign = _filter_slack_lookup_matches(matches, binding)
     if len(usable) == 1 and not foreign:
         return _finish_observed_slack_delivery(
             ledger,
