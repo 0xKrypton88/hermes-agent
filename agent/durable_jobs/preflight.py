@@ -17,6 +17,10 @@ from agent.durable_jobs.config import (
     DurableJobsConfigError,
     load_durable_jobs_config,
 )
+from agent.durable_jobs.injected_transports import (
+    CursorCloudInjectedTransport,
+    SlackInjectedTransport,
+)
 from agent.durable_jobs.redaction import redact_secret_text
 
 
@@ -77,34 +81,41 @@ def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
     return reasons
 
 
+def _approved_cursor_transport(transport: Any) -> bool:
+    return isinstance(transport, CursorCloudInjectedTransport) and bool(
+        transport.can_resolve_secret_ref()
+    )
+
+
+def _approved_slack_transport(transport: Any) -> bool:
+    return isinstance(transport, SlackInjectedTransport) and bool(
+        transport.can_resolve_secret_ref()
+    )
+
+
 def _injected_transport_capability(
     cfg: DurableJobsConfig,
     cursor_transport: Any,
     slack_transport: Any,
 ) -> bool:
     if cfg.cursor_adapter_mode == ADAPTER_MODE_INJECTED:
-        if not all(
-            callable(getattr(cursor_transport, name, None))
-            for name in ("create", "lookup", "status")
-        ):
+        if not _approved_cursor_transport(cursor_transport):
             return False
     if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
-        if not all(
-            callable(getattr(slack_transport, name, None))
-            for name in ("post_root", "lookup_by_client_msg_id")
-        ):
+        if not _approved_slack_transport(slack_transport):
             return False
     return True
 
 
 def _transport_secret_ref(transport: Any) -> Optional[str]:
-    if transport is None:
+    if not isinstance(
+        transport, (CursorCloudInjectedTransport, SlackInjectedTransport)
+    ):
         return None
-    raw = getattr(transport, "secret_ref", None)
-    if callable(raw):
-        raw = None
-    if raw is None:
-        raw = getattr(transport, "_secret_ref", None)
+    try:
+        raw = transport.secret_ref
+    except Exception:
+        return None
     if not isinstance(raw, str):
         return None
     text = raw.strip()

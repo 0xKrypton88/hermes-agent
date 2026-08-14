@@ -54,6 +54,13 @@ class CursorCloudInjectedTransport:
     def secret_ref(self) -> str:
         return self._secret_ref
 
+    def can_resolve_secret_ref(self) -> bool:
+        """True when an injected request callable is bound to this secret ref.
+
+        Never reads environment values or returns credential material.
+        """
+        return callable(self._request) and bool(self._secret_ref)
+
     def create(
         self, *, idempotency_key: str, job_id: str, name: str, agent_id: str
     ) -> Any:
@@ -112,6 +119,13 @@ class SlackInjectedTransport:
     @property
     def secret_ref(self) -> str:
         return self._secret_ref
+
+    def can_resolve_secret_ref(self) -> bool:
+        """True when an injected request callable is bound to this secret ref.
+
+        Never reads environment values or returns credential material.
+        """
+        return callable(self._request) and bool(self._secret_ref)
 
     def post_root(
         self,

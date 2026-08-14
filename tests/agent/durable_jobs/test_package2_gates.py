@@ -322,6 +322,7 @@ def test_preflight_runtime_ready_requires_injected_transport_capability(
     )
     assert ready.constructible is True
     assert ready.secret_refs_present is True
+    assert ready.transport_capability is True
     assert ready.runtime_ready is True
     assert "secret_refs_missing" not in ready.reasons
     assert "transport_capability_missing" not in ready.reasons
@@ -396,6 +397,62 @@ def test_preflight_runtime_ready_requires_transport_secret_ref_binding(
     assert other_cursor not in dumped
     assert other_slack not in dumped
     assert "xoxb-" not in dumped
+
+
+def test_preflight_runtime_ready_rejects_metadata_only_duck_transports(
+    tmp_path, monkeypatch
+):
+    """Matching method names + public secret_ref strings are not capability."""
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    class MetadataOnlyCursorTransport:
+        secret_ref = "CURSOR_API_KEY"
+        _secret_ref = "CURSOR_API_KEY"
+
+        def create(self, **_k):
+            return None
+
+        def lookup(self, **_k):
+            return None
+
+        def status(self, **_k):
+            return None
+
+    class MetadataOnlySlackTransport:
+        secret_ref = "SLACK_BOT_TOKEN"
+        _secret_ref = "SLACK_BOT_TOKEN"
+
+        def post_root(self, **_k):
+            return None
+
+        def lookup_by_client_msg_id(self, client_msg_id: str):
+            return None
+
+    raw = _complete_sqlite(tmp_path)
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+
+    report = preflight_durable_jobs(
+        raw,
+        cursor_transport=MetadataOnlyCursorTransport(),
+        slack_transport=MetadataOnlySlackTransport(),
+    )
+    assert report.constructible is True
+    assert report.secret_refs_present is True
+    assert report.transport_capability is False
+    assert report.runtime_ready is False
+    assert "transport_capability_missing" in report.reasons
+    assert "transport_secret_ref_mismatch" not in report.reasons
+    dumped = str(report)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "supersecret" not in dumped
+    for reason in report.reasons:
+        assert "CURSOR_API_KEY" not in reason
+        assert "SLACK_BOT_TOKEN" not in reason
+        assert CURSOR_TOKEN not in reason
+        assert SLACK_TOKEN not in reason
 
 
 def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):
@@ -501,6 +558,8 @@ def test_injected_transports_are_production_shaped_and_secret_ref_only():
         request=request, secret_ref="CURSOR_API_KEY"
     )
     slack = SlackInjectedTransport(request=request, secret_ref="SLACK_BOT_TOKEN")
+    assert cursor.can_resolve_secret_ref() is True
+    assert slack.can_resolve_secret_ref() is True
     created = cursor.create(
         idempotency_key="cursor:job:create_run",
         job_id="job-1",
