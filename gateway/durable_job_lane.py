@@ -45,6 +45,7 @@ _ACTION_TO_DECISION = {
 _LOCK = threading.Lock()
 _UNOWNED = 0
 _LANES: dict[int, "DurableJobLaneHandle"] = {}
+_OWNER_OPLOCKS: dict[int, threading.Lock] = {}
 
 _IDENTITY_PAYLOAD_KEYS = (
     "workspace_id",
@@ -110,11 +111,35 @@ def _owner_key(owner: Any) -> int:
     return id(owner)
 
 
-def _clear_owner_runner_field(owner: Any) -> None:
-    if owner is None or not hasattr(owner, "_durable_job_lane"):
+def _owner_oplock(key: int) -> threading.Lock:
+    """Per-owner lock. Never acquire this while holding ``_LOCK``."""
+    with _LOCK:
+        lock = _OWNER_OPLOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _OWNER_OPLOCKS[key] = lock
+        return lock
+
+
+def _publish_runner_field(
+    owner: Any, handle: Optional["DurableJobLaneHandle"]
+) -> None:
+    if owner is None:
         return
     try:
-        owner._durable_job_lane = None
+        owner._durable_job_lane = handle
+    except Exception:
+        pass
+
+
+def _cas_clear_runner_field(
+    owner: Any, expected: Optional["DurableJobLaneHandle"]
+) -> None:
+    if owner is None or expected is None:
+        return
+    try:
+        if getattr(owner, "_durable_job_lane", None) is expected:
+            owner._durable_job_lane = None
     except Exception:
         pass
 
@@ -122,18 +147,25 @@ def _clear_owner_runner_field(owner: Any) -> None:
 def _retire_owner_lane(owner: Any) -> None:
     """Detach+shutdown the previously attached lane for this owner, if any.
 
-    Unauthorized/unready reattach must not leave a live handle in ``_LANES``
-    or keep Slack ingress active. Shutdown runs outside ``_LOCK``.
+    Registry pop and runner-field CAS run under the per-owner lock.
+    Shutdown runs outside that lock so a concurrent valid attach can
+    publish without holding shutdown I/O, and a lease-holder reattach
+    cannot deadlock against a waiter.
     """
     key = _owner_key(owner)
-    with _LOCK:
-        handle = _LANES.pop(key, None)
-    if handle is not None:
-        try:
-            handle.shutdown()
-        except Exception:
-            logger.debug("durable job lane retire failed", exc_info=True)
-    _clear_owner_runner_field(owner)
+    oplock = _owner_oplock(key)
+    with oplock:
+        with _LOCK:
+            handle = _LANES.pop(key, None)
+        _cas_clear_runner_field(owner, handle)
+    if handle is None:
+        return
+    try:
+        handle.shutdown()
+    except LaneClosedError:
+        raise
+    except Exception:
+        logger.debug("durable job lane retire failed", exc_info=True)
 
 
 def get_active_durable_job_lane() -> Optional[DurableJobLaneHandle]:
@@ -196,6 +228,8 @@ def attach_durable_job_lane(
     except DurableJobsConfigError:
         _retire_owner_lane(owner)
         return None
+    except LaneClosedError:
+        raise
     except Exception:
         logger.debug("durable job lane preflight failed", exc_info=True)
         _retire_owner_lane(owner)
@@ -213,11 +247,13 @@ def attach_durable_job_lane(
         return None
 
     key = _owner_key(owner)
-    with _LOCK:
-        if key in _LANES:
-            raise DurableJobLaneAlreadyAttached(
-                "durable job lane is already attached for this owner"
-            )
+    oplock = _owner_oplock(key)
+    with oplock:
+        with _LOCK:
+            if key in _LANES:
+                raise DurableJobLaneAlreadyAttached(
+                    "durable job lane is already attached for this owner"
+                )
         try:
             cursor_adapter = cursor_adapter_from_config(
                 cfg, transport=cursor_transport
@@ -232,10 +268,18 @@ def attach_durable_job_lane(
                 slack_adapter=slack_adapter,
                 preflight=report,
             )
+        except LaneClosedError:
+            raise
         except Exception:
             logger.debug("durable job lane construct failed", exc_info=True)
             return None
-        _LANES[key] = handle
+        with _LOCK:
+            if key in _LANES:
+                raise DurableJobLaneAlreadyAttached(
+                    "durable job lane is already attached for this owner"
+                )
+            _LANES[key] = handle
+        _publish_runner_field(owner, handle)
         logger.info(
             "Durable job lane constructed (dispatch_allowed=%s, adapters=%s/%s)",
             cfg.dispatch_allowed,
@@ -278,33 +322,37 @@ def attach_to_gateway_runner(
             raw_config=raw_config, owner=runner, **kwargs
         )
     except DurableJobLaneAlreadyAttached:
-        with _LOCK:
-            handle = _LANES.get(id(runner))
+        key = id(runner)
+        oplock = _owner_oplock(key)
+        with oplock:
+            with _LOCK:
+                handle = _LANES.get(key)
+            if handle is not None:
+                _publish_runner_field(runner, handle)
+        return handle
+    except LaneClosedError:
+        raise
     except Exception:
         logger.debug("durable job lane attach failed (fail-closed)", exc_info=True)
-        handle = None
-    runner._durable_job_lane = handle
+        return None
     return handle
 
 
 def detach_from_gateway_runner(runner: Any) -> None:
     key = id(runner)
-    with _LOCK:
-        owned = _LANES.pop(key, None)
-    holder_closed: Optional[LaneClosedError] = None
-    if owned is not None:
-        try:
-            owned.shutdown()
-        except LaneClosedError as exc:
-            holder_closed = exc
-        except Exception:
-            logger.debug("durable job lane detach failed", exc_info=True)
+    oplock = _owner_oplock(key)
+    with oplock:
+        with _LOCK:
+            owned = _LANES.pop(key, None)
+        _cas_clear_runner_field(runner, owned)
+    if owned is None:
+        return
     try:
-        runner._durable_job_lane = None
+        owned.shutdown()
+    except LaneClosedError:
+        raise
     except Exception:
-        pass
-    if holder_closed is not None:
-        raise holder_closed
+        logger.debug("durable job lane detach failed", exc_info=True)
 
 
 def _text(value: Any) -> str:

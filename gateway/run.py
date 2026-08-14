@@ -10892,28 +10892,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         hard-disabled even when the lane is constructed.
         """
         try:
-            from gateway.durable_job_lane import attach_to_gateway_runner
+            from gateway.durable_job_lane import LaneClosedError, attach_to_gateway_runner
 
             attach_to_gateway_runner(self)
+        except LaneClosedError:
+            raise
         except Exception:
             logger.warning(
                 "Durable Job Lane construction failed; gateway continues without it",
                 exc_info=True,
             )
-            self._durable_job_lane = None
 
     def _maybe_detach_durable_job_lane(self) -> None:
         """Idempotent shutdown of a lifecycle-owned durable-job lane."""
         try:
-            from gateway.durable_job_lane import detach_from_gateway_runner
+            from gateway.durable_job_lane import LaneClosedError, detach_from_gateway_runner
 
             detach_from_gateway_runner(self)
+        except LaneClosedError:
+            raise
         except Exception:
             logger.debug("Durable Job Lane detach failed", exc_info=True)
-            try:
-                self._durable_job_lane = None
-            except Exception:
-                pass
 
     async def start(self) -> bool:
         """
@@ -12952,7 +12951,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _detach_lane = getattr(self, "_maybe_detach_durable_job_lane", None)
         if callable(_detach_lane):
             try:
+                from agent.durable_jobs.lane import LaneClosedError as _LaneClosedError
+
                 _detach_lane()
+            except _LaneClosedError:
+                raise
             except Exception:
                 logger.debug("Durable Job Lane detach failed", exc_info=True)
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
