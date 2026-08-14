@@ -146,6 +146,15 @@ class DurableLaneService:
     def _before_mutation_lease(self) -> None:
         return None
 
+    def _after_idle_closed(self) -> None:
+        """Called after the last mutation lease releases on a closed lane.
+
+        Production is a no-op. The gateway seam may bind an instance hook
+        so idle retirement state can be dropped without importing gateway
+        from this module. Must not run while ``_lifecycle`` is held.
+        """
+        return None
+
     def _acquire_mutation_lease(self) -> None:
         with self._lifecycle:
             if self._closed:
@@ -155,6 +164,7 @@ class DurableLaneService:
             self._active_leases += 1
 
     def _release_mutation_lease(self) -> None:
+        idle_closed = False
         with self._lifecycle:
             ident = threading.get_ident()
             held = self._leases_by_thread.get(ident, 0)
@@ -165,6 +175,9 @@ class DurableLaneService:
             if self._active_leases > 0:
                 self._active_leases -= 1
             self._close_idle.notify_all()
+            idle_closed = self._closed and self._active_leases == 0
+        if idle_closed:
+            self._after_idle_closed()
 
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:

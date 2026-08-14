@@ -158,6 +158,30 @@ def _publish_runner_field(
         pass
 
 
+def _bind_idle_cleanup(key: int, handle: "DurableJobLaneHandle") -> None:
+    """Drop ``_RETIRING`` when the closed lane's last lease releases.
+
+    Bound on the lane instance so ``DurableLaneService`` does not import
+    this module. The hook must run outside ``_lifecycle``.
+    """
+    lane = getattr(handle, "lane", None)
+    if lane is None:
+        return
+
+    def _after_idle_closed() -> None:
+        _clear_retiring_if_idle(key, handle)
+
+    lane._after_idle_closed = _after_idle_closed
+
+
+def _unbind_idle_cleanup(handle: "DurableJobLaneHandle") -> None:
+    lane = getattr(handle, "lane", None)
+    if lane is None:
+        return
+    if "_after_idle_closed" in getattr(lane, "__dict__", {}):
+        delattr(lane, "_after_idle_closed")
+
+
 def _cas_clear_runner_field(
     owner: Any, expected: Optional["DurableJobLaneHandle"]
 ) -> None:
@@ -206,6 +230,7 @@ def _cas_unpublish(
             )
             _RETIRING[key] = state
             _cas_clear_runner_field(clear_owner, current)
+            _bind_idle_cleanup(key, current)
             return current, state, True
         retiring = _RETIRING.get(key)
         if retiring is not None and (
@@ -235,6 +260,7 @@ def _clear_retiring_if_idle(key: int, handle: "DurableJobLaneHandle") -> None:
         current = _RETIRING.get(key)
         if idle and current is not None and current.handle is handle:
             del _RETIRING[key]
+            _unbind_idle_cleanup(handle)
 
 
 def _thread_holds_mutation_lease(handle: "DurableJobLaneHandle") -> bool:
@@ -438,6 +464,7 @@ def attach_durable_job_lane(
             previous = _RETIRING.pop(key, None)
         if previous is not None:
             previous.done.set()
+            _unbind_idle_cleanup(previous.handle)
         _bind_handle_owner(handle, owner)
         _publish_runner_field(owner, handle)
         logger.info(
