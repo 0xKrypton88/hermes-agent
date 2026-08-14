@@ -713,3 +713,138 @@ def test_package2_modules_do_not_import_psycopg_or_live_sdks():
     assert "psycopg" not in sys.modules
     assert "slack_sdk" not in sys.modules
     assert "slack_bolt" not in sys.modules
+
+
+def _seed_lane_job(
+    tmp_path: Path,
+    *,
+    repository_identity: str,
+    include_identity_binding: bool = True,
+    idempotency_key: str = "idem-lane",
+):
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.lane import DurableLaneService
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+    from agent.durable_jobs.store import DurableJobStore
+
+    raw = _complete_sqlite(tmp_path, dispatch_enabled=False)
+    if not include_identity_binding:
+        raw["durable_jobs"].pop("identity_binding", None)
+    cfg = load_durable_jobs_config(raw)
+    store = DurableJobStore(sqlite_path=cfg.sqlite_path)
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="lane-invariant",
+        repository_identity=repository_identity,
+        idempotency_key=idempotency_key,
+    )
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    lane = DurableLaneService(config=cfg, store=store)
+    return lane, job, store
+
+
+def _inbound_kwargs(job, **overrides):
+    payload = dict(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        actor_id="U-alice",
+        decision_type="go",
+        decision_idempotency_key="dec-lane",
+        policy_version="pol-1",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_lane_consume_rejects_cross_repo_job_with_zero_writes_or_ack(tmp_path):
+    from tests.agent.durable_jobs.eng28_support import RecordingAckPort, count_table
+
+    lane, job, store = _seed_lane_job(
+        tmp_path,
+        repository_identity="github.com/evil/other",
+        idempotency_key="idem-generic-cross-repo",
+    )
+    assert lane.config.identity_binding is not None
+    assert (
+        lane.config.identity_binding.repository_identity
+        == "github.com/example/repo"
+    )
+    assert job.repository_identity == "github.com/evil/other"
+    ack = RecordingAckPort()
+    result = lane.consume_inbound_action(ack, **_inbound_kwargs(job))
+    assert result.ok is False
+    assert result.ack_status == "rejected"
+    assert getattr(result, "retryable", False) is False
+    assert ack.acks == []
+    assert count_table(store.sqlite_path, "job_inbound_actions") == 0
+    assert count_table(store.sqlite_path, "job_decisions") == 0
+
+
+def test_lane_consume_rejects_missing_identity_binding_with_zero_writes(tmp_path):
+    from tests.agent.durable_jobs.eng28_support import RecordingAckPort, count_table
+
+    lane, job, store = _seed_lane_job(
+        tmp_path,
+        repository_identity="github.com/example/repo",
+        include_identity_binding=False,
+        idempotency_key="idem-missing-binding",
+    )
+    assert lane.config.identity_binding is None
+    ack = RecordingAckPort()
+    result = lane.consume_inbound_action(ack, **_inbound_kwargs(job))
+    assert result.ok is False
+    assert result.ack_status == "rejected"
+    assert ack.acks == []
+    assert count_table(store.sqlite_path, "job_inbound_actions") == 0
+    assert count_table(store.sqlite_path, "job_decisions") == 0
+
+
+def test_lane_consume_does_not_reopen_store_after_close_between_check_and_use(
+    tmp_path,
+):
+    from agent.durable_jobs.lane import DurableLaneService
+    from tests.agent.durable_jobs.eng28_support import RecordingAckPort, count_table
+
+    class _CloseBeforeStoreUse(DurableLaneService):
+        def _require_sqlite_path(self):
+            DurableLaneService.close(self)
+            return DurableLaneService._require_sqlite_path(self)
+
+    base_lane, job, store = _seed_lane_job(
+        tmp_path,
+        repository_identity="github.com/example/repo",
+        idempotency_key="idem-toctou-close",
+    )
+    racing = _CloseBeforeStoreUse(config=base_lane.config, store=store)
+    ack = RecordingAckPort()
+    result = racing.consume_inbound_action(
+        ack, **_inbound_kwargs(job, decision_idempotency_key="dec-toctou")
+    )
+    assert result.ok is False
+    assert result.retryable is True
+    assert result.ack_status == "pending"
+    assert ack.acks == []
+    assert racing._closed is True
+    assert racing._store is None
+    assert count_table(store.sqlite_path, "job_inbound_actions") == 0
+    assert count_table(store.sqlite_path, "job_decisions") == 0

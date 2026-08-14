@@ -369,12 +369,6 @@ def consume_slack_action_if_active(
     if getattr(handle.lane, "_closed", False):
         return InboundActionResult(ok=False, ack_status="pending", retryable=True)
     try:
-        job = handle.lane._require_sqlite_path().get_job(parsed["job_id"])
-    except sqlite3.OperationalError:
-        return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-    if job is None or job.repository_identity != binding.repository_identity:
-        return InboundActionResult(ok=False, ack_status="rejected")
-    try:
         return handle.lane.consume_inbound_action(
             ack_port if ack_port is not None else _SilentAck(),
             **parsed,

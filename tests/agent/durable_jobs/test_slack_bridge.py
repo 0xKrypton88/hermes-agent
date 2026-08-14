@@ -95,6 +95,10 @@ def _lane(tmp_path: Path, store=None, *, enabled: bool = True):
                 "dispatch_enabled": False,
                 "sqlite_path": sqlite_path,
                 "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+                "identity_binding": {
+                    "workspace_id": "T1",
+                    "repository_identity": "github.com/example/repo",
+                },
             }
         }
     )

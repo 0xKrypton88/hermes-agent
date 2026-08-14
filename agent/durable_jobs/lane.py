@@ -8,6 +8,7 @@ Binding is required before any provider or Slack effect.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from typing import Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
@@ -36,6 +37,10 @@ from agent.durable_jobs.slack_contract import (
 from agent.durable_jobs.store import DurableJobStore
 
 
+class LaneClosedError(RuntimeError):
+    """Closed durable lane refuses store reconstruction and mutation."""
+
+
 class DurableLaneService:
     def __init__(
         self,
@@ -45,12 +50,14 @@ class DurableLaneService:
         self.config = config
         self._store = store
         self._closed = False
+        self._lifecycle = threading.Lock()
 
     def close(self) -> None:
         """Idempotent shutdown. Subsequent consume is retryable, not reconstructed."""
-        self._closed = True
-        store = self._store
-        self._store = None
+        with self._lifecycle:
+            self._closed = True
+            store = self._store
+            self._store = None
         if store is not None and hasattr(store, "close"):
             try:
                 store.close()
@@ -64,20 +71,32 @@ class DurableLaneService:
             )
 
     def _require_sqlite_path(self) -> DurableJobStore:
-        if self.config.resolved_backend == "postgresql":
-            raise DurableJobsConfigError(
-                "durable-lane Slack/provider/decision ledgers do not fall back "
-                "to SQLite when durable_jobs.backend is postgresql"
-            )
-        if self._store is not None:
+        with self._lifecycle:
+            if self._closed:
+                raise LaneClosedError("durable lane is closed")
+            if self.config.resolved_backend == "postgresql":
+                raise DurableJobsConfigError(
+                    "durable-lane Slack/provider/decision ledgers do not fall back "
+                    "to SQLite when durable_jobs.backend is postgresql"
+                )
+            if self._store is not None:
+                return self._store
+            if self.config.sqlite_path is None:
+                raise DurableJobsConfigError(
+                    "durable_jobs.sqlite_path must be set explicitly "
+                    "(disposable / test path); refusing default Hermes state.db"
+                )
+            self._store = DurableJobStore(sqlite_path=self.config.sqlite_path)
             return self._store
-        if self.config.sqlite_path is None:
-            raise DurableJobsConfigError(
-                "durable_jobs.sqlite_path must be set explicitly "
-                "(disposable / test path); refusing default Hermes state.db"
-            )
-        self._store = DurableJobStore(sqlite_path=self.config.sqlite_path)
-        return self._store
+
+    def _repository_identity_rejected(
+        self, store: DurableJobStore, job_id: str
+    ) -> bool:
+        binding = self.config.identity_binding
+        if binding is None or not str(binding.repository_identity or "").strip():
+            return True
+        job = store.get_job(job_id)
+        return job is None or job.repository_identity != binding.repository_identity
 
     def bind_slack(
         self,
@@ -240,6 +259,8 @@ class DurableLaneService:
             return InboundActionResult(ok=False, ack_status="rejected")
         try:
             store = self._require_sqlite_path()
+            if self._repository_identity_rejected(store, job_id):
+                return InboundActionResult(ok=False, ack_status="rejected")
             return consume_durable_inbound_action(
                 store.sqlite_path,
                 ack_port,
@@ -253,6 +274,10 @@ class DurableLaneService:
                 policy_version=policy_version,
                 candidate_id=candidate_id,
                 candidate_version=candidate_version,
+            )
+        except LaneClosedError:
+            return InboundActionResult(
+                ok=False, ack_status="pending", retryable=True
             )
         except sqlite3.OperationalError:
             return InboundActionResult(
