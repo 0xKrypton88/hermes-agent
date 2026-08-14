@@ -455,6 +455,71 @@ def test_preflight_runtime_ready_rejects_metadata_only_duck_transports(
         assert SLACK_TOKEN not in reason
 
 
+def test_preflight_runtime_ready_rejects_unbound_subclass_transports(
+    tmp_path, monkeypatch
+):
+    """Subclasses must not spoof capability by overriding can_resolve_secret_ref."""
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    class UnboundCursorSubclass(CursorCloudInjectedTransport):
+        def __init__(self, **_k):
+            self._secret_ref = "CURSOR_API_KEY"
+
+        @property
+        def secret_ref(self) -> str:
+            return "CURSOR_API_KEY"
+
+        def can_resolve_secret_ref(self) -> bool:
+            return True
+
+    class UnboundSlackSubclass(SlackInjectedTransport):
+        def __init__(self, **_k):
+            self._secret_ref = "SLACK_BOT_TOKEN"
+
+        @property
+        def secret_ref(self) -> str:
+            return "SLACK_BOT_TOKEN"
+
+        def can_resolve_secret_ref(self) -> bool:
+            return True
+
+    raw = _complete_sqlite(tmp_path)
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+
+    cursor = UnboundCursorSubclass()
+    slack = UnboundSlackSubclass()
+    assert isinstance(cursor, CursorCloudInjectedTransport)
+    assert isinstance(slack, SlackInjectedTransport)
+    assert cursor.can_resolve_secret_ref() is True
+    assert slack.can_resolve_secret_ref() is True
+    assert not hasattr(cursor, "_request")
+    assert not hasattr(slack, "_request")
+
+    report = preflight_durable_jobs(
+        raw, cursor_transport=cursor, slack_transport=slack
+    )
+    assert report.constructible is True
+    assert report.secret_refs_present is True
+    assert report.transport_capability is False
+    assert report.runtime_ready is False
+    assert "transport_capability_missing" in report.reasons
+    dumped = str(report)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "supersecret" not in dumped
+    for reason in report.reasons:
+        assert "CURSOR_API_KEY" not in reason
+        assert "SLACK_BOT_TOKEN" not in reason
+        assert CURSOR_TOKEN not in reason
+        assert SLACK_TOKEN not in reason
+
+
 def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):
     import types
 

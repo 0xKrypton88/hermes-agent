@@ -81,15 +81,24 @@ def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
     return reasons
 
 
-def _approved_cursor_transport(transport: Any) -> bool:
-    return isinstance(transport, CursorCloudInjectedTransport) and bool(
-        transport.can_resolve_secret_ref()
-    )
+def _instance_attr(transport: Any, name: str) -> Any:
+    try:
+        return object.__getattribute__(transport, name)
+    except AttributeError:
+        return None
 
 
-def _approved_slack_transport(transport: Any) -> bool:
-    return isinstance(transport, SlackInjectedTransport) and bool(
-        transport.can_resolve_secret_ref()
+def _concrete_injected_transport(transport: Any, expected_cls: type) -> bool:
+    """Exact concrete type plus a real callable request operation.
+
+    Subclasses and overridable helpers are not a supported readiness contract.
+    """
+    if type(transport) is not expected_cls:
+        return False
+    request = _instance_attr(transport, "_request")
+    secret_ref = _instance_attr(transport, "_secret_ref")
+    return callable(request) and isinstance(secret_ref, str) and bool(
+        secret_ref.strip()
     )
 
 
@@ -99,23 +108,25 @@ def _injected_transport_capability(
     slack_transport: Any,
 ) -> bool:
     if cfg.cursor_adapter_mode == ADAPTER_MODE_INJECTED:
-        if not _approved_cursor_transport(cursor_transport):
+        if not _concrete_injected_transport(
+            cursor_transport, CursorCloudInjectedTransport
+        ):
             return False
     if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
-        if not _approved_slack_transport(slack_transport):
+        if not _concrete_injected_transport(
+            slack_transport, SlackInjectedTransport
+        ):
             return False
     return True
 
 
 def _transport_secret_ref(transport: Any) -> Optional[str]:
-    if not isinstance(
-        transport, (CursorCloudInjectedTransport, SlackInjectedTransport)
+    if type(transport) not in (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
     ):
         return None
-    try:
-        raw = transport.secret_ref
-    except Exception:
-        return None
+    raw = _instance_attr(transport, "_secret_ref")
     if not isinstance(raw, str):
         return None
     text = raw.strip()
