@@ -10884,11 +10884,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return exact, fallback
 
     def _maybe_attach_durable_job_lane(self) -> None:
-        """Construct Durable Job Lane only when validated config gates pass.
+        """Construct Durable Job Lane only when runtime capability is bound.
 
         Default-off and fail-closed. Reads ``durable_jobs`` from active config.
-        Never injects an HTTP/SDK client or credential. Package 1 dispatch
-        remains hard-disabled even when the lane is constructed.
+        Never injects an HTTP/SDK client or credential. Missing or mismatched
+        transport secret refs refuse attach. Package 1 dispatch remains
+        hard-disabled even when the lane is constructed.
         """
         try:
             from gateway.durable_job_lane import attach_to_gateway_runner

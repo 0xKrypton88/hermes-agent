@@ -16,6 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.agent.durable_jobs.package2_support import (
+    attach_runtime_ready_lane,
+    runtime_ready_transport_kwargs,
+)
+
 SECRET_DSN = "postgresql://hermes:supersecret@127.0.0.1:5432/durable_jobs"
 SLACK_TOKEN = "xoxb-super-secret-token"
 
@@ -161,46 +166,44 @@ def test_invalid_config_fail_closes_without_raising(tmp_path):
     assert handle is None
 
 
-def test_complete_gates_construct_lane_with_null_adapters_when_no_transport(
-    tmp_path,
-):
-    from agent.durable_jobs.adapters import NullCursorProvider, NullSlackPort
+def test_complete_gates_without_runtime_capability_do_not_attach(tmp_path):
     from gateway.durable_job_lane import (
         attach_durable_job_lane,
         get_active_durable_job_lane,
     )
 
     handle = attach_durable_job_lane(raw_config=_complete(tmp_path))
-    assert handle is not None
-    assert handle.config.dispatch_allowed is True
-    assert handle.config.enabled is True
-    assert isinstance(handle.cursor_adapter, NullCursorProvider)
-    assert isinstance(handle.slack_adapter, NullSlackPort)
-    assert get_active_durable_job_lane() is handle
-    assert handle.lane is not None
+    assert handle is None
+    assert get_active_durable_job_lane() is None
 
 
-def test_double_construction_is_rejected(tmp_path):
+def test_double_construction_is_rejected(tmp_path, monkeypatch):
     from gateway.durable_job_lane import (
         DurableJobLaneAlreadyAttached,
         attach_durable_job_lane,
     )
 
-    first = attach_durable_job_lane(raw_config=_complete(tmp_path))
+    first = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+    )
     assert first is not None
     with pytest.raises(DurableJobLaneAlreadyAttached):
-        attach_durable_job_lane(raw_config=_complete(tmp_path))
+        attach_durable_job_lane(
+            raw_config=_complete(tmp_path),
+            **runtime_ready_transport_kwargs(monkeypatch),
+        )
 
 
-def test_shutdown_clears_active_handle_and_allows_restart(tmp_path):
+def test_shutdown_clears_active_handle_and_allows_restart(tmp_path, monkeypatch):
     from agent.durable_jobs.store import DurableJobStore
     from gateway.durable_job_lane import (
-        attach_durable_job_lane,
         detach_durable_job_lane,
         get_active_durable_job_lane,
     )
 
-    first = attach_durable_job_lane(raw_config=_complete(tmp_path))
+    first = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+    )
     store = DurableJobStore(sqlite_path=tmp_path / "jobs.sqlite")
     job = store.create_job(
         origin_platform="slack",
@@ -213,7 +216,9 @@ def test_shutdown_clears_active_handle_and_allows_restart(tmp_path):
     detach_durable_job_lane()
     assert get_active_durable_job_lane() is None
 
-    second = attach_durable_job_lane(raw_config=_complete(tmp_path))
+    second = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+    )
     assert second is not None
     recovered = second.lane._require_sqlite_path().recover_job(job.job_id)
     assert recovered is not None
@@ -221,7 +226,9 @@ def test_shutdown_clears_active_handle_and_allows_restart(tmp_path):
     assert recovered.idempotency_key == "idem-restart"
 
 
-def test_explicit_injected_transports_are_wired_behind_existing_ports(tmp_path):
+def test_explicit_injected_transports_are_wired_behind_existing_ports(
+    tmp_path, monkeypatch
+):
     from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
     from agent.durable_jobs.injected_transports import (
         CursorCloudInjectedTransport,
@@ -229,6 +236,9 @@ def test_explicit_injected_transports_are_wired_behind_existing_ports(tmp_path):
     )
     from agent.durable_jobs.slack_bridge import SlackClientBridge
     from gateway.durable_job_lane import attach_durable_job_lane
+    from tests.agent.durable_jobs.package2_support import bind_runtime_secret_env
+
+    bind_runtime_secret_env(monkeypatch)
 
     def request(**_k):
         raise AssertionError("transport must stay idle during attach")
@@ -255,11 +265,13 @@ def test_attach_and_preflight_open_no_sockets(tmp_path, monkeypatch):
 
     monkeypatch.setattr(socket.socket, "connect", _deny)
     monkeypatch.setattr(socket.socket, "connect_ex", _deny)
-    handle = attach_durable_job_lane(raw_config=_complete(tmp_path))
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+    )
     assert handle is not None
 
 
-def test_status_and_errors_redact_secrets(tmp_path):
+def test_status_and_errors_redact_secrets(tmp_path, monkeypatch):
     from gateway.durable_job_lane import (
         attach_durable_job_lane,
         durable_job_lane_status,
@@ -281,7 +293,9 @@ def test_status_and_errors_redact_secrets(tmp_path):
         }
     )
     assert closed is None
-    handle = attach_durable_job_lane(raw_config=_complete(tmp_path))
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+    )
     assert handle is not None
     status = durable_job_lane_status()
     dumped = f"{status!r} {handle!r} {handle.config!r}"
@@ -301,16 +315,18 @@ def test_inactive_slack_ingress_is_noop():
     assert result is None
 
 
-def test_active_slack_ingress_reuses_lane_inbound_not_a_parallel_router(tmp_path):
+def test_active_slack_ingress_reuses_lane_inbound_not_a_parallel_router(
+    tmp_path, monkeypatch
+):
     from tests.agent.durable_jobs.eng28_support import RecordingAckPort
     from agent.durable_jobs.decisions import DecisionLedger
     from agent.durable_jobs.slack_contract import SlackBindingLedger
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        consume_slack_action_if_active,
-    )
+    from gateway.durable_job_lane import consume_slack_action_if_active
 
-    handle = attach_durable_job_lane(raw_config=_complete(tmp_path, dispatch_enabled=False))
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
+    )
     assert handle is not None
     store = handle.lane._require_sqlite_path()
     job = store.create_job(
@@ -366,13 +382,15 @@ def test_active_slack_ingress_reuses_lane_inbound_not_a_parallel_router(tmp_path
     assert result.ok is True
 
 
-def test_malformed_slack_action_fail_closes_without_store_side_effects(tmp_path):
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        consume_slack_action_if_active,
-    )
+def test_malformed_slack_action_fail_closes_without_store_side_effects(
+    tmp_path, monkeypatch
+):
+    from gateway.durable_job_lane import consume_slack_action_if_active
 
-    handle = attach_durable_job_lane(raw_config=_complete(tmp_path, dispatch_enabled=False))
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
+    )
     assert handle is not None
     result = consume_slack_action_if_active(
         body={"team": {"id": "T1"}},
@@ -393,7 +411,7 @@ def test_gateway_runner_start_attaches_default_off(monkeypatch, tmp_path):
     assert getattr(runner, "_durable_job_lane", None) is None
 
 
-def test_gateway_runner_stop_detaches_constructed_lane(tmp_path):
+def test_gateway_runner_stop_detaches_constructed_lane(tmp_path, monkeypatch):
     from gateway.durable_job_lane import (
         attach_to_gateway_runner,
         detach_from_gateway_runner,
@@ -401,7 +419,11 @@ def test_gateway_runner_stop_detaches_constructed_lane(tmp_path):
     )
 
     runner = SimpleNamespace(_durable_job_lane=None)
-    attach_to_gateway_runner(runner, raw_config=_complete(tmp_path))
+    attach_to_gateway_runner(
+        runner,
+        raw_config=_complete(tmp_path),
+        **runtime_ready_transport_kwargs(monkeypatch),
+    )
     assert runner._durable_job_lane is not None
     assert get_active_durable_job_lane() is runner._durable_job_lane
     detach_from_gateway_runner(runner)
@@ -409,7 +431,7 @@ def test_gateway_runner_stop_detaches_constructed_lane(tmp_path):
     assert get_active_durable_job_lane() is None
 
 
-def test_claim_takeover_survives_reconstructed_lane(tmp_path):
+def test_claim_takeover_survives_reconstructed_lane(tmp_path, monkeypatch):
     from agent.durable_jobs.clock import DEFAULT_CLAIM_LEASE_SECONDS, FrozenClock
     from agent.durable_jobs.effects import (
         EffectStatus,
@@ -421,12 +443,12 @@ def test_claim_takeover_survives_reconstructed_lane(tmp_path):
         install_default_adapter_authorization,
     )
     from tests.agent.durable_jobs.test_claim_leases import FakeCreateResult, FakeCursorProvider, FakeRun
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        detach_durable_job_lane,
-    )
+    from gateway.durable_job_lane import detach_durable_job_lane
 
-    handle = attach_durable_job_lane(raw_config=_complete(tmp_path, dispatch_enabled=False))
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
+    )
     store = handle.lane._require_sqlite_path()
     job = store.create_job(
         origin_platform="slack",
@@ -457,7 +479,10 @@ def test_claim_takeover_survives_reconstructed_lane(tmp_path):
     detach_durable_job_lane()
 
     clock.advance(DEFAULT_CLAIM_LEASE_SECONDS + 1)
-    handle2 = attach_durable_job_lane(raw_config=_complete(tmp_path, dispatch_enabled=False))
+    handle2 = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
+    )
     assert handle2 is not None
     key = provider_idempotency_key(job.job_id, "create_run")
     provider = FakeCursorProvider(
@@ -474,15 +499,17 @@ def test_claim_takeover_survives_reconstructed_lane(tmp_path):
     assert adopted.provider_run_id == "run-unique"
 
 
-def test_spoofed_action_value_identity_is_rejected_with_zero_consumption(tmp_path):
+def test_spoofed_action_value_identity_is_rejected_with_zero_consumption(
+    tmp_path, monkeypatch
+):
     from gateway.durable_job_lane import (
-        attach_durable_job_lane,
         consume_slack_action_if_active,
         parse_slack_durable_action,
     )
 
-    handle = attach_durable_job_lane(
-        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
     )
     assert handle is not None
     job, store = _seed_bound_job(handle, idempotency_key="idem-spoof")
@@ -567,14 +594,14 @@ def test_decision_type_and_identity_are_not_taken_from_action_value(tmp_path):
     assert matching["job_id"] == "job-1"
 
 
-def test_identity_binding_mismatch_is_rejected_with_zero_consumption(tmp_path):
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        consume_slack_action_if_active,
-    )
+def test_identity_binding_mismatch_is_rejected_with_zero_consumption(
+    tmp_path, monkeypatch
+):
+    from gateway.durable_job_lane import consume_slack_action_if_active
 
-    handle = attach_durable_job_lane(
-        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
     )
     assert handle is not None
     job, store = _seed_bound_job(handle, idempotency_key="idem-binding")
@@ -597,7 +624,7 @@ def test_identity_binding_mismatch_is_rejected_with_zero_consumption(tmp_path):
     assert _count_rows(store.sqlite_path, "job_decisions") == 0
 
 
-def test_old_runner_stop_does_not_shutdown_new_runner_lane(tmp_path):
+def test_old_runner_stop_does_not_shutdown_new_runner_lane(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.durable_job_lane import consume_slack_action_if_active
     from gateway.run import GatewayRunner
@@ -618,8 +645,16 @@ def test_old_runner_stop_does_not_shutdown_new_runner_lane(tmp_path):
     )
     from gateway.durable_job_lane import attach_to_gateway_runner
 
-    attach_to_gateway_runner(old, raw_config=_complete(tmp_path / "old"))
-    attach_to_gateway_runner(new, raw_config=_complete(tmp_path / "new"))
+    attach_to_gateway_runner(
+        old,
+        raw_config=_complete(tmp_path / "old"),
+        **runtime_ready_transport_kwargs(monkeypatch),
+    )
+    attach_to_gateway_runner(
+        new,
+        raw_config=_complete(tmp_path / "new"),
+        **runtime_ready_transport_kwargs(monkeypatch),
+    )
     assert old._durable_job_lane is not None
     assert new._durable_job_lane is not None
     assert old._durable_job_lane is not new._durable_job_lane
@@ -647,14 +682,14 @@ def test_old_runner_stop_does_not_shutdown_new_runner_lane(tmp_path):
     assert _count_rows(store.sqlite_path, "job_inbound_actions") == 1
 
 
-def test_consume_after_shutdown_is_retryable_without_durable_write(tmp_path):
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        consume_slack_action_if_active,
-    )
+def test_consume_after_shutdown_is_retryable_without_durable_write(
+    tmp_path, monkeypatch
+):
+    from gateway.durable_job_lane import consume_slack_action_if_active
 
-    handle = attach_durable_job_lane(
-        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
     )
     assert handle is not None
     job, store = _seed_bound_job(handle, idempotency_key="idem-closed")
@@ -679,14 +714,14 @@ def test_consume_after_shutdown_is_retryable_without_durable_write(tmp_path):
     assert _count_rows(store.sqlite_path, "job_decisions") == 0
 
 
-def test_cross_repo_slack_decision_is_rejected_with_zero_durable_writes(tmp_path):
-    from gateway.durable_job_lane import (
-        attach_durable_job_lane,
-        consume_slack_action_if_active,
-    )
+def test_cross_repo_slack_decision_is_rejected_with_zero_durable_writes(
+    tmp_path, monkeypatch
+):
+    from gateway.durable_job_lane import consume_slack_action_if_active
 
-    handle = attach_durable_job_lane(
-        raw_config=_complete(tmp_path, dispatch_enabled=False)
+    handle = attach_runtime_ready_lane(
+        raw_config=_complete(tmp_path, dispatch_enabled=False),
+        monkeypatch=monkeypatch,
     )
     assert handle is not None
     assert handle.config.identity_binding is not None
@@ -722,7 +757,7 @@ def test_cross_repo_slack_decision_is_rejected_with_zero_durable_writes(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_gateway_runner_start_stop_constructs_and_releases_lane(
+async def test_gateway_runner_start_stop_does_not_attach_without_runtime_capability(
     monkeypatch, tmp_path
 ):
     from gateway.config import GatewayConfig
@@ -742,11 +777,10 @@ async def test_gateway_runner_start_stop_constructs_and_releases_lane(
     )
     ok = await asyncio.wait_for(runner.start(), timeout=60)
     assert ok is True
-    handle = getattr(runner, "_durable_job_lane", None)
-    assert handle is not None
-    assert handle.preflight.constructible is True
-    assert handle.preflight.runtime_ready is False
-    assert get_active_durable_job_lane() is handle
+    # Gateway start never injects transports. Complete yaml without a
+    # bound runtime capability must fail closed — no handle, no adapters.
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert get_active_durable_job_lane() is None
     await asyncio.wait_for(runner.stop(), timeout=60)
     assert getattr(runner, "_durable_job_lane", None) is None
     assert get_active_durable_job_lane() is None

@@ -583,6 +583,10 @@ def _enabled_lane(tmp_path, store):
                 "dispatch_enabled": False,
                 "sqlite_path": str(store.sqlite_path),
                 "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+                "identity_binding": {
+                    "workspace_id": "T1",
+                    "repository_identity": "github.com/example/repo",
+                },
             }
         }
     )

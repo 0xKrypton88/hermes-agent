@@ -1,7 +1,8 @@
 """Lifecycle-owned Gateway seam for Durable Job Lane (ENG-36 Package 2).
 
 Reads ``durable_jobs`` from active config and constructs the lane only when
-explicit validated gates pass. Default remains enabled=false / dispatch off.
+explicit validated gates pass **and** runtime transport capability is bound
+(``runtime_ready``). Default remains enabled=false / dispatch off.
 No implicit network client and no built-in credentials.
 """
 
@@ -151,7 +152,7 @@ def attach_durable_job_lane(
     slack_transport: Any = None,
     owner: Any = None,
 ) -> Optional[DurableJobLaneHandle]:
-    """Construct the lane only when validated gates pass. Fail closed otherwise."""
+    """Construct the lane only when runtime capability is bound. Fail closed."""
     raw = _load_raw_config(raw_config)
     try:
         report = preflight_durable_jobs(
@@ -167,6 +168,12 @@ def attach_durable_job_lane(
         return None
 
     if report is None or not report.constructible or cfg is None:
+        return None
+    if not report.runtime_ready:
+        logger.debug(
+            "durable job lane refusing attach; runtime capability unbound (%s)",
+            report.reasons,
+        )
         return None
 
     key = _owner_key(owner)

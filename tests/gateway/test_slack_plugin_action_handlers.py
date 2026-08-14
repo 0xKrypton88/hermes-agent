@@ -356,14 +356,14 @@ def _decision_count(sqlite_path: Path) -> int:
 class TestDurableJobSlackActionIngress:
     """Production Slack action ingress: persist before ACK, fail-closed retry."""
 
-    def test_ack_happens_only_after_durable_persist(self, tmp_path):
-        from gateway.durable_job_lane import (
-            attach_durable_job_lane,
-            detach_durable_job_lane,
-        )
+    def test_ack_happens_only_after_durable_persist(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
 
         detach_durable_job_lane()
-        handle = attach_durable_job_lane(raw_config=_durable_complete(tmp_path))
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
         assert handle is not None
         job, store = _seed_durable_job(handle)
         inbound_at_ack: list[int] = []
@@ -397,14 +397,14 @@ class TestDurableJobSlackActionIngress:
         finally:
             detach_durable_job_lane()
 
-    def test_retryable_failure_does_not_ack(self, tmp_path):
-        from gateway.durable_job_lane import (
-            attach_durable_job_lane,
-            detach_durable_job_lane,
-        )
+    def test_retryable_failure_does_not_ack(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
 
         detach_durable_job_lane()
-        handle = attach_durable_job_lane(raw_config=_durable_complete(tmp_path))
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
         assert handle is not None
         job, store = _seed_durable_job(handle)
         handle.shutdown()
@@ -439,14 +439,14 @@ class TestDurableJobSlackActionIngress:
         finally:
             detach_durable_job_lane()
 
-    def test_cross_repo_decision_does_not_persist_or_success_ack(self, tmp_path):
-        from gateway.durable_job_lane import (
-            attach_durable_job_lane,
-            detach_durable_job_lane,
-        )
+    def test_cross_repo_decision_does_not_persist_or_success_ack(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
 
         detach_durable_job_lane()
-        handle = attach_durable_job_lane(raw_config=_durable_complete(tmp_path))
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
         assert handle is not None
         job, store = _seed_durable_job(
             handle, repository_identity="github.com/evil/other"

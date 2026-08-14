@@ -747,18 +747,20 @@ def test_reconcile_pre_lease_ledger_construction_does_not_write_after_close(
     _assert_no_reopen(lane)
 
 
-def test_gateway_shutdown_after_checkout_does_not_ack_or_write(tmp_path):
+def test_gateway_shutdown_after_checkout_does_not_ack_or_write(tmp_path, monkeypatch):
     from agent.durable_jobs.decisions import DecisionLedger
     from agent.durable_jobs.slack_contract import SlackBindingLedger
     from gateway.durable_job_lane import (
-        attach_durable_job_lane,
         consume_slack_action_if_active,
         detach_durable_job_lane,
     )
+    from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
 
     detach_durable_job_lane()
     try:
-        handle = attach_durable_job_lane(raw_config=_complete(tmp_path))
+        handle = attach_runtime_ready_lane(
+            raw_config=_complete(tmp_path), monkeypatch=monkeypatch
+        )
         assert handle is not None
         lane = handle.lane
         store = lane._require_sqlite_path()
