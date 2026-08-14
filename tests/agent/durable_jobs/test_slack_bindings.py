@@ -267,8 +267,7 @@ def test_cross_binding_resume_is_rejected(tmp_path):
 
 def test_lane_cursor_create_requires_binding_before_provider_effect(tmp_path):
     from agent.durable_jobs.config import load_durable_jobs_config
-    from agent.durable_jobs.lane import DurableLaneService
-    from agent.durable_jobs.slack_contract import BindingRequiredError
+    from agent.durable_jobs.lane import DurableLaneService, LaneIdentityRejected
 
     store, job = _make_job(tmp_path, authorize=False)
     cfg = load_durable_jobs_config(
@@ -301,7 +300,7 @@ def test_lane_cursor_create_requires_binding_before_provider_effect(tmp_path):
             return []
 
     lane = DurableLaneService(config=cfg, store=store)
-    with pytest.raises(BindingRequiredError):
+    with pytest.raises(LaneIdentityRejected):
         lane.reconcile_cursor_create(
             job_id=job.job_id,
             action_id="create_run",

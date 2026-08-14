@@ -52,6 +52,12 @@ TRACKED_TABLES = (
     "job_inbound_actions",
 )
 
+MISSING_WORKSPACE_GAPS = (
+    "missing_row",
+    "empty_workspace",
+    "missing_table",
+)
+
 
 def _complete(tmp_path: Path, **overrides) -> dict:
     section = {
@@ -76,6 +82,27 @@ def _complete(tmp_path: Path, **overrides) -> dict:
 
 def _snapshot(path: Path) -> dict[str, int]:
     return {table: count_table(path, table) for table in TRACKED_TABLES}
+
+
+def _snapshot_allow_missing(path: Path) -> dict[str, int | None]:
+    out: dict[str, int | None] = {}
+    for table in TRACKED_TABLES:
+        try:
+            out[table] = count_table(path, table)
+        except sqlite3.OperationalError:
+            out[table] = None
+    return out
+
+
+def _bindings_table_exists(path: Path) -> bool:
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='slack_job_bindings'",
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 
 class _IdleSlack:
@@ -211,6 +238,60 @@ def _seed(
         install_default_adapter_authorization(store.sqlite_path, job.job_id)
     lane = DurableLaneService(config=cfg, store=store)
     return lane, job, store, workspace
+
+
+def _seed_matching_job_without_workspace(
+    tmp_path: Path,
+    *,
+    gap: str,
+    idempotency_key: str,
+):
+    """Matching repository identity, no verifiable persisted workspace binding."""
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.lane import DurableLaneService
+    from agent.durable_jobs.store import DurableJobStore
+
+    cfg = load_durable_jobs_config(_complete(tmp_path))
+    store = DurableJobStore(sqlite_path=cfg.sqlite_path)
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="missing-workspace",
+        repository_identity=CONFIG_REPO,
+        idempotency_key=idempotency_key,
+    )
+    if gap == "empty_workspace":
+        conn = sqlite3.connect(store.sqlite_path)
+        try:
+            now = "2099-01-01T00:00:00+00:00"
+            conn.execute(
+                """
+                INSERT INTO slack_job_bindings(
+                    job_id, workspace_id, channel_id, root_thread_ts,
+                    candidate_id, candidate_version, outbound_client_msg_id,
+                    delivered_message_ts, status, unknown_reason,
+                    claim_owner_token, claim_leased_at, claim_expires_at,
+                    claim_generation, created_at, updated_at
+                ) VALUES (?, '', 'C123', '111.222', 'cand-1', 'v1', ?,
+                          NULL, 'bound', NULL, NULL, NULL, NULL, 0, ?, ?)
+                """,
+                (job.job_id, f"empty-ws-{job.job_id}", now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    elif gap == "missing_table":
+        conn = sqlite3.connect(store.sqlite_path)
+        try:
+            conn.execute("DROP TABLE slack_job_bindings")
+            conn.commit()
+        finally:
+            conn.close()
+    elif gap != "missing_row":
+        raise AssertionError(f"unknown workspace gap {gap}")
+    lane = DurableLaneService(config=cfg, store=store)
+    return lane, job, store
 
 
 def _inbound(job, workspace_id: str, **overrides):
@@ -479,3 +560,134 @@ def test_sqlite_row_count_helper_sees_seeded_identity_state(tmp_path):
     assert row is not None
     assert row[0] == FOREIGN_WORKSPACE
     assert row[1] == CONFIG_REPO
+
+
+def _assert_typed_identity_reject(writer, value, caught, ack, slack, provider):
+    assert ack.acks == []
+    assert slack.posts == []
+    assert slack.lookups == []
+    assert provider.create_calls == []
+    assert provider.lookup_calls == []
+    if writer == "consume_inbound_action":
+        assert caught is None
+        assert value is not None
+        assert value.ok is False
+        assert value.ack_status == "rejected"
+        assert getattr(value, "retryable", False) is False
+        _assert_no_secrets(value)
+        return
+    assert value is None
+    assert caught is not None
+    assert type(caught).__name__ == "LaneIdentityRejected"
+    _assert_no_secrets(caught)
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+@pytest.mark.parametrize("gap", MISSING_WORKSPACE_GAPS)
+def test_missing_persisted_workspace_is_fail_closed(tmp_path, writer, gap):
+    """No persisted workspace_id is not implicit approval except bind_slack bootstrap."""
+    lane, job, store = _seed_matching_job_without_workspace(
+        tmp_path,
+        gap=gap,
+        idempotency_key=f"idem-missing-ws-{writer}-{gap}",
+    )
+    before = _snapshot_allow_missing(store.sqlite_path)
+    bootstrap = writer == "bind_slack" and gap == "missing_row"
+    value, caught, ack, slack, provider = _invoke(
+        lane, writer, job, CONFIG_WORKSPACE, positive=bootstrap
+    )
+    _assert_no_secrets(value)
+    _assert_no_secrets(caught)
+    _assert_no_secrets(ack.acks)
+
+    if bootstrap:
+        assert caught is None, caught
+        assert value is not None
+        assert _bindings_table_exists(store.sqlite_path)
+        assert count_table(store.sqlite_path, "slack_job_bindings") == (
+            (before["slack_job_bindings"] or 0) + 1
+        )
+        return
+
+    after = _snapshot_allow_missing(store.sqlite_path)
+    assert after == before
+    if gap == "missing_table":
+        assert _bindings_table_exists(store.sqlite_path) is False
+    _assert_typed_identity_reject(writer, value, caught, ack, slack, provider)
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_bind_slack_bootstrap_then_matching_writers_succeed(tmp_path, writer):
+    from tests.agent.durable_jobs.authz_fixtures import (
+        install_default_adapter_authorization,
+    )
+
+    lane, job, store = _seed_matching_job_without_workspace(
+        tmp_path,
+        gap="missing_row",
+        idempotency_key=f"idem-bootstrap-{writer}",
+    )
+    if writer != "bind_slack":
+        bound = lane.bind_slack(
+            job_id=job.job_id,
+            workspace_id=CONFIG_WORKSPACE,
+            channel_id="C123",
+            root_thread_ts="111.222",
+            candidate_id="cand-1",
+            candidate_version="v1",
+        )
+        assert bound is not None
+        install_default_adapter_authorization(store.sqlite_path, job.job_id)
+        if writer in ("consume_inbound_action", "record_decision"):
+            lane.set_job_policy(
+                job_id=job.job_id,
+                policy_version="pol-1",
+                allowed_actors=("U-alice",),
+                expires_at="2099-01-01T00:00:00+00:00",
+            )
+    value, caught, ack, slack, provider = _invoke(
+        lane, writer, job, CONFIG_WORKSPACE, positive=True
+    )
+    _assert_no_secrets(value)
+    _assert_no_secrets(caught)
+    assert caught is None, caught
+    assert value is not None
+    if writer == "consume_inbound_action":
+        assert value.ok is True
+        assert ack.acks
+    if writer == "deliver_slack_root":
+        assert slack.posts
+    if writer == "reconcile_cursor_create":
+        assert provider.create_calls
+    if writer == "bind_slack":
+        assert count_table(store.sqlite_path, "slack_job_bindings") == 1
+    if writer == "set_job_policy":
+        assert count_table(store.sqlite_path, "job_authz_policies") == 1
+
+
+def test_close_after_checkout_precedes_missing_workspace_reject(tmp_path):
+    from agent.durable_jobs.lane import LaneClosedError
+
+    lane, job, store = _seed_matching_job_without_workspace(
+        tmp_path,
+        gap="missing_row",
+        idempotency_key="idem-close-precedes-missing-ws",
+    )
+    original = lane._require_sqlite_path
+
+    def _checkout_then_close():
+        checked = original()
+        lane.close()
+        return checked
+
+    lane._require_sqlite_path = _checkout_then_close
+    before = _snapshot(store.sqlite_path)
+    with pytest.raises(LaneClosedError):
+        lane.set_job_policy(
+            job_id=job.job_id,
+            policy_version="pol-2",
+            allowed_actors=("U-alice",),
+        )
+    assert _snapshot(store.sqlite_path) == before
+    assert lane._closed is True
+    assert lane._store is None

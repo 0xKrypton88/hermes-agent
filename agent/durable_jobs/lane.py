@@ -2,7 +2,11 @@
 
 Default-off: every mutating entry point requires ``durable_jobs.enabled``.
 No live Cursor, Slack, network, gateway, or dispatch adapters are constructed.
-Binding is required before any provider or Slack effect.
+Binding is required before any provider or Slack effect. ``bind_slack`` is
+the only workspace bootstrap: it may persist a binding when the caller's
+workspace_id and the job repository match ``identity_binding``. Every other
+public writer requires a verifiable persisted ``slack_job_bindings.workspace_id``
+that already matches config.
 
 Close / mutation-lease invariant
 --------------------------------
@@ -224,6 +228,21 @@ class DurableLaneService:
         job = store.get_job(job_id)
         return job is None or job.repository_identity != binding.repository_identity
 
+    def _slack_bindings_schema_missing(self, store: DurableJobStore) -> bool:
+        with store._connect() as conn:
+            try:
+                conn.execute("SELECT workspace_id FROM slack_job_bindings LIMIT 0")
+            except sqlite3.OperationalError as exc:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                message = str(exc).lower()
+                if "no such table" in message or "no such column" in message:
+                    return True
+                raise
+        return False
+
     def _persisted_workspace_id(
         self, store: DurableJobStore, job_id: str
     ) -> Optional[str]:
@@ -233,13 +252,19 @@ class DurableLaneService:
                     "SELECT workspace_id FROM slack_job_bindings WHERE job_id = ?",
                     (job_id,),
                 ).fetchone()
-            except sqlite3.OperationalError:
-                return None
+            except sqlite3.OperationalError as exc:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                message = str(exc).lower()
+                if "no such table" in message or "no such column" in message:
+                    return None
+                raise
         if row is None:
             return None
         value = row["workspace_id"] if isinstance(row, sqlite3.Row) else row[0]
-        text = str(value or "").strip()
-        return text or None
+        return str(value or "").strip()
 
     def _identity_rejected(
         self,
@@ -247,6 +272,7 @@ class DurableLaneService:
         job_id: str,
         *,
         workspace_id: Optional[str] = None,
+        require_persisted_workspace: bool = True,
     ) -> bool:
         if self._repository_identity_rejected(store, job_id):
             return True
@@ -258,10 +284,12 @@ class DurableLaneService:
             return True
         if workspace_id is not None and str(workspace_id).strip() != expected_ws:
             return True
-        persisted = self._persisted_workspace_id(store, job_id)
-        if persisted is not None and persisted != expected_ws:
+        if self._slack_bindings_schema_missing(store):
             return True
-        return False
+        persisted = self._persisted_workspace_id(store, job_id)
+        if persisted is None:
+            return require_persisted_workspace
+        return persisted != expected_ws
 
     def _checkout_for_mutation(self) -> DurableJobStore:
         self._require_enabled()
@@ -277,9 +305,15 @@ class DurableLaneService:
         job_id: str,
         *,
         workspace_id: Optional[str] = None,
+        require_persisted_workspace: bool = True,
     ) -> DurableJobStore:
         store = self._checkout_for_mutation()
-        if self._identity_rejected(store, job_id, workspace_id=workspace_id):
+        if self._identity_rejected(
+            store,
+            job_id,
+            workspace_id=workspace_id,
+            require_persisted_workspace=require_persisted_workspace,
+        ):
             raise LaneIdentityRejected(
                 "durable lane rejected unbound repository/workspace identity"
             )
@@ -300,7 +334,9 @@ class DurableLaneService:
         candidate_version: str,
     ) -> SlackJobBinding:
         store = self._acquire_authorized_mutation(
-            job_id, workspace_id=workspace_id
+            job_id,
+            workspace_id=workspace_id,
+            require_persisted_workspace=False,
         )
         with self._mutation_lease():
             return SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
@@ -434,9 +470,11 @@ class DurableLaneService:
         """Durable Go/Pause/Cancel ingress. No parallel Slack router.
 
         Disabled and malformed identity reject before a store is constructed.
-        Repository/workspace identity is fail-closed here before a mutation
-        lease. Authorized consumption uses the existing coordinator
-        ACK/decision lane only while holding a mutation lease.
+        Repository identity, config workspace, and a persisted Slack workspace
+        binding are fail-closed here before a mutation lease. Missing binding,
+        table, or identity is a typed reject — not an implicit approve.
+        Authorized consumption uses the existing coordinator ACK/decision lane
+        only while holding a mutation lease.
         """
         self._require_enabled()
         if inbound_action_shape_rejected(
