@@ -150,3 +150,105 @@ def test_detach_handle_does_not_clear_sibling_owner(tmp_path, monkeypatch):
     assert _owner_entry(owner_b) is lane_b
     assert owner_b._durable_job_lane is lane_b
     assert lane_b.lane._closed is False
+
+
+def test_holder_detach_clears_retiring_after_final_lease_release(
+    tmp_path, monkeypatch
+):
+    """Holder-led handle detach must not leak ``_RETIRING`` after leases drain.
+
+    On 164d81f26 ``_clear_retiring_if_idle`` runs in ``_shutdown_retired``
+    finally while the holder lease is still active, so the entry stays.
+    ``_release_mutation_lease`` never retries. The strong owner/handle
+    refs remain, and a later no-arg detach cannot pop them.
+    """
+    from agent.durable_jobs.lane import LaneClosedError
+    from gateway.durable_job_lane import (
+        _RETIRING,
+        _owner_key,
+        attach_to_gateway_runner,
+        detach_durable_job_lane,
+    )
+
+    transports = runtime_ready_transport_kwargs(monkeypatch)
+    owner = SimpleNamespace(_durable_job_lane=None)
+    sibling = SimpleNamespace(_durable_job_lane=None)
+    handle = attach_to_gateway_runner(
+        owner, raw_config=_complete(tmp_path / "owner"), **transports
+    )
+    sibling_handle = attach_to_gateway_runner(
+        sibling, raw_config=_complete(tmp_path / "sibling"), **transports
+    )
+    assert handle is not None and sibling_handle is not None
+    key = _owner_key(owner)
+    sibling_key = _owner_key(sibling)
+    raised: list[BaseException] = []
+
+    with handle.lane._mutation_lease():
+        try:
+            detach_durable_job_lane(handle)
+        except LaneClosedError as exc:
+            raised.append(exc)
+
+    assert raised and isinstance(raised[0], LaneClosedError)
+    assert handle.lane._active_leases == 0
+    assert handle.lane._closed is True
+    assert key not in _RETIRING
+    assert sibling_key not in _RETIRING
+    assert owner._durable_job_lane is None
+    assert _owner_entry(owner) is None
+    assert sibling._durable_job_lane is sibling_handle
+    assert _owner_entry(sibling) is sibling_handle
+    assert sibling_handle.lane._closed is False
+
+    newer = attach_to_gateway_runner(
+        owner, raw_config=_complete(tmp_path / "newer"), **transports
+    )
+    assert newer is not None
+    assert newer is not handle
+    assert owner._durable_job_lane is newer
+    assert _owner_entry(owner) is newer
+    assert key not in _RETIRING
+    assert sibling._durable_job_lane is sibling_handle
+    assert _owner_entry(sibling) is sibling_handle
+
+    detach_durable_job_lane(newer)
+    assert owner._durable_job_lane is None
+    assert _owner_entry(owner) is None
+    assert key not in _RETIRING
+    assert sibling._durable_job_lane is sibling_handle
+    assert _owner_entry(sibling) is sibling_handle
+    assert sibling_handle.lane._closed is False
+
+
+def test_holder_detach_noarg_after_lease_release_does_not_keep_retiring(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.lane import LaneClosedError
+    from gateway.durable_job_lane import (
+        _RETIRING,
+        _owner_key,
+        attach_to_gateway_runner,
+        detach_durable_job_lane,
+    )
+
+    owner = SimpleNamespace(_durable_job_lane=None)
+    handle = attach_to_gateway_runner(
+        owner,
+        raw_config=_complete(tmp_path),
+        **runtime_ready_transport_kwargs(monkeypatch),
+    )
+    assert handle is not None
+    key = _owner_key(owner)
+
+    with handle.lane._mutation_lease():
+        try:
+            detach_durable_job_lane(handle)
+        except LaneClosedError:
+            pass
+
+    detach_durable_job_lane()
+    assert key not in _RETIRING
+    assert _RETIRING == {}
+    assert owner._durable_job_lane is None
+    assert handle.lane._closed is True
