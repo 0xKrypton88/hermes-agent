@@ -227,14 +227,70 @@ def test_preflight_complete_sqlite_is_constructible_without_sockets(
 
     monkeypatch.setattr(socket.socket, "connect", _deny)
     monkeypatch.setattr(socket.socket, "connect_ex", _deny)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
 
     report = preflight_durable_jobs(_complete_sqlite(tmp_path))
     assert report.constructible is True
     assert report.dispatch_allowed is True
-    assert report.runtime_ready is True
+    assert report.runtime_ready is False
+    assert report.secret_refs_present is False
+    assert "secret_refs_missing" in report.reasons
     assert report.cursor_adapter_mode == "injected"
     assert report.slack_adapter_mode == "injected"
-    assert "supersecret" not in str(report)
+    dumped = str(report)
+    assert "supersecret" not in dumped
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+
+
+def test_preflight_runtime_ready_requires_both_injected_secret_refs(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    raw = _complete_sqlite(tmp_path)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+
+    missing_both = preflight_durable_jobs(raw)
+    assert missing_both.constructible is True
+    assert missing_both.runtime_ready is False
+    assert missing_both.secret_refs_present is False
+    assert "secret_refs_missing" in missing_both.reasons
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    missing_slack = preflight_durable_jobs(raw)
+    assert missing_slack.constructible is True
+    assert missing_slack.runtime_ready is False
+    assert missing_slack.secret_refs_present is False
+    assert "secret_refs_missing" in missing_slack.reasons
+    assert CURSOR_TOKEN not in str(missing_slack)
+    assert SLACK_TOKEN not in str(missing_slack)
+
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    missing_cursor = preflight_durable_jobs(raw)
+    assert missing_cursor.constructible is True
+    assert missing_cursor.runtime_ready is False
+    assert missing_cursor.secret_refs_present is False
+    assert "secret_refs_missing" in missing_cursor.reasons
+    assert CURSOR_TOKEN not in str(missing_cursor)
+    assert SLACK_TOKEN not in str(missing_cursor)
+    assert "xoxb-" not in str(missing_cursor)
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    ready = preflight_durable_jobs(raw)
+    assert ready.constructible is True
+    assert ready.runtime_ready is True
+    assert ready.secret_refs_present is True
+    assert "secret_refs_missing" not in ready.reasons
+    dumped = str(ready)
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "supersecret" not in dumped
 
 
 def test_preflight_does_not_import_psycopg_on_sqlite_path(tmp_path, monkeypatch):

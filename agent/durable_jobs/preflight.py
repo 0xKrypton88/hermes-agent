@@ -127,7 +127,9 @@ def preflight_durable_jobs(raw: Mapping[str, Any] | None) -> DurableJobsPrefligh
         and "refuses_hermes_state_db" not in reasons
         and "sqlite_paths_must_be_distinct" not in reasons
     )
-    runtime_ready = constructible
+    if constructible and not secret_refs_present:
+        reasons.append("secret_refs_missing")
+    runtime_ready = constructible and secret_refs_present
     return DurableJobsPreflight(
         constructible=constructible,
         dispatch_allowed=bool(cfg.dispatch_allowed and constructible),
