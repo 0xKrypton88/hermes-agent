@@ -59,6 +59,31 @@ _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
 _TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
 _GETSET_DESCRIPTOR_TYPE = type(_TYPE_DICT_DESCRIPTOR)
 _MISSING = object()
+_STARTUP_READY_SIGNATURE = None
+_STARTUP_SNAPSHOT_SIGNATURE = None
+try:
+    import hermes_environ_startup as _startup_module
+
+    _startup_ready = object.__getattribute__(_startup_module, "trusted_startup_ready")
+    _startup_snapshot = object.__getattribute__(_startup_module, "startup_pin_snapshot")
+    _STARTUP_READY_SIGNATURE = (
+        object.__getattribute__(_startup_ready, "__code__"),
+        object.__getattribute__(_startup_ready, "__qualname__"),
+        object.__getattribute__(_startup_ready, "__module__"),
+    )
+    _STARTUP_SNAPSHOT_SIGNATURE = (
+        object.__getattribute__(_startup_snapshot, "__code__"),
+        object.__getattribute__(_startup_snapshot, "__qualname__"),
+        object.__getattribute__(_startup_snapshot, "__module__"),
+    )
+    del _startup_ready
+    del _startup_snapshot
+    del _startup_module
+except Exception:
+    _STARTUP_READY_SIGNATURE = None
+    _STARTUP_SNAPSHOT_SIGNATURE = None
+
+
 _WIN32_ENVVAR_NOT_FOUND = 203
 
 
@@ -218,13 +243,43 @@ def _trusted_startup_pins():
     storage = _module_storage(module)
     if storage is None:
         return False, None, None
-    ready = _exact_str_dict_value(storage, "_TRUSTED_CAPTURE_READY")
+
+    ready_fn = _exact_str_dict_value(storage, "trusted_startup_ready")
+    if ready_fn is _MISSING or not callable(ready_fn):
+        return False, None, None
+    snapshot_fn = _exact_str_dict_value(storage, "startup_pin_snapshot")
+    if snapshot_fn is _MISSING or not callable(snapshot_fn):
+        return False, None, None
+    try:
+        ready_signature = (
+            object.__getattribute__(ready_fn, "__code__"),
+            object.__getattribute__(ready_fn, "__qualname__"),
+            object.__getattribute__(ready_fn, "__module__"),
+        )
+        snapshot_signature = (
+            object.__getattribute__(snapshot_fn, "__code__"),
+            object.__getattribute__(snapshot_fn, "__qualname__"),
+            object.__getattribute__(snapshot_fn, "__module__"),
+        )
+    except Exception:
+        return False, None, None
+    if ready_signature != _STARTUP_READY_SIGNATURE or snapshot_signature != _STARTUP_SNAPSHOT_SIGNATURE:
+        return False, None, None
+    try:
+        ready = ready_fn()
+    except Exception:
+        return False, None, None
     if ready is not True:
         return False, None, None
-    pinned_environ = _exact_str_dict_value(storage, "_PINNED_OS_ENVIRON")
-    if pinned_environ is _MISSING or pinned_environ is None:
+    try:
+        snapshot = snapshot_fn()
+    except Exception:
         return False, None, None
-    pinned_posix = _exact_str_dict_value(storage, "_PINNED_POSIX_ENVIRON")
+    if type(snapshot) is not tuple or len(snapshot) != 3:
+        return False, None, None
+    ready_value, pinned_environ, pinned_posix = snapshot
+    if ready_value is not True or pinned_environ is _MISSING or pinned_environ is None:
+        return False, None, None
     if pinned_posix is _MISSING:
         pinned_posix = None
     return True, pinned_environ, pinned_posix

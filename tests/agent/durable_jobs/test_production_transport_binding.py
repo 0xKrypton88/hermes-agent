@@ -2348,6 +2348,33 @@ sys.stdout.write(" none=" + ("1" if data is None else "0"))
     assert result.returncode == 0, result.stderr
     assert result.stdout == "ready=0 accepted=0 present=0 none=1"
 
+def test_startup_module_signature_guard_rejects_mutated_ready_facade():
+    script = r"""
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+import hermes_environ_startup
+from agent.durable_jobs.preflight import _trusted_startup_pins
+
+hermes_environ_startup.capture_trusted_startup()
+ready, _env, _posix = _trusted_startup_pins()
+sys.stdout.write("baseline=" + ("1" if ready else "0"))
+
+hermes_environ_startup.trusted_startup_ready = lambda: True
+hermes_environ_startup.startup_pin_snapshot = lambda: (True, os.environ, None)
+ready2, _env2, _posix2 = _trusted_startup_pins()
+sys.stdout.write(" mutated=" + ("1" if ready2 else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "baseline=1 mutated=0"
+
+
 
 def test_cli_entry_captures_trusted_startup_before_preflight():
     script = r"""
