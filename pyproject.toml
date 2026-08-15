@@ -400,6 +400,7 @@ py-modules = [
   "toolset_distributions",
   "cli",
   "hermes_bootstrap",
+  "hermes_environ_startup",
   "hermes_constants",
   "hermes_state",
   "hermes_state_common",

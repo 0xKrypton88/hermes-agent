@@ -80,6 +80,11 @@ import sys
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
+try:
+    import hermes_environ_startup  # noqa: E402
+    hermes_environ_startup.capture_trusted_startup()
+except ModuleNotFoundError:
+    pass
 from hermes_cli import _startup_fast  # noqa: E402
 
 # Early venv self-heal — MUST run before any third-party import below.  When

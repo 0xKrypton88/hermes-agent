@@ -27212,6 +27212,20 @@ def _shutdown_gateway_health_export(runner: Any) -> None:
         logger.debug("gateway health OTLP export shutdown failed", exc_info=True)
 
 
+def _capture_trusted_environ_startup() -> None:
+    """Pin process-environ identity for durable-job binding.
+
+    Called from ``main`` / ``start_gateway`` only. Importing this module
+    must not capture — a pre-import environ replacement plus
+    ``import gateway.run`` is not trusted provenance.
+    """
+    try:
+        import hermes_environ_startup
+        hermes_environ_startup.capture_trusted_startup()
+    except ModuleNotFoundError:
+        pass
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -27226,6 +27240,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    _capture_trusted_environ_startup()
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
@@ -27875,6 +27891,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
+    _capture_trusted_environ_startup()
     # Force UTF-8 stdio on Windows — gateway logs and startup banner would
     # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.
     try:

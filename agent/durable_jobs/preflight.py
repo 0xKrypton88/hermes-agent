@@ -199,56 +199,35 @@ def _stdlib_os_module():
     return module
 
 
-def _already_imported_startup_environ_singleton():
-    """Return the hermes_constants pin if that module is already imported.
+def _trusted_startup_pins():
+    """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
 
-    Does not import ``hermes_constants``. A first import after a pre-import
-    ``os.environ`` replacement would pin the replacement and look like
-    provenance. ``_MISSING`` means no prior pin exists.
+    Reads ``hermes_environ_startup`` only if that module is already in
+    ``sys.modules``. Does not import it and does not call capture.
+    A missing, unready, or empty pin is not provenance.
     """
     try:
         modules = object.__getattribute__(sys, "modules")
     except AttributeError:
-        return _MISSING
+        return False, None, None
     if type(modules) is not dict:
-        return _MISSING
-    module = _exact_str_dict_value(modules, "hermes_constants")
+        return False, None, None
+    module = _exact_str_dict_value(modules, "hermes_environ_startup")
     if module is _MISSING:
-        return _MISSING
+        return False, None, None
     storage = _module_storage(module)
     if storage is None:
-        return _MISSING
-    pinned = _exact_str_dict_value(storage, "_STARTUP_OS_ENVIRON_SINGLETON")
-    if pinned is _MISSING:
-        return _MISSING
-    return pinned
-
-
-def _posix_process_environ_mapping():
-    """Return the ``posix.environ`` object, or None.
-
-    Identity only: never iterates the mapping, never hashes its keys,
-    and never reads or compares values. Unused as a presence oracle.
-    """
-    platform = _sys_platform()
-    if platform is None or str.__eq__(platform, "win32"):
-        return None
-    try:
-        modules = object.__getattribute__(sys, "modules")
-    except AttributeError:
-        return None
-    if type(modules) is not dict:
-        return None
-    posix_mod = _exact_str_dict_value(modules, "posix")
-    if posix_mod is _MISSING:
-        return None
-    storage = _module_storage(posix_mod)
-    if storage is None:
-        return None
-    mapping = _exact_str_dict_value(storage, "environ")
-    if mapping is _MISSING or type(mapping) is not dict:
-        return None
-    return mapping
+        return False, None, None
+    ready = _exact_str_dict_value(storage, "_TRUSTED_CAPTURE_READY")
+    if ready is not True:
+        return False, None, None
+    pinned_environ = _exact_str_dict_value(storage, "_PINNED_OS_ENVIRON")
+    if pinned_environ is _MISSING or pinned_environ is None:
+        return False, None, None
+    pinned_posix = _exact_str_dict_value(storage, "_PINNED_POSIX_ENVIRON")
+    if pinned_posix is _MISSING:
+        pinned_posix = None
+    return True, pinned_environ, pinned_posix
 
 
 def _module_storage(module: Any):
@@ -331,22 +310,21 @@ def _environ_data_from_instance(environ: Any, environ_type: Any, descriptor: Any
 
 
 def _capture_os_environ_boundary():
-    """Pin ``os.environ`` only when ``_data`` provenance can be established.
+    """Pin ``os.environ`` only when a prior trusted startup pin exists.
 
-    POSIX: at import, ``_data`` must be the interpreter ``posix.environ``
-    mapping (``is``), and ``environb`` must share that same object. A
-    pre-import replacement pair whose shared ``_data`` is a fresh dict
-    is not that mapping and fails closed. Later rebinding of
-    ``posix.environ`` is ignored and is never a presence oracle.
+    A replaced ``os.environ`` / ``os.environb`` / ``posix.environ``
+    mapping is never provenance. This function does not import
+    ``hermes_environ_startup`` and does not call capture. Missing or
+    unready pins fail closed on every platform.
+
+    POSIX: ``_data`` must be the posix mapping pinned at trusted
+    bootstrap (``is``), not the live ``posix.environ`` attribute.
+    ``environb`` must share that same pinned object.
 
     Windows: ``GetEnvironmentVariableW`` is the presence authority.
-    ``environb`` is not a supported surface and must stay absent; a
-    created sibling pair fails closed. ``nt.environ`` is a copy, not
-    ``_data``, and is never treated as provenance or a presence oracle.
-    Provenance requires a prior ``hermes_constants`` pin of the original
-    ``os.environ`` object (``is``). This module does not import
-    ``hermes_constants`` to create that pin. Missing or mismatched pin
-    fails closed.
+    ``environb`` must stay absent. ``nt.environ`` is a copy, not
+    ``_data``, and is never a presence oracle. Provenance is
+    ``os.environ is`` the pinned startup singleton.
     """
     module = _stdlib_os_module()
     storage = _module_storage(module)
@@ -375,24 +353,23 @@ def _capture_os_environ_boundary():
     platform = _sys_platform()
     if platform is None:
         return None, None, None, None, None
+    ready, pinned_environ, pinned_posix = _trusted_startup_pins()
+    if not ready or environ is not pinned_environ:
+        return None, None, None, None, None
     if str.__eq__(platform, "win32"):
         environb = _exact_str_dict_value(storage, "environb")
         if environb is not _MISSING:
             return None, None, None, None, None
-        witnessed = _already_imported_startup_environ_singleton()
-        if witnessed is _MISSING or witnessed is None:
-            return None, None, None, None, None
-        if environ is not witnessed:
-            return None, None, None, None, None
         return environ, environ_type, descriptor, data, None
-    posix_environ = _posix_process_environ_mapping()
-    if posix_environ is None or data is not posix_environ:
+    if pinned_posix is None or type(pinned_posix) is not dict:
+        return None, None, None, None, None
+    if data is not pinned_posix:
         return None, None, None, None, None
     environb = _exact_str_dict_value(storage, "environb")
     if environb is _MISSING or type(environb) is not environ_type:
         return None, None, None, None, None
     sibling = _environ_data_from_instance(environb, environ_type, descriptor)
-    if sibling is _MISSING or sibling is not posix_environ:
+    if sibling is _MISSING or sibling is not pinned_posix:
         return None, None, None, None, None
     return environ, environ_type, descriptor, data, environb
 
@@ -494,12 +471,12 @@ def _process_environ_dict() -> dict | None:
 
     Proves the current ``os.environ`` binding is still the captured
     singleton and that its ``_data`` object is still the captured
-    dict. Capture already required POSIX ``_data is posix.environ``;
-    this function does not re-read ``posix.environ`` / ``nt.environ``
-    (those attributes may be rebound and are never a presence oracle).
+    dict. Capture required a prior trusted startup pin; this function
+    does not import or call capture, and does not re-read live
+    ``posix.environ`` / ``nt.environ``. A pin that appears only after
+    this module was imported cannot revive a failed capture.
     Windows requires ``environb`` stay absent; presence stays on
-    ``GetEnvironmentVariableW``. A later sibling that no longer shares
-    the captured ``_data`` fails closed.
+    ``GetEnvironmentVariableW``.
     """
     environ = _CAPTURED_OS_ENVIRON
     environ_type = _CAPTURED_OS_ENVIRON_TYPE
@@ -532,18 +509,18 @@ def _process_environ_dict() -> dict | None:
     current_data = _environ_data_from_instance(current, environ_type, descriptor)
     if current_data is _MISSING or current_data is not captured:
         return None
+    ready, pinned_environ, pinned_posix = _trusted_startup_pins()
+    if not ready or environ is not pinned_environ or current is not pinned_environ:
+        return None
     if str.__eq__(platform, "win32"):
         if environb is not None:
             return None
         current_b = _exact_str_dict_value(module_storage, "environb")
         if current_b is not _MISSING:
             return None
-        witnessed = _already_imported_startup_environ_singleton()
-        if witnessed is _MISSING or witnessed is None:
-            return None
-        if environ is not witnessed or current is not witnessed:
-            return None
         return captured
+    if pinned_posix is None or captured is not pinned_posix:
+        return None
     if environb is None or type(environb) is not environ_type:
         return None
     current_b = _exact_str_dict_value(module_storage, "environb")

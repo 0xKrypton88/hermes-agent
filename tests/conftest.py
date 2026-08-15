@@ -35,10 +35,12 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Pin os.environ identity before any test imports durable-job preflight.
-# Windows capture cannot prove _data via nt.environ; a missing prior pin
-# fails closed. This import must happen while os.environ is still original.
-import hermes_constants as _hermes_constants_environ_witness  # noqa: E402,F401
+# Pin the genuine process environ before any test imports durable-job
+# preflight. Importing the startup module does not capture; the explicit
+# call must happen while os.environ is still original.
+import hermes_environ_startup as _hermes_environ_startup  # noqa: E402
+
+_hermes_environ_startup.capture_trusted_startup()
 
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
