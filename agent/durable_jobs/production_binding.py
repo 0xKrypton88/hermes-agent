@@ -140,11 +140,50 @@ def _concrete_instance_storage(owner: Any) -> dict[str, Any] | None:
     return storage
 
 
+def _exact_str_item_pairs(storage: Any) -> list[tuple[str, Any]] | None:
+    """Return ``(exact-str key, value)`` pairs, or None if storage is unsafe.
+
+    Walks a builtin ``dict`` through ``dict.items`` so untrusted keys are
+    never hashed, membership-tested, or compared. Any non-exact-str key
+    fails closed. Values are not inspected, stringified, or compared.
+    """
+    if type(storage) is not dict:
+        return None
+    pairs: list[tuple[str, Any]] = []
+    try:
+        items = dict.items(storage)
+    except Exception:
+        return None
+    for pair in items:
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
+            return None
+        key = tuple.__getitem__(pair, 0)
+        value = tuple.__getitem__(pair, 1)
+        if type(key) is not str:
+            return None
+        pairs.append((key, value))
+    return pairs
+
+
+def _exact_str_pair_value(pairs: list[tuple[str, Any]] | None, name: str) -> Any:
+    if pairs is None or type(name) is not str:
+        return None
+    matched = None
+    seen = False
+    for key, value in pairs:
+        if str.__eq__(key, name):
+            if seen:
+                return None
+            matched = value
+            seen = True
+    if not seen:
+        return None
+    return matched
+
+
 def _owner_attr(owner: Any, name: str) -> Any:
     storage = _concrete_instance_storage(owner)
-    if storage is None:
-        return None
-    return storage.get(name)
+    return _exact_str_pair_value(_exact_str_item_pairs(storage), name)
 
 
 def _instance_attr(transport: Any, name: str) -> Any:
@@ -174,15 +213,35 @@ def _runtime_identity(owner: Any) -> Optional[tuple[str, str]]:
     raw = _owner_attr(owner, OWNER_RUNTIME_IDENTITY_ATTR)
     if type(raw) is not dict:
         return None
-    workspace = raw.get("workspace_id")
-    repository = raw.get("repository_identity")
+    pairs = _exact_str_item_pairs(raw)
+    if pairs is None:
+        return None
+    workspace = None
+    repository = None
+    seen_workspace = False
+    seen_repository = False
+    for key, value in pairs:
+        if str.__eq__(key, "workspace_id"):
+            if seen_workspace:
+                return None
+            workspace = value
+            seen_workspace = True
+        elif str.__eq__(key, "repository_identity"):
+            if seen_repository:
+                return None
+            repository = value
+            seen_repository = True
+        else:
+            return None
+    if not seen_workspace or not seen_repository:
+        return None
     if type(workspace) is not str or type(repository) is not str:
         return None
-    if workspace != workspace.strip() or repository != repository.strip():
+    if not str.__eq__(workspace, str.strip(workspace)):
         return None
-    if not workspace or not repository:
+    if not str.__eq__(repository, str.strip(repository)):
         return None
-    if set(raw) != {"workspace_id", "repository_identity"}:
+    if str.__len__(workspace) == 0 or str.__len__(repository) == 0:
         return None
     return (workspace, repository)
 
