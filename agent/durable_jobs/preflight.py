@@ -308,10 +308,11 @@ def _environ_data_from_instance(environ: Any, environ_type: Any, descriptor: Any
 def _capture_os_environ_boundary():
     """Pin ``os.environ`` only when ``_data`` provenance can be established.
 
-    POSIX: ``_data`` must be the interpreter ``posix.environ`` mapping
-    (``is``), and ``environb`` must share that same object. A pre-import
-    replacement pair whose shared ``_data`` is a fresh dict is not that
-    mapping and fails closed.
+    POSIX: at import, ``_data`` must be the interpreter ``posix.environ``
+    mapping (``is``), and ``environb`` must share that same object. A
+    pre-import replacement pair whose shared ``_data`` is a fresh dict
+    is not that mapping and fails closed. Later rebinding of
+    ``posix.environ`` is ignored and is never a presence oracle.
 
     Windows: ``GetEnvironmentVariableW`` is the presence authority.
     ``environb`` is not a supported surface and must stay absent; a
