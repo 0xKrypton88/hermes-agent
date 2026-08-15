@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -295,6 +296,132 @@ class _ArmedCollidingKey:
     def __bool__(self):
         self._probes.append(f"{self._label}.__bool__")
         raise AssertionError(f"{self._label}.__bool__ must not run")
+
+
+class _EvilSecretRefStr(str):
+    """str subclass that traps equality, hash, strip, and bool hooks."""
+
+    def __init__(self, value, probes, label):
+        self._probes = probes
+        self._label = label
+
+    def __new__(cls, value, probes, label):
+        return str.__new__(cls, value)
+
+    def __eq__(self, other):
+        self._probes.append(f"{self._label}.__eq__")
+        raise AssertionError(f"{self._label}.__eq__ must not run")
+
+    def __hash__(self):
+        self._probes.append(f"{self._label}.__hash__")
+        raise AssertionError(f"{self._label}.__hash__ must not run")
+
+    def __bool__(self):
+        self._probes.append(f"{self._label}.__bool__")
+        raise AssertionError(f"{self._label}.__bool__ must not run")
+
+    def strip(self, *args, **kwargs):
+        self._probes.append(f"{self._label}.strip")
+        raise AssertionError(f"{self._label}.strip must not run")
+
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in (here, *here.parents):
+        if (parent / "agent" / "durable_jobs" / "preflight.py").is_file():
+            return parent
+    raise AssertionError("repository root not found")
+
+
+def _child_inherits_env_name(name: str) -> bool:
+    """Return whether a child process inherits this environment *name*."""
+    if type(name) is not str:
+        raise AssertionError("name must be an exact str")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os,sys;sys.stdout.write('1' if sys.argv[1] in os.environ else '0')",
+            name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError("child environment-name probe failed")
+    return result.stdout == "1"
+
+
+def _environ_instance_storage():
+    from agent.durable_jobs.preflight import (
+        _CAPTURED_OS_ENVIRON,
+        _CAPTURED_OS_ENVIRON_DICT,
+        _CAPTURED_OS_ENVIRON_TYPE,
+    )
+
+    return _CAPTURED_OS_ENVIRON_DICT.__get__(
+        _CAPTURED_OS_ENVIRON, _CAPTURED_OS_ENVIRON_TYPE
+    )
+
+
+def _replace_environ_data(replacement):
+    storage = _environ_instance_storage()
+    original = dict.__getitem__(storage, "_data")
+    dict.__setitem__(storage, "_data", replacement)
+    return storage, original
+
+
+def _insert_backing_only_name(name: str):
+    from agent.durable_jobs.preflight import _process_environ_dict
+
+    data = _process_environ_dict()
+    if type(data) is not dict:
+        raise AssertionError("expected intact environ backing dict")
+    encoded = str.encode(name, "ascii")
+    if dict.__contains__(data, name) or dict.__contains__(data, encoded):
+        raise AssertionError("backing-only name already present")
+    try:
+        dict.__setitem__(data, encoded, object())
+        return data, encoded
+    except Exception:
+        dict.__setitem__(data, name, object())
+        return data, name
+
+
+def _scrub_untrusted_environ_keys():
+    try:
+        storage = _environ_instance_storage()
+        data = dict.__getitem__(storage, "_data")
+    except Exception:
+        return
+    if type(data) is not dict:
+        return
+    drop = []
+    for pair in dict.items(data):
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
+            continue
+        key = tuple.__getitem__(pair, 0)
+        if type(key) is str or type(key) is bytes:
+            continue
+        try:
+            object.__getattribute__(key, "_armed")
+            key._armed = False
+        except AttributeError:
+            pass
+        drop.append(key)
+    for key in drop:
+        try:
+            dict.__delitem__(data, key)
+        except Exception:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _scrub_environ_data_keys():
+    _scrub_untrusted_environ_keys()
+    yield
+    _scrub_untrusted_environ_keys()
 
 
 def _getset_descriptor_type():
@@ -1246,3 +1373,222 @@ def test_bind_does_not_eq_hash_colliding_runtime_identity_dict_key(
     assert bound == {}
     assert probes == []
     assert calls == []
+
+
+def test_replaced_environ_data_dict_is_rejected(monkeypatch):
+    from agent.durable_jobs.preflight import (
+        _process_environ_dict,
+        _secret_ref_present,
+    )
+
+    fake_name = "HERMES_ENG50_V6_FAKE_REF"
+    real_name = "HERMES_ENG50_V6_REAL_REF"
+    monkeypatch.setenv(real_name, "x")
+    replacement = {fake_name: object()}
+    storage, original = _replace_environ_data(replacement)
+    try:
+        data = _process_environ_dict()
+        assert data is not replacement
+        assert data is None
+        assert _secret_ref_present(fake_name) is False
+        assert _secret_ref_present(real_name) is False
+    finally:
+        dict.__setitem__(storage, "_data", original)
+    assert _secret_ref_present(real_name) is True
+    assert _secret_ref_present(fake_name) is False
+
+
+def test_preimport_fake_os_environ_boundary_fails_closed():
+    script = """
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+
+class _Environ:
+    pass
+
+fake = _Environ()
+fake._data = {"HERMES_ENG50_V6_PREIMPORT": object()}
+os._Environ = _Environ
+os.environ = fake
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+data = _process_environ_dict()
+present = _secret_ref_present("HERMES_ENG50_V6_PREIMPORT")
+sys.stdout.write("accepted=" + ("1" if data is fake._data else "0"))
+sys.stdout.write(" present=" + ("1" if present else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "accepted=0 present=0"
+
+
+def test_secret_ref_presence_does_not_eq_hostile_environ_data_key(monkeypatch):
+    from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+
+    hostile_name = "HERMES_ENG50_V6_HOSTILE_REF"
+    live_name = "HERMES_ENG50_V6_HOSTILE_LIVE"
+    monkeypatch.delenv(hostile_name, raising=False)
+    monkeypatch.setenv(live_name, "x")
+    data = _process_environ_dict()
+    assert type(data) is dict
+    probes: list = []
+    hostile = _ArmedCollidingKey(hostile_name, probes, "env_key")
+    live_hostile = _ArmedCollidingKey(live_name, probes, "live_key")
+    dict.__setitem__(data, hostile, object())
+    dict.__setitem__(data, live_hostile, object())
+    try:
+        hostile.arm()
+        live_hostile.arm()
+        assert _secret_ref_present(hostile_name) is False
+        assert _secret_ref_present(live_name) is True
+        assert probes == []
+    finally:
+        hostile._armed = False
+        live_hostile._armed = False
+        dict.__delitem__(data, hostile)
+        dict.__delitem__(data, live_hostile)
+
+
+def test_secret_ref_presence_follows_child_inherited_env_not_backing_cache():
+    from agent.durable_jobs.preflight import _secret_ref_present
+
+    putenv_name = "HERMES_ENG50_V6_PUTENV_ONLY"
+    backing_name = "HERMES_ENG50_V6_BACKING_ONLY"
+    os.putenv(putenv_name, "1")
+    try:
+        assert _child_inherits_env_name(putenv_name) is True
+        assert _secret_ref_present(putenv_name) is True
+    finally:
+        os.unsetenv(putenv_name)
+    assert _secret_ref_present(putenv_name) is False
+    assert _child_inherits_env_name(putenv_name) is False
+
+    data, backing_key = _insert_backing_only_name(backing_name)
+    try:
+        assert _child_inherits_env_name(backing_name) is False
+        assert _secret_ref_present(backing_name) is False
+    finally:
+        dict.__delitem__(data, backing_key)
+
+
+def test_approved_transport_rejects_str_subclass_secret_ref_without_hooks():
+    from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
+    from agent.durable_jobs.production_binding import _approved_transport
+
+    probes: list = []
+    transport = CursorCloudInjectedTransport(
+        request=_idle_request([]), secret_ref="CURSOR_API_KEY"
+    )
+    storage = object.__getattribute__(transport, "__dict__")
+    dict.__setitem__(
+        storage, "_secret_ref", _EvilSecretRefStr("CURSOR_API_KEY", probes, "ref")
+    )
+    assert (
+        _approved_transport(
+            transport, CursorCloudInjectedTransport, "CURSOR_API_KEY"
+        )
+        is False
+    )
+    assert probes == []
+
+
+def test_preflight_rejects_str_subclass_secret_ref_without_hooks(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import (
+        _concrete_injected_transport,
+        _transport_secret_ref,
+        preflight_durable_jobs,
+    )
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    cursor = CursorCloudInjectedTransport(
+        request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+    )
+    slack = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+    )
+    dict.__setitem__(
+        object.__getattribute__(cursor, "__dict__"),
+        "_secret_ref",
+        _EvilSecretRefStr("CURSOR_API_KEY", probes, "cursor"),
+    )
+    dict.__setitem__(
+        object.__getattribute__(slack, "__dict__"),
+        "_secret_ref",
+        _EvilSecretRefStr("SLACK_BOT_TOKEN", probes, "slack"),
+    )
+    assert _concrete_injected_transport(cursor, CursorCloudInjectedTransport) is False
+    assert _transport_secret_ref(cursor) is None
+    report = preflight_durable_jobs(
+        _complete(tmp_path), cursor_transport=cursor, slack_transport=slack
+    )
+    assert report.transport_capability is False
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+    _assert_no_secrets(report)
+
+
+def test_bind_rejects_str_subclass_secret_ref_without_hooks(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    cursor = CursorCloudInjectedTransport(
+        request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+    )
+    slack = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+    )
+    dict.__setitem__(
+        object.__getattribute__(cursor, "__dict__"),
+        "_secret_ref",
+        _EvilSecretRefStr("CURSOR_API_KEY", probes, "cursor"),
+    )
+    bound = bind_production_transports(
+        _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
+        cursor_transport=cursor,
+        slack_transport=slack,
+    )
+    assert bound == {}
+    assert probes == []
+    assert calls == []
+
+
+def test_bind_rejects_replaced_environ_data_dict(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    calls: list = []
+    replacement = {"CURSOR_API_KEY": "x", "SLACK_BOT_TOKEN": "x"}
+    storage, original = _replace_environ_data(replacement)
+    try:
+        bound = bind_production_transports(
+            _complete(tmp_path),
+            owner=_owner_with_matching_identity(),
+            cursor_request=_idle_request(calls),
+            slack_request=_idle_request(calls),
+        )
+        assert bound == {}
+        assert calls == []
+    finally:
+        dict.__setitem__(storage, "_data", original)
