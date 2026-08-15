@@ -269,6 +269,34 @@ class _EvilStr(str):
         raise AssertionError("str-subclass __hash__ must not run")
 
 
+class _ArmedCollidingKey:
+    """Key whose hash collides with a target after setup, then traps hooks."""
+
+    def __init__(self, target, probes, label):
+        self._target = target
+        self._probes = probes
+        self._label = label
+        self._armed = False
+
+    def arm(self):
+        self._armed = True
+        return self
+
+    def __hash__(self):
+        if self._armed:
+            self._probes.append(f"{self._label}.__hash__")
+            raise AssertionError(f"{self._label}.__hash__ must not run")
+        return hash(self._target)
+
+    def __eq__(self, other):
+        self._probes.append(f"{self._label}.__eq__")
+        raise AssertionError(f"{self._label}.__eq__ must not run")
+
+    def __bool__(self):
+        self._probes.append(f"{self._label}.__bool__")
+        raise AssertionError(f"{self._label}.__bool__ must not run")
+
+
 def _getset_descriptor_type():
     return type(type.__dict__["__dict__"])
 
@@ -1138,6 +1166,83 @@ def test_owner_dict_descriptor_metaclass_eq_is_not_compared_to_getset(
         cursor_request=_idle_request(calls),
         slack_request=_idle_request(calls),
     )
+    assert bound == {}
+    assert probes == []
+    assert calls == []
+
+
+def test_owner_attr_does_not_eq_hash_colliding_instance_dict_key():
+    from agent.durable_jobs.production_binding import (
+        OWNER_RUNTIME_IDENTITY_ATTR,
+        _owner_attr,
+    )
+
+    probes: list = []
+    owner = type("Owner", (), {})()
+    storage = object.__getattribute__(owner, "__dict__")
+    assert type(storage) is dict
+    key = _ArmedCollidingKey(OWNER_RUNTIME_IDENTITY_ATTR, probes, "owner_key")
+    storage[key] = _matching_identity()
+    key.arm()
+    assert _owner_attr(owner, OWNER_RUNTIME_IDENTITY_ATTR) is None
+    assert probes == []
+
+
+def test_runtime_identity_does_not_eq_hash_colliding_identity_dict_key():
+    from agent.durable_jobs.production_binding import _runtime_identity
+
+    probes: list = []
+    owner = type("Owner", (), {})()
+    storage = object.__getattribute__(owner, "__dict__")
+    identity = {}
+    key = _ArmedCollidingKey("workspace_id", probes, "id_key")
+    identity[key] = CONFIG_WORKSPACE
+    identity["repository_identity"] = CONFIG_REPO
+    storage["_durable_job_runtime_identity"] = identity
+    key.arm()
+    assert _runtime_identity(owner) is None
+    assert probes == []
+
+
+def test_bind_does_not_eq_hash_colliding_owner_dict_key(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    owner = type("Owner", (), {})()
+    storage = object.__getattribute__(owner, "__dict__")
+    assert type(storage) is dict
+    key = _ArmedCollidingKey("_durable_job_runtime_identity", probes, "owner_key")
+    storage[key] = _matching_identity()
+    storage["_durable_job_cursor_request"] = _idle_request(calls)
+    storage["_durable_job_slack_request"] = _idle_request(calls)
+    key.arm()
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert probes == []
+    assert calls == []
+
+
+def test_bind_does_not_eq_hash_colliding_runtime_identity_dict_key(
+    tmp_path, monkeypatch
+):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    owner = type("Owner", (), {})()
+    storage = object.__getattribute__(owner, "__dict__")
+    identity = {}
+    key = _ArmedCollidingKey("workspace_id", probes, "id_key")
+    identity[key] = CONFIG_WORKSPACE
+    identity["repository_identity"] = CONFIG_REPO
+    storage["_durable_job_runtime_identity"] = identity
+    storage["_durable_job_cursor_request"] = _idle_request(calls)
+    storage["_durable_job_slack_request"] = _idle_request(calls)
+    key.arm()
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
     assert bound == {}
     assert probes == []
     assert calls == []

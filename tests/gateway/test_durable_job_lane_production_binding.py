@@ -222,6 +222,34 @@ def _restore_os_module_environ(replaced):
         object.__setattr__(module, "environ", original)
 
 
+class _ArmedCollidingKey:
+    """Key whose hash collides with a target after setup, then traps hooks."""
+
+    def __init__(self, target, probes, label):
+        self._target = target
+        self._probes = probes
+        self._label = label
+        self._armed = False
+
+    def arm(self):
+        self._armed = True
+        return self
+
+    def __hash__(self):
+        if self._armed:
+            self._probes.append(f"{self._label}.__hash__")
+            raise AssertionError(f"{self._label}.__hash__ must not run")
+        return hash(self._target)
+
+    def __eq__(self, other):
+        self._probes.append(f"{self._label}.__eq__")
+        raise AssertionError(f"{self._label}.__eq__ must not run")
+
+    def __bool__(self):
+        self._probes.append(f"{self._label}.__bool__")
+        raise AssertionError(f"{self._label}.__bool__ must not run")
+
+
 def _getset_descriptor_type():
     return type(type.__dict__["__dict__"])
 
@@ -906,6 +934,54 @@ def test_startup_owner_dict_descriptor_metaclass_eq_is_not_compared_to_getset(
     _prepare_startup(tmp_path, monkeypatch)
     runner = _make_runner(tmp_path, runner_cls=TrapRunner)
     _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_owner_dict_colliding_key_hooks_are_not_executed(
+    tmp_path, monkeypatch
+):
+    probes: list = []
+    calls: list = []
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    _install_request_ports(
+        runner,
+        _idle_request(calls),
+        _idle_request(calls),
+        install_identity=False,
+    )
+    storage = object.__getattribute__(runner, "__dict__")
+    assert type(storage) is dict
+    key = _ArmedCollidingKey("_durable_job_runtime_identity", probes, "owner_key")
+    storage[key] = _matching_identity()
+    key.arm()
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_runtime_identity_dict_colliding_key_hooks_are_not_executed(
+    tmp_path, monkeypatch
+):
+    probes: list = []
+    calls: list = []
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    _install_request_ports(
+        runner,
+        _idle_request(calls),
+        _idle_request(calls),
+        install_identity=False,
+    )
+    storage = object.__getattribute__(runner, "__dict__")
+    identity = {}
+    key = _ArmedCollidingKey("workspace_id", probes, "id_key")
+    identity[key] = CONFIG_WORKSPACE
+    identity["repository_identity"] = CONFIG_REPO
+    storage["_durable_job_runtime_identity"] = identity
+    key.arm()
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
     assert probes == []
