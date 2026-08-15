@@ -200,6 +200,28 @@ def _install_overridable_environ_traps(monkeypatch):
     _install_secret_value_traps(monkeypatch)
 
 
+def _replace_os_module_environ(stale):
+    """Point posix/nt.environ at a snapshot that is not os.environ._data."""
+    replaced = []
+    for modname in ("posix", "nt"):
+        try:
+            module = __import__(modname)
+        except ImportError:
+            continue
+        try:
+            original = object.__getattribute__(module, "environ")
+        except AttributeError:
+            continue
+        object.__setattr__(module, "environ", stale)
+        replaced.append((module, original))
+    return replaced
+
+
+def _restore_os_module_environ(replaced):
+    for module, original in replaced:
+        object.__setattr__(module, "environ", original)
+
+
 def _getset_descriptor_type():
     return type(type.__dict__["__dict__"])
 
@@ -814,6 +836,60 @@ def test_startup_presence_does_not_use_overridable_environ_mapping_apis(
     assert "xoxb-" not in dumped
     assert "cursor-test-ref-value" not in dumped
     assert "slack-test-ref-value" not in dumped
+
+
+def test_startup_attach_follows_live_os_environ_not_stale_os_module_dict(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    raw, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    stale = {}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        runner._maybe_attach_durable_job_lane()
+        handle = getattr(runner, "_durable_job_lane", None)
+        assert handle is not None
+        assert get_active_durable_job_lane() is handle
+        assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+        assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+        assert handle.preflight.secret_refs_present is True
+        assert handle.preflight.runtime_ready is True
+        assert handle.config.dispatch_allowed is False
+        assert handle.preflight.dispatch_allowed is False
+        assert calls == []
+        dumped = f"{handle!r} {handle.preflight!r} {raw!r}"
+        assert CURSOR_TOKEN not in dumped
+        assert SLACK_TOKEN not in dumped
+        assert "xoxb-" not in dumped
+        assert "cursor-test-ref-value" not in dumped
+        assert "slack-test-ref-value" not in dumped
+    finally:
+        _restore_os_module_environ(replaced)
+
+
+def test_startup_attach_stays_none_when_refs_only_in_stale_os_module_environ(
+    tmp_path, monkeypatch
+):
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    stale = {"CURSOR_API_KEY": b"stale", "SLACK_BOT_TOKEN": b"stale"}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        runner._maybe_attach_durable_job_lane()
+        assert getattr(runner, "_durable_job_lane", None) is None
+        assert calls == []
+    finally:
+        _restore_os_module_environ(replaced)
 
 
 def test_startup_owner_dict_descriptor_metaclass_eq_is_not_compared_to_getset(

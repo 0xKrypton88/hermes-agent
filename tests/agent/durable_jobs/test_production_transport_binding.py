@@ -177,6 +177,33 @@ def _install_overridable_environ_traps(monkeypatch):
     _install_preflight_os_environ(monkeypatch, _AdversarialEnviron())
 
 
+def _replace_os_module_environ(stale):
+    """Point posix/nt.environ at a snapshot that is not os.environ._data.
+
+    Windows CPython keeps ``nt.environ`` as an exact ``dict`` that is not
+    synchronized with ``monkeypatch.setenv`` / ``os.environ``. POSIX tests
+    reproduce that split by rebinding the OS-module attribute only.
+    """
+    replaced = []
+    for modname in ("posix", "nt"):
+        try:
+            module = __import__(modname)
+        except ImportError:
+            continue
+        try:
+            original = object.__getattribute__(module, "environ")
+        except AttributeError:
+            continue
+        object.__setattr__(module, "environ", stale)
+        replaced.append((module, original))
+    return replaced
+
+
+def _restore_os_module_environ(replaced):
+    for module, original in replaced:
+        object.__setattr__(module, "environ", original)
+
+
 class _AdversarialEnviron:
     """Proxy whose mapping/equality/hash hooks fail if invoked."""
 
@@ -967,6 +994,88 @@ def test_preflight_absence_ignores_lying_environ_mapping(tmp_path, monkeypatch):
     assert report.dispatch_allowed is False
     assert "secret_refs_missing" in report.reasons
     _assert_no_secrets(report)
+
+
+def test_secret_ref_presence_follows_live_os_environ_not_stale_os_module_dict(
+    monkeypatch,
+):
+    from agent.durable_jobs.preflight import _secret_ref_present
+
+    monkeypatch.setenv("CURSOR_API_KEY", "x")
+    stale = {}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        assert _secret_ref_present("CURSOR_API_KEY") is True
+    finally:
+        _restore_os_module_environ(replaced)
+
+
+def test_secret_ref_presence_ignores_name_only_in_stale_os_module_environ(
+    monkeypatch,
+):
+    from agent.durable_jobs.preflight import _secret_ref_present
+
+    monkeypatch.delenv("ONLY_IN_STALE_OS_MODULE", raising=False)
+    stale = {"ONLY_IN_STALE_OS_MODULE": b"stale"}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        assert _secret_ref_present("ONLY_IN_STALE_OS_MODULE") is False
+    finally:
+        _restore_os_module_environ(replaced)
+
+
+def test_preflight_presence_follows_live_os_environ_not_stale_os_module_dict(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    stale = {}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        calls: list = []
+        report = preflight_durable_jobs(
+            _complete(tmp_path),
+            cursor_transport=CursorCloudInjectedTransport(
+                request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+            ),
+            slack_transport=SlackInjectedTransport(
+                request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+            ),
+        )
+        assert report.secret_refs_present is True
+        assert report.runtime_ready is True
+        assert report.dispatch_allowed is False
+        assert "secret_refs_missing" not in report.reasons
+        assert calls == []
+        _assert_no_secrets(report)
+    finally:
+        _restore_os_module_environ(replaced)
+
+
+def test_preflight_absence_when_names_only_in_stale_os_module_environ(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    stale = {"CURSOR_API_KEY": b"stale", "SLACK_BOT_TOKEN": b"stale"}
+    replaced = _replace_os_module_environ(stale)
+    try:
+        report = preflight_durable_jobs(_complete(tmp_path))
+        assert report.secret_refs_present is False
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "secret_refs_missing" in report.reasons
+        _assert_no_secrets(report)
+    finally:
+        _restore_os_module_environ(replaced)
 
 
 def test_secret_ref_present_ignores_user_controlled_eq_and_hash_hooks():
