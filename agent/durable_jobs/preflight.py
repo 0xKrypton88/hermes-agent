@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from agent.durable_jobs.config import (
@@ -53,38 +54,87 @@ class DurableJobsPreflight:
         )
 
 
-def _process_environ_dict() -> dict | None:
-    """Return the interpreter process-environment dict, or None.
+_TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
+_GETSET_DESCRIPTOR_TYPE = type(_TYPE_DICT_DESCRIPTOR)
 
-    Runtime boundary: CPython stores the process environment in
-    ``posix.environ`` (POSIX; bytes keys/values) or ``nt.environ``
-    (Windows). That dict is not the overridable ``os.environ`` mapping
-    and is read only through builtin ``dict.__contains__`` so values are
-    never retrieved. Tests and callers may replace ``os.environ``.
+
+def _capture_os_environ_boundary():
+    """Capture the CPython ``os._Environ`` instance and ``__dict__`` descriptor."""
+    try:
+        environ_type = object.__getattribute__(os, "_Environ")
+        environ = object.__getattribute__(os, "environ")
+    except AttributeError:
+        return None, None, None
+    if type(environ) is not environ_type:
+        return None, None, None
+    try:
+        namespace = _TYPE_DICT_DESCRIPTOR.__get__(environ_type, type)
+    except Exception:
+        return None, None, None
+    if type(namespace) is not MappingProxyType:
+        return None, None, None
+    try:
+        descriptor = namespace.get("__dict__")
+    except Exception:
+        return None, None, None
+    if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None, None, None
+    return environ, environ_type, descriptor
+
+
+_CAPTURED_OS_ENVIRON, _CAPTURED_OS_ENVIRON_TYPE, _CAPTURED_OS_ENVIRON_DICT = (
+    _capture_os_environ_boundary()
+)
+
+
+def _process_environ_dict() -> dict | None:
+    """Return the live CPython ``os._Environ`` backing dict, or None.
+
+    Runtime boundary: name presence follows ``os.environ._data``, the
+    exact ``dict`` updated by ``os.environ`` / ``setenv``. ``posix.environ``
+    and ``nt.environ`` are not consulted — on Windows, ``nt.environ`` is
+    an exact ``dict`` that is not synchronized with ``os.environ``.
+
+    The ``os._Environ`` instance and its builtin ``__dict__`` descriptor
+    are captured at import. Lookup uses exact type / identity checks and
+    builtin descriptor / ``dict`` operations only. Credential values are
+    never retrieved. Unsupported or tampered runtimes fail closed.
     """
-    for module_name in ("posix", "nt"):
-        try:
-            module = __import__(module_name)
-        except ImportError:
-            continue
-        try:
-            data = object.__getattribute__(module, "environ")
-        except AttributeError:
-            continue
-        if type(data) is dict:
-            return data
-    return None
+    environ = _CAPTURED_OS_ENVIRON
+    environ_type = _CAPTURED_OS_ENVIRON_TYPE
+    descriptor = _CAPTURED_OS_ENVIRON_DICT
+    if environ is None or environ_type is None or descriptor is None:
+        return None
+    if type(environ) is not environ_type:
+        return None
+    if type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None
+    try:
+        storage = descriptor.__get__(environ, environ_type)
+    except Exception:
+        return None
+    if type(storage) is not dict:
+        return None
+    try:
+        if not dict.__contains__(storage, "_data"):
+            return None
+        data = dict.__getitem__(storage, "_data")
+    except Exception:
+        return None
+    if type(data) is not dict:
+        return None
+    return data
 
 
 def _secret_ref_present(ref: Optional[str]) -> bool:
     """True when the process environment contains this reference *name*.
 
     Accepts only an exact ``str`` name. Detects key presence via the
-    interpreter OS environ dict (see ``_process_environ_dict``). Never
-    retrieves, resolves, stringifies, logs, or otherwise accesses the
-    credential value, and never calls overridable ``os.environ`` mapping
-    APIs (get, contains, keys, items, values, iteration) or user
-    equality/hash hooks.
+    captured CPython ``os._Environ`` backing dict (see
+    ``_process_environ_dict``). Never retrieves, resolves, stringifies,
+    logs, or otherwise accesses the credential value, and never calls
+    overridable ``os.environ`` mapping APIs (get, contains, keys, items,
+    values, iteration) or user equality/hash hooks.
     """
     if type(ref) is not str or not ref:
         return False
