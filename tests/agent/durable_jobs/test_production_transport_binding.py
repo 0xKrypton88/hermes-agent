@@ -2593,7 +2593,19 @@ finally:
     assert result.stdout == "before=0 imported=0 after=1 pins=1 env=1"
 
 
-def _pre_rebound_environ_script(body: str, *, win32: bool) -> str:
+def _pre_rebound_environ_script(
+    body: str,
+    *,
+    win32: bool,
+    after_replace: str = "",
+) -> str:
+    """Build a subprocess that replaces ``os.environ`` before capture.
+
+    ``asyncio`` and ``hermes_logging`` are imported on the real POSIX
+    platform first so a later ``sys.platform`` spoof does not crash host
+    imports (Windows asyncio / ConcurrentRotatingFileHandler). Capture
+    entrypoints still load after the replacement.
+    """
     win32_setup = ""
     if win32:
         win32_setup = """
@@ -2605,11 +2617,13 @@ except AttributeError:
 object.__setattr__(sys, "platform", "win32")
 """
     return f"""
+import asyncio
 import os
 import shutil
 import sys
 import tempfile
 sys.path.insert(0, sys.argv[1])
+import hermes_logging
 home = tempfile.mkdtemp()
 old = os.environ
 replacement = os._Environ(
@@ -2621,8 +2635,9 @@ replacement = os._Environ(
 )
 os.environ = replacement
 del old
-{win32_setup}
 replacement["HERMES_HOME"] = home
+{after_replace}
+{win32_setup}
 os.putenv("CURSOR_API_KEY", "1")
 os.putenv("SLACK_BOT_TOKEN", "1")
 try:
@@ -2632,10 +2647,14 @@ finally:
 """
 
 
-def _assert_pre_rebound_rejected(body: str) -> None:
+def _assert_pre_rebound_rejected(body: str, *, after_replace: str = "") -> None:
     expected = "ready=0 accepted=0 present=0 env_is_new=0 none=1"
     for win32 in (False, True):
-        script = _pre_rebound_environ_script(body, win32=win32)
+        script = _pre_rebound_environ_script(
+            body,
+            win32=win32,
+            after_replace=after_replace,
+        )
         result = subprocess.run(
             [sys.executable, "-c", script, str(_repo_root())],
             check=False,
@@ -2676,9 +2695,9 @@ def test_pre_rebound_os_environ_replacement_rejected_for_run_agent():
 
 
 def test_pre_rebound_os_environ_replacement_rejected_for_gateway_preflight():
+    after_replace = "from gateway.run import _capture_trusted_environ_startup\n"
     body = (
-        "    from gateway.run import _capture_trusted_environ_startup\n"
         "    _capture_trusted_environ_startup()\n"
         + _PRE_REBOUND_REPORT
     )
-    _assert_pre_rebound_rejected(body)
+    _assert_pre_rebound_rejected(body, after_replace=after_replace)
