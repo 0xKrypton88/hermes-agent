@@ -95,8 +95,11 @@ Hermes `state.db`.
   injects only those approved concrete types when a truthful request
   port and a concrete matching `_durable_job_runtime_identity` are
   already stored on the runner instance. Owner seam names are read only
-  from instance `__dict__` (never properties, descriptors, or class
-  attributes). Config flags and secret-ref *names* cannot mint a client.
+  from instance `__dict__` via builtin type access (never properties,
+  descriptors, class attributes, or custom metaclass `__getattribute__`
+  hooks). Preflight detects secret-ref *names* by environment key
+  presence only and never retrieves credential values. Config flags and
+  secret-ref *names* cannot mint a client.
   This repository has no Cursor Cloud or Slack `InjectedRequestPort`
   implementation; missing ports or identity fail closed rather than
   inventing HTTP/SDK behavior

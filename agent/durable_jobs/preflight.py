@@ -54,10 +54,20 @@ class DurableJobsPreflight:
 
 
 def _secret_ref_present(ref: Optional[str]) -> bool:
+    """True when the environment contains this reference *name*.
+
+    Detects key presence only. Never retrieves, resolves, compares,
+    stringifies, logs, or otherwise accesses the credential value.
+    """
     if not ref:
         return False
-    value = os.environ.get(ref)
-    return bool(value)
+    try:
+        for key in os.environ.keys():
+            if key == ref:
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:

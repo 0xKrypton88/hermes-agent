@@ -19,6 +19,7 @@ secret-ref-mismatched, or identity-mismatched sources fail closed
 from __future__ import annotations
 
 from collections.abc import Mapping as MappingABC
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from agent.durable_jobs.config import (
@@ -59,6 +60,8 @@ def _builtin_instance_dict_descriptor_types() -> frozenset[type]:
 
 
 _INSTANCE_DICT_DESCRIPTOR_TYPES = _builtin_instance_dict_descriptor_types()
+_TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
+_TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
 
 
 def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -78,23 +81,42 @@ def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
 def _concrete_instance_storage(owner: Any) -> dict[str, Any] | None:
     """Return the owner's instance dict, or None when storage is unsafe.
 
-    Looks up the ``__dict__`` descriptor on the type MRO only. Custom
-    ``__dict__`` properties/descriptors and objects without a builtin
-    instance dict (including slotted objects) are denied. Seam names are
-    never resolved through getattr/class lookup.
+    Walks the real type MRO and class namespaces through builtin ``type``
+    descriptors so custom metaclass ``__getattribute__`` hooks cannot
+    observe or intercept the lookup. Accepts only builtin instance-dict
+    descriptors and exact ``dict`` storage. Custom ``__dict__``
+    properties/descriptors and objects without a builtin instance dict
+    (including slotted objects) are denied. Seam names are never
+    resolved through getattr/class lookup.
     """
     if owner is None:
         return None
+    cls = type(owner)
+    try:
+        mro = _TYPE_MRO_DESCRIPTOR.__get__(cls, type)
+    except Exception:
+        return None
+    if type(mro) is not tuple:
+        return None
     descriptor = None
-    for base in type(owner).__mro__:
-        found = base.__dict__.get("__dict__")
+    for base in mro:
+        try:
+            namespace = _TYPE_DICT_DESCRIPTOR.__get__(base, type)
+        except Exception:
+            return None
+        if type(namespace) is not MappingProxyType:
+            return None
+        try:
+            found = namespace.get("__dict__")
+        except Exception:
+            return None
         if found is not None:
             descriptor = found
             break
     if descriptor is None or type(descriptor) not in _INSTANCE_DICT_DESCRIPTOR_TYPES:
         return None
     try:
-        storage = descriptor.__get__(owner, type(owner))
+        storage = descriptor.__get__(owner, cls)
     except Exception:
         return None
     if type(storage) is not dict:
