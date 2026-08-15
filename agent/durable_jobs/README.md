@@ -90,6 +90,13 @@ Hermes `state.db`.
 - Production-shaped `CursorCloudInjectedTransport` /
   `SlackInjectedTransport` require an injected request callable and a
   secret-ref name. No built-in credentials, no implicit HTTP/SDK client
+- ENG-50 production binding (`production_binding.py`) is the
+  lifecycle-owned Gateway startup seam: `_maybe_attach_durable_job_lane`
+  injects only those approved concrete types when a truthful request
+  port is already installed on the runner. Config flags and secret-ref
+  *names* cannot mint a client. This repository has no Cursor Cloud or
+  Slack `InjectedRequestPort` implementation; missing ports fail closed
+  rather than inventing HTTP/SDK behavior
 - Preflight validates config/backend/schema/path/adapter modes/bindings/
   secret-ref names/runtime readiness with no sockets and no `psycopg`
   import on the SQLite path

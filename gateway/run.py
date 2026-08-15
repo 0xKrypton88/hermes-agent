@@ -10887,14 +10887,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Construct Durable Job Lane only when runtime capability is bound.
 
         Default-off and fail-closed. Reads ``durable_jobs`` from active config.
-        Never injects an HTTP/SDK client or credential. Missing or mismatched
-        transport secret refs refuse attach. Package 1 dispatch remains
-        hard-disabled even when the lane is constructed.
+        Binds only approved concrete transports when a truthful request port
+        is already installed on this runner. Never constructs an HTTP/SDK
+        client or reads a credential because flags are on. Missing or
+        mismatched transport secret refs refuse attach. Package 1 dispatch
+        remains hard-disabled even when the lane is constructed.
         """
         try:
+            from agent.durable_jobs.production_binding import production_attach_kwargs
             from gateway.durable_job_lane import LaneClosedError, attach_to_gateway_runner
 
-            attach_to_gateway_runner(self)
+            attach_to_gateway_runner(self, **production_attach_kwargs(owner=self))
         except LaneClosedError:
             raise
         except Exception:
