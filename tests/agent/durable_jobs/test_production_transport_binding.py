@@ -2591,3 +2591,94 @@ finally:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "before=0 imported=0 after=1 pins=1 env=1"
+
+
+def _pre_rebound_environ_script(body: str, *, win32: bool) -> str:
+    win32_setup = ""
+    if win32:
+        win32_setup = """
+import shutil
+try:
+    object.__delattr__(os, "environb")
+except AttributeError:
+    pass
+object.__setattr__(sys, "platform", "win32")
+"""
+    return f"""
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+home = tempfile.mkdtemp()
+old = os.environ
+replacement = os._Environ(
+    {{}},
+    object.__getattribute__(old, "encodekey"),
+    object.__getattribute__(old, "decodekey"),
+    object.__getattribute__(old, "encodevalue"),
+    object.__getattribute__(old, "decodevalue"),
+)
+os.environ = replacement
+del old
+{win32_setup}
+replacement["HERMES_HOME"] = home
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
+try:
+{body}
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+
+
+def _assert_pre_rebound_rejected(body: str) -> None:
+    expected = "ready=0 accepted=0 present=0 env_is_new=0 none=1"
+    for win32 in (False, True):
+        script = _pre_rebound_environ_script(body, win32=win32)
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(_repo_root())],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected, (win32, result.stdout, result.stderr)
+
+
+_PRE_REBOUND_REPORT = """
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import (
+        _process_environ_dict,
+        _secret_ref_present,
+        _trusted_startup_pins,
+    )
+    ready = hermes_environ_startup.trusted_startup_ready()
+    pins_ready, env, _posix = _trusted_startup_pins()
+    data = _process_environ_dict()
+    present = _secret_ref_present("CURSOR_API_KEY")
+    sys.stdout.write("ready=" + ("1" if ready or pins_ready else "0"))
+    sys.stdout.write(" accepted=" + ("1" if data is replacement else "0"))
+    sys.stdout.write(" present=" + ("1" if present else "0"))
+    sys.stdout.write(" env_is_new=" + ("1" if env is replacement else "0"))
+    sys.stdout.write(" none=" + ("1" if data is None else "0"))
+"""
+
+
+def test_pre_rebound_os_environ_replacement_rejected_for_hermes_cli_main():
+    body = "    import hermes_cli.main\n" + _PRE_REBOUND_REPORT
+    _assert_pre_rebound_rejected(body)
+
+
+def test_pre_rebound_os_environ_replacement_rejected_for_run_agent():
+    body = "    import run_agent\n" + _PRE_REBOUND_REPORT
+    _assert_pre_rebound_rejected(body)
+
+
+def test_pre_rebound_os_environ_replacement_rejected_for_gateway_preflight():
+    body = (
+        "    from gateway.run import _capture_trusted_environ_startup\n"
+        "    _capture_trusted_environ_startup()\n"
+        + _PRE_REBOUND_REPORT
+    )
+    _assert_pre_rebound_rejected(body)
