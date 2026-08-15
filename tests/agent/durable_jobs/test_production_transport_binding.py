@@ -1974,3 +1974,116 @@ sys.stdout.write(" none=" + ("1" if data is None else "0"))
     )
     assert result.returncode == 0
     assert result.stdout == "accepted=0 present=0 none=1"
+
+
+def test_preimport_double_environ_and_environb_replacement_fails_closed():
+    script = r"""
+import os
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+
+class _Hostile:
+    def __init__(self, probes):
+        self._probes = probes
+        self._armed = False
+    def arm(self):
+        self._armed = True
+    def __hash__(self):
+        if self._armed:
+            self._probes.append("hash")
+            raise AssertionError("hostile backing __hash__ must not run")
+        return 1
+    def __eq__(self, other):
+        self._probes.append("eq")
+        raise AssertionError("hostile backing __eq__ must not run")
+
+probes = []
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+try:
+    old_b = object.__getattribute__(os, "environb")
+except AttributeError:
+    old_b = None
+if old_b is not None:
+    b_encodekey = object.__getattribute__(old_b, "encodekey")
+    b_decodekey = object.__getattribute__(old_b, "decodekey")
+    b_encodevalue = object.__getattribute__(old_b, "encodevalue")
+    b_decodevalue = object.__getattribute__(old_b, "decodevalue")
+else:
+    def b_encodekey(value):
+        if type(value) is not bytes:
+            raise TypeError("bytes expected")
+        return value
+    b_decodekey = bytes
+    b_encodevalue = b_encodekey
+    b_decodevalue = bytes
+new_data = {}
+hostile = _Hostile(probes)
+dict.__setitem__(new_data, hostile, object())
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+new_b = os._Environ(new_data, b_encodekey, b_decodekey, b_encodevalue, b_decodevalue)
+os.environ = new
+os.environb = new_b
+del old
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
+hostile.arm()
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+from agent.durable_jobs.production_binding import bind_production_transports
+data = _process_environ_dict()
+present = _secret_ref_present("HERMES_ENG50_V8_DOUBLE")
+td = tempfile.mkdtemp()
+owner = type("Owner", (), {})()
+object.__getattribute__(owner, "__dict__")["_durable_job_runtime_identity"] = {
+    "workspace_id": "T1",
+    "repository_identity": "github.com/example/repo",
+}
+def _idle(*, operation, secret_ref, payload):
+    raise AssertionError("bind/preflight must not call the provider")
+object.__getattribute__(owner, "__dict__")["_durable_job_cursor_request"] = _idle
+object.__getattribute__(owner, "__dict__")["_durable_job_slack_request"] = _idle
+bound = bind_production_transports(
+    {
+        "durable_jobs": {
+            "enabled": True,
+            "dispatch_enabled": False,
+            "backend": "sqlite",
+            "sqlite_path": td + "/jobs.sqlite",
+            "checkpoint_sqlite_path": td + "/checkpoints.sqlite",
+            "cursor_adapter_mode": "injected",
+            "slack_adapter_mode": "injected",
+            "cursor_secret_ref": "CURSOR_API_KEY",
+            "slack_secret_ref": "SLACK_BOT_TOKEN",
+            "policy_version": "eng29-matrix-v1",
+            "identity_binding": {
+                "workspace_id": "T1",
+                "repository_identity": "github.com/example/repo",
+            },
+        }
+    },
+    owner=owner,
+)
+sys.stdout.write(
+    "double_preimport_replacement_accepted="
+    + ("1" if data is new_data else "0")
+)
+sys.stdout.write(" present=" + ("1" if present else "0"))
+sys.stdout.write(" none=" + ("1" if data is None else "0"))
+sys.stdout.write(" bound=" + ("1" if bound else "0"))
+sys.stdout.write(" probes=" + ("1" if probes else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        result.stdout
+        == "double_preimport_replacement_accepted=0 present=0 none=1 bound=0 probes=0"
+    )
