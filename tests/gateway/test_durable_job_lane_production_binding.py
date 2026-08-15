@@ -150,13 +150,53 @@ def _deny_environ_mapping_api(*_a, **_k):
     raise AssertionError("must not use overridable environ mapping APIs")
 
 
+class _AdversarialEnviron:
+    """Proxy whose mapping APIs fail if preflight delegates to os.environ."""
+
+    def __getattribute__(self, name):
+        if name in {
+            "get",
+            "keys",
+            "items",
+            "values",
+            "copy",
+            "setdefault",
+            "pop",
+            "popitem",
+            "update",
+            "clear",
+        }:
+            raise AssertionError(f"environ.{name} must not run")
+        return object.__getattribute__(self, name)
+
+    def __contains__(self, key):
+        raise AssertionError("environ.__contains__ must not run")
+
+    def __iter__(self):
+        raise AssertionError("environ.__iter__ must not run")
+
+    def __getitem__(self, key):
+        raise AssertionError("environ.__getitem__ must not run")
+
+    def __len__(self):
+        raise AssertionError("environ.__len__ must not run")
+
+
 def _install_overridable_environ_traps(monkeypatch):
-    """Fail if startup uses overridable os.environ mapping APIs."""
-    monkeypatch.setattr(os.environ, "keys", _deny_environ_mapping_api)
-    monkeypatch.setattr(os.environ, "items", _deny_environ_mapping_api)
-    monkeypatch.setattr(os.environ, "values", _deny_environ_mapping_api)
-    monkeypatch.setattr(os._Environ, "__iter__", _deny_environ_mapping_api)
-    monkeypatch.setattr(os._Environ, "__contains__", _deny_environ_mapping_api)
+    """Replace only preflight's os.environ view; leave process os.environ intact."""
+    import agent.durable_jobs.preflight as preflight
+
+    real_os = preflight.os
+
+    class _OsView:
+        def __getattr__(self, name):
+            if name == "environ":
+                return _AdversarialEnviron()
+            if name == "getenv":
+                return _deny_environ_mapping_api
+            return getattr(real_os, name)
+
+    monkeypatch.setattr(preflight, "os", _OsView())
     _install_secret_value_traps(monkeypatch)
 
 

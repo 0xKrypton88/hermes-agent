@@ -40,28 +40,43 @@ OWNER_SLACK_TRANSPORT_ATTR = "_durable_job_slack_transport"
 OWNER_RUNTIME_IDENTITY_ATTR = "_durable_job_runtime_identity"
 
 
-def _builtin_instance_dict_descriptor_types() -> frozenset[type]:
-    found: set[type] = set()
+def _trusted_instance_dict_descriptor_types() -> tuple[type, ...]:
+    found: list[type] = []
 
     class _Plain:
         pass
 
     plain = _Plain.__dict__.get("__dict__")
     if plain is not None:
-        found.add(type(plain))
+        found.append(type(plain))
 
     class _SlottedDict:
         __slots__ = ("__dict__",)
 
     slotted = _SlottedDict.__dict__.get("__dict__")
     if slotted is not None:
-        found.add(type(slotted))
-    return frozenset(found)
+        slotted_type = type(slotted)
+        already = False
+        for existing in found:
+            if slotted_type is existing:
+                already = True
+                break
+        if not already:
+            found.append(slotted_type)
+    return tuple(found)
 
 
-_INSTANCE_DICT_DESCRIPTOR_TYPES = _builtin_instance_dict_descriptor_types()
+_TRUSTED_INSTANCE_DICT_DESCRIPTOR_TYPES = _trusted_instance_dict_descriptor_types()
 _TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
 _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
+
+
+def _is_trusted_instance_dict_descriptor(descriptor: Any) -> bool:
+    descr_type = type(descriptor)
+    for trusted in _TRUSTED_INSTANCE_DICT_DESCRIPTOR_TYPES:
+        if descr_type is trusted:
+            return True
+    return False
 
 
 def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -82,12 +97,13 @@ def _concrete_instance_storage(owner: Any) -> dict[str, Any] | None:
     """Return the owner's instance dict, or None when storage is unsafe.
 
     Walks the real type MRO and class namespaces through builtin ``type``
-    descriptors so custom metaclass ``__getattribute__`` hooks cannot
-    observe or intercept the lookup. Accepts only builtin instance-dict
-    descriptors and exact ``dict`` storage. Custom ``__dict__``
-    properties/descriptors and objects without a builtin instance dict
-    (including slotted objects) are denied. Seam names are never
-    resolved through getattr/class lookup.
+    descriptors so custom metaclass ``__getattribute__`` / ``__eq__`` /
+    ``__hash__`` hooks cannot observe or intercept the lookup. Accepts
+    only trusted builtin instance-dict descriptor type identities
+    (``is``, never ``==`` / ``in`` / ``isinstance``) and exact ``dict``
+    storage. Custom ``__dict__`` properties/descriptors and objects
+    without a builtin instance dict (including slotted objects) are
+    denied. Seam names are never resolved through getattr/class lookup.
     """
     if owner is None:
         return None
@@ -113,7 +129,7 @@ def _concrete_instance_storage(owner: Any) -> dict[str, Any] | None:
         if found is not None:
             descriptor = found
             break
-    if descriptor is None or type(descriptor) not in _INSTANCE_DICT_DESCRIPTOR_TYPES:
+    if descriptor is None or not _is_trusted_instance_dict_descriptor(descriptor):
         return None
     try:
         storage = descriptor.__get__(owner, cls)

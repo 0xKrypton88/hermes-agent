@@ -53,21 +53,54 @@ class DurableJobsPreflight:
         )
 
 
-def _secret_ref_present(ref: Optional[str]) -> bool:
-    """True when the environment contains this reference *name*.
+def _process_environ_dict() -> dict | None:
+    """Return the interpreter process-environment dict, or None.
 
-    Detects key presence only. Never retrieves, resolves, compares,
-    stringifies, logs, or otherwise accesses the credential value.
+    Runtime boundary: CPython stores the process environment in
+    ``posix.environ`` (POSIX; bytes keys/values) or ``nt.environ``
+    (Windows). That dict is not the overridable ``os.environ`` mapping
+    and is read only through builtin ``dict.__contains__`` so values are
+    never retrieved. Tests and callers may replace ``os.environ``.
     """
-    if not ref:
+    for module_name in ("posix", "nt"):
+        try:
+            module = __import__(module_name)
+        except ImportError:
+            continue
+        try:
+            data = object.__getattribute__(module, "environ")
+        except AttributeError:
+            continue
+        if type(data) is dict:
+            return data
+    return None
+
+
+def _secret_ref_present(ref: Optional[str]) -> bool:
+    """True when the process environment contains this reference *name*.
+
+    Accepts only an exact ``str`` name. Detects key presence via the
+    interpreter OS environ dict (see ``_process_environ_dict``). Never
+    retrieves, resolves, stringifies, logs, or otherwise accesses the
+    credential value, and never calls overridable ``os.environ`` mapping
+    APIs (get, contains, keys, items, values, iteration) or user
+    equality/hash hooks.
+    """
+    if type(ref) is not str or not ref:
+        return False
+    data = _process_environ_dict()
+    if data is None:
         return False
     try:
-        for key in os.environ.keys():
-            if key == ref:
-                return True
+        encoded = str.encode(ref, "ascii")
+    except UnicodeEncodeError:
+        return False
+    try:
+        if dict.__contains__(data, ref):
+            return True
+        return dict.__contains__(data, encoded)
     except Exception:
         return False
-    return False
 
 
 def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
