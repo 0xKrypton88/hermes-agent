@@ -11,6 +11,7 @@ No live Slack/Cursor/network. PostgreSQL is not imported.
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 from pathlib import Path
@@ -117,6 +118,36 @@ class _SeamDescriptor:
     def __set__(self, obj, value):
         self.probes.append(f"set:{self.name}")
         raise AssertionError(f"owner seam descriptor {self.name} must not run")
+
+
+_SECRET_VALUE_NAMES = frozenset({"CURSOR_API_KEY", "SLACK_BOT_TOKEN"})
+
+
+def _install_secret_value_traps(monkeypatch, *, extra_names=()):
+    """Raise if attach/preflight retrieves a credential value."""
+    names = _SECRET_VALUE_NAMES | frozenset(extra_names)
+    original_get = os.environ.get
+    original_getenv = os.getenv
+    original_getitem = os._Environ.__getitem__
+
+    def _deny_get(key, default=None):
+        if key in names:
+            raise AssertionError("preflight/attach must not retrieve secret values")
+        return original_get(key, default)
+
+    def _deny_getenv(key, default=None):
+        if key in names:
+            raise AssertionError("preflight/attach must not retrieve secret values")
+        return original_getenv(key, default)
+
+    def _deny_getitem(self, key):
+        if key in names:
+            raise AssertionError("preflight/attach must not retrieve secret values")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(os.environ, "get", _deny_get)
+    monkeypatch.setattr(os, "getenv", _deny_getenv)
+    monkeypatch.setattr(os._Environ, "__getitem__", _deny_getitem)
 
 
 def test_bind_production_transports_module_exists():
@@ -556,5 +587,170 @@ def test_concrete_instance_storage_is_used_without_executing_class_descriptors(
     report = preflight_durable_jobs(raw, **bound)
     assert report.runtime_ready is True
     assert report.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+
+
+def test_preflight_reports_secret_ref_presence_without_reading_values(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    _install_secret_value_traps(monkeypatch)
+    calls: list = []
+    raw = _complete(tmp_path)
+    report = preflight_durable_jobs(
+        raw,
+        cursor_transport=CursorCloudInjectedTransport(
+            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+        ),
+        slack_transport=SlackInjectedTransport(
+            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+        ),
+    )
+    assert report.secret_refs_present is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert "secret_refs_missing" not in report.reasons
+    assert calls == []
+    _assert_no_secrets(report)
+
+
+def test_preflight_reports_secret_ref_absence_without_reading_values(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    _install_secret_value_traps(monkeypatch)
+    report = preflight_durable_jobs(_complete(tmp_path))
+    assert report.secret_refs_present is False
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert "secret_refs_missing" in report.reasons
+    _assert_no_secrets(report)
+
+
+def test_bind_and_preflight_do_not_read_secret_values(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    _install_secret_value_traps(monkeypatch)
+    calls: list = []
+    raw = _complete(tmp_path)
+    bound = bind_production_transports(
+        raw,
+        owner=_owner_with_matching_identity(),
+        cursor_request=_idle_request(calls),
+        slack_request=_idle_request(calls),
+    )
+    report = preflight_durable_jobs(raw, **bound)
+    assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
+    assert type(bound.get("slack_transport")) is SlackInjectedTransport
+    assert report.secret_refs_present is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert calls == []
+    _assert_no_secrets(bound)
+    _assert_no_secrets(report)
+
+
+def test_owner_metaclass_hooks_are_not_executed_during_bind(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    armed = {"on": False}
+
+    class RecordingMeta(type):
+        def __getattribute__(cls, name):
+            if armed["on"] and name in ("__mro__", "__dict__"):
+                probes.append(name)
+                raise AssertionError(f"owner metaclass must not supply {name}")
+            return type.__getattribute__(cls, name)
+
+    class Owner(metaclass=RecordingMeta):
+        pass
+
+    owner = Owner()
+    storage = object.__getattribute__(owner, "__dict__")
+    storage["_durable_job_runtime_identity"] = _matching_identity()
+    storage["_durable_job_cursor_request"] = request
+    storage["_durable_job_slack_request"] = request
+    raw = _complete(tmp_path)
+    armed["on"] = True
+    bound = bind_production_transports(raw, owner=owner)
+    report = preflight_durable_jobs(raw, **bound)
+    assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
+    assert type(bound.get("slack_transport")) is SlackInjectedTransport
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+    _assert_no_secrets(bound)
+    _assert_no_secrets(report)
+
+
+def test_owner_metaclass_does_not_revive_class_attribute_or_property_seams(
+    tmp_path, monkeypatch
+):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    identity = _matching_identity()
+    armed = {"on": False}
+
+    class RecordingMeta(type):
+        def __getattribute__(cls, name):
+            if armed["on"] and name in ("__mro__", "__dict__"):
+                probes.append(name)
+                raise AssertionError(f"owner metaclass must not supply {name}")
+            return type.__getattribute__(cls, name)
+
+    class Owner(metaclass=RecordingMeta):
+        _durable_job_runtime_identity = identity
+        _durable_job_cursor_request = request
+        _durable_job_slack_request = request
+
+        @property
+        def _durable_job_cursor_transport(self):
+            probes.append("cursor_transport")
+            raise AssertionError("cursor transport property must not run")
+
+        @property
+        def _durable_job_slack_transport(self):
+            probes.append("slack_transport")
+            raise AssertionError("slack transport property must not run")
+
+    owner = Owner()
+    assert "_durable_job_runtime_identity" not in vars(owner)
+    raw = _complete(tmp_path)
+    armed["on"] = True
+    bound = bind_production_transports(raw, owner=owner)
+    assert bound == {}
     assert probes == []
     assert calls == []

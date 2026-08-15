@@ -11,6 +11,7 @@ No live Slack/Cursor/network. No Gateway adapter connect.
 
 from __future__ import annotations
 
+import os
 import socket
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +114,36 @@ class _SeamDescriptor:
     def __set__(self, obj, value):
         self.probes.append(f"set:{self.name}")
         raise AssertionError(f"owner seam descriptor {self.name} must not run")
+
+
+_SECRET_VALUE_NAMES = frozenset({"CURSOR_API_KEY", "SLACK_BOT_TOKEN"})
+
+
+def _install_secret_value_traps(monkeypatch, *, extra_names=()):
+    """Raise if startup attach/preflight retrieves a credential value."""
+    names = _SECRET_VALUE_NAMES | frozenset(extra_names)
+    original_get = os.environ.get
+    original_getenv = os.getenv
+    original_getitem = os._Environ.__getitem__
+
+    def _deny_get(key, default=None):
+        if key in names:
+            raise AssertionError("startup attach/preflight must not retrieve secret values")
+        return original_get(key, default)
+
+    def _deny_getenv(key, default=None):
+        if key in names:
+            raise AssertionError("startup attach/preflight must not retrieve secret values")
+        return original_getenv(key, default)
+
+    def _deny_getitem(self, key):
+        if key in names:
+            raise AssertionError("startup attach/preflight must not retrieve secret values")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(os.environ, "get", _deny_get)
+    monkeypatch.setattr(os, "getenv", _deny_getenv)
+    monkeypatch.setattr(os._Environ, "__getitem__", _deny_getitem)
 
 
 def _make_runner(tmp_path: Path, runner_cls=None):
@@ -563,5 +594,109 @@ def test_startup_concrete_instance_storage_ignores_class_descriptors(
     assert type(handle.slack_adapter._transport) is SlackInjectedTransport
     assert handle.preflight.runtime_ready is True
     assert handle.preflight.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_preflight_does_not_read_secret_values(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    raw, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    _install_secret_value_traps(monkeypatch)
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+    assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+    assert handle.preflight.secret_refs_present is True
+    assert handle.preflight.runtime_ready is True
+    assert handle.config.dispatch_allowed is False
+    assert handle.preflight.dispatch_allowed is False
+    assert calls == []
+    dumped = f"{handle!r} {handle.preflight!r} {raw!r}"
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "cursor-test-ref-value" not in dumped
+    assert "slack-test-ref-value" not in dumped
+
+
+def test_startup_owner_metaclass_hooks_are_not_executed(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from gateway.durable_job_lane import get_active_durable_job_lane
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    armed = {"on": False}
+
+    class RecordingMeta(type):
+        def __getattribute__(cls, name):
+            if armed["on"] and name in ("__mro__", "__dict__"):
+                probes.append(name)
+                raise AssertionError(f"owner metaclass must not supply {name}")
+            return type.__getattribute__(cls, name)
+
+    class TrapRunner(GatewayRunner, metaclass=RecordingMeta):
+        pass
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    storage = object.__getattribute__(runner, "__dict__")
+    storage["_durable_job_runtime_identity"] = _matching_identity()
+    storage["_durable_job_cursor_request"] = request
+    storage["_durable_job_slack_request"] = request
+    armed["on"] = True
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+    assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+    assert handle.preflight.runtime_ready is True
+    assert handle.preflight.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_owner_metaclass_does_not_revive_class_attribute_seams(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    armed = {"on": False}
+
+    class RecordingMeta(type):
+        def __getattribute__(cls, name):
+            if armed["on"] and name in ("__mro__", "__dict__"):
+                probes.append(name)
+                raise AssertionError(f"owner metaclass must not supply {name}")
+            return type.__getattribute__(cls, name)
+
+    class TrapRunner(GatewayRunner, metaclass=RecordingMeta):
+        _durable_job_runtime_identity = _matching_identity()
+        _durable_job_cursor_request = request
+        _durable_job_slack_request = request
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    assert "_durable_job_runtime_identity" not in vars(runner)
+    armed["on"] = True
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
     assert probes == []
     assert calls == []
