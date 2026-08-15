@@ -188,10 +188,7 @@ def _owner_attr(owner: Any, name: str) -> Any:
 
 
 def _instance_attr(transport: Any, name: str) -> Any:
-    try:
-        return object.__getattribute__(transport, name)
-    except AttributeError:
-        return None
+    return _owner_attr(transport, name)
 
 
 def _is_request_port(value: Any) -> bool:

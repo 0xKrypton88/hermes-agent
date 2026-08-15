@@ -56,9 +56,54 @@ class DurableJobsPreflight:
 
 
 _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
+_TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
 _GETSET_DESCRIPTOR_TYPE = type(_TYPE_DICT_DESCRIPTOR)
 _MISSING = object()
 _WIN32_ENVVAR_NOT_FOUND = 203
+
+
+def _trusted_instance_dict_descriptor_types() -> tuple[type, ...]:
+    found: list[type] = []
+
+    class _Plain:
+        pass
+
+    plain = _Plain.__dict__.get("__dict__")
+    if plain is not None:
+        found.append(type(plain))
+
+    class _SlottedDict:
+        __slots__ = ("__dict__",)
+
+    slotted = _SlottedDict.__dict__.get("__dict__")
+    if slotted is not None:
+        slotted_type = type(slotted)
+        already = False
+        for existing in found:
+            if slotted_type is existing:
+                already = True
+                break
+        if not already:
+            found.append(slotted_type)
+    return tuple(found)
+
+
+_TRUSTED_INSTANCE_DICT_DESCRIPTOR_TYPES = _trusted_instance_dict_descriptor_types()
+_MODULE_TYPE = type(sys)
+_MODULE_TYPE_NAMESPACE = _TYPE_DICT_DESCRIPTOR.__get__(_MODULE_TYPE, type)
+_MODULE_DICT_DESCRIPTOR = (
+    _MODULE_TYPE_NAMESPACE.get("__dict__")
+    if type(_MODULE_TYPE_NAMESPACE) is MappingProxyType
+    else None
+)
+
+
+def _is_trusted_instance_dict_descriptor(descriptor: Any) -> bool:
+    descr_type = type(descriptor)
+    for trusted in _TRUSTED_INSTANCE_DICT_DESCRIPTOR_TYPES:
+        if descr_type is trusted:
+            return True
+    return False
 
 
 def _is_stdlib_os_environ_type(environ_type: Any) -> bool:
@@ -121,39 +166,144 @@ def _exact_str_dict_value(storage: Any, name: str):
     return value
 
 
-def _capture_os_environ_boundary():
-    """Capture the real CPython ``os._Environ`` instance and backing dict."""
+def _type_namespace(cls: Any):
     try:
-        environ_type = object.__getattribute__(os, "_Environ")
-        environ = object.__getattribute__(os, "environ")
-    except AttributeError:
-        return None, None, None, None
-    if type(environ) is not environ_type:
-        return None, None, None, None
-    if not _is_stdlib_os_environ_type(environ_type):
-        return None, None, None, None
-    try:
-        namespace = _TYPE_DICT_DESCRIPTOR.__get__(environ_type, type)
+        namespace = _TYPE_DICT_DESCRIPTOR.__get__(cls, type)
     except Exception:
-        return None, None, None, None
+        return None
     if type(namespace) is not MappingProxyType:
-        return None, None, None, None
+        return None
+    return namespace
+
+
+def _stdlib_os_module():
+    try:
+        modules = object.__getattribute__(sys, "modules")
+    except AttributeError:
+        return None
+    if type(modules) is not dict:
+        return None
+    module = _exact_str_dict_value(modules, "os")
+    if module is _MISSING:
+        return None
+    return module
+
+
+def _module_storage(module: Any):
+    if module is None:
+        return None
+    module_type = type(module)
+    namespace = _type_namespace(module_type)
+    if namespace is None:
+        return None
     try:
         descriptor = namespace.get("__dict__")
     except Exception:
-        return None, None, None, None
-    if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
-        return None, None, None, None
+        return None
+    if descriptor is None or descriptor is not _MODULE_DICT_DESCRIPTOR:
+        return None
+    try:
+        storage = descriptor.__get__(module, module_type)
+    except Exception:
+        return None
+    if type(storage) is not dict:
+        return None
+    return storage
+
+
+def _concrete_instance_storage(obj: Any):
+    """Return builtin instance dict storage, or None when unsafe.
+
+    Walks the real type MRO and class namespaces through builtin ``type``
+    descriptors. Accepts only trusted instance-dict descriptor type
+    identities (``is``) and exact ``dict`` storage. Does not execute
+    custom ``__dict__`` descriptors, properties, or metaclass ``__eq__``.
+    """
+    if obj is None:
+        return None
+    cls = type(obj)
+    try:
+        mro = _TYPE_MRO_DESCRIPTOR.__get__(cls, type)
+    except Exception:
+        return None
+    if type(mro) is not tuple:
+        return None
+    descriptor = None
+    for base in mro:
+        namespace = _type_namespace(base)
+        if namespace is None:
+            return None
+        try:
+            found = namespace.get("__dict__")
+        except Exception:
+            return None
+        if found is not None:
+            descriptor = found
+            break
+    if descriptor is None or not _is_trusted_instance_dict_descriptor(descriptor):
+        return None
+    try:
+        storage = descriptor.__get__(obj, cls)
+    except Exception:
+        return None
+    if type(storage) is not dict:
+        return None
+    return storage
+
+
+def _environ_data_from_instance(environ: Any, environ_type: Any, descriptor: Any):
+    if type(environ) is not environ_type:
+        return _MISSING
+    if type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return _MISSING
     try:
         storage = descriptor.__get__(environ, environ_type)
     except Exception:
-        return None, None, None, None
+        return _MISSING
     if type(storage) is not dict:
-        return None, None, None, None
+        return _MISSING
     data = _exact_str_dict_value(storage, "_data")
     if data is _MISSING or type(data) is not dict:
-        return None, None, None, None
-    return environ, environ_type, descriptor, data
+        return _MISSING
+    return data
+
+
+def _capture_os_environ_boundary():
+    """Pin the startup ``os.environ`` singleton and its exact ``_data`` dict."""
+    module = _stdlib_os_module()
+    storage = _module_storage(module)
+    if storage is None:
+        return None, None, None, None, None
+    environ_type = _exact_str_dict_value(storage, "_Environ")
+    environ = _exact_str_dict_value(storage, "environ")
+    if environ_type is _MISSING or environ is _MISSING:
+        return None, None, None, None, None
+    if type(environ) is not environ_type:
+        return None, None, None, None, None
+    if not _is_stdlib_os_environ_type(environ_type):
+        return None, None, None, None, None
+    namespace = _type_namespace(environ_type)
+    if namespace is None:
+        return None, None, None, None, None
+    try:
+        descriptor = namespace.get("__dict__")
+    except Exception:
+        return None, None, None, None, None
+    if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None, None, None, None, None
+    data = _environ_data_from_instance(environ, environ_type, descriptor)
+    if data is _MISSING:
+        return None, None, None, None, None
+    environb = _exact_str_dict_value(storage, "environb")
+    if environb is _MISSING:
+        environb = None
+    elif type(environb) is not environ_type:
+        return None, None, None, None, None
+    else:
+        sibling = _environ_data_from_instance(environb, environ_type, descriptor)
+        if sibling is _MISSING or sibling is not data:
+            return None, None, None, None, None
+    return environ, environ_type, descriptor, data, environb
 
 
 (
@@ -161,6 +311,7 @@ def _capture_os_environ_boundary():
     _CAPTURED_OS_ENVIRON_TYPE,
     _CAPTURED_OS_ENVIRON_DICT,
     _CAPTURED_OS_ENVIRON_DATA,
+    _CAPTURED_OS_ENVIRONB,
 ) = _capture_os_environ_boundary()
 
 
@@ -184,15 +335,7 @@ def _bind_native_env_name_probe():
                 ctypes.c_uint32,
             ]
             get_var.restype = ctypes.c_uint32
-            wgetenv = None
-            try:
-                msvcrt = ctypes.CDLL("msvcrt")
-                wgetenv = msvcrt._wgetenv
-                wgetenv.argtypes = [ctypes.c_wchar_p]
-                wgetenv.restype = ctypes.c_void_p
-            except Exception:
-                wgetenv = None
-            return ("win32", get_var, wgetenv, ctypes)
+            return ("win32", get_var, None, ctypes)
         except Exception:
             return None
     try:
@@ -212,9 +355,12 @@ def _native_env_name_present(name: str) -> bool | None:
     """True/False for child-inherited name presence; None fail-closed.
 
     POSIX uses libc ``getenv`` with a void pointer so the value is never
-    dereferenced. Windows uses ``GetEnvironmentVariableW`` size-only
-    (and CRT ``_wgetenv`` as a pointer check). Values are never copied,
-    logged, or compared. ``posix.environ`` / ``nt.environ`` are unused.
+    dereferenced. Windows uses ``GetEnvironmentVariableW`` size-only as
+    the sole authority. ``ERROR_ENVVAR_NOT_FOUND`` is absent and is
+    never overridden by a stale CRT ``_wgetenv`` cache. Empty names are
+    present (nonzero size) without copying the value. Values are never
+    copied, logged, or compared. ``posix.environ`` / ``nt.environ`` are
+    unused.
     """
     if type(name) is not str or str.__len__(name) == 0:
         return None
@@ -226,26 +372,18 @@ def _native_env_name_present(name: str) -> bool | None:
         return None
     if str.__eq__(kind, "win32"):
         get_var = tuple.__getitem__(probe, 1)
-        wgetenv = tuple.__getitem__(probe, 2)
         ctypes_mod = tuple.__getitem__(probe, 3)
         try:
             size = get_var(name, None, 0)
         except Exception:
-            size = 0
+            return None
         if size != 0:
             return True
         try:
             err = ctypes_mod.get_last_error()
         except Exception:
-            err = None
-        if wgetenv is not None:
-            try:
-                ptr = wgetenv(name)
-            except Exception:
-                ptr = None
-            if ptr is not None:
-                return True
-        if err == _WIN32_ENVVAR_NOT_FOUND or err == 0:
+            return False
+        if err == _WIN32_ENVVAR_NOT_FOUND:
             return False
         return False
     getenv = tuple.__getitem__(probe, 1)
@@ -261,11 +399,13 @@ def _native_env_name_present(name: str) -> bool | None:
 
 
 def _process_environ_dict() -> dict | None:
-    """Return the captured CPython ``os._Environ._data`` dict, or None.
+    """Return the pinned startup ``os.environ._data`` dict, or None.
 
-    The backing dict object captured at import must still be present
-    under the authentic ``os._Environ`` instance. A replaced exact
-    ``dict`` fails closed. This helper is a tamper check only — name
+    Proves the current ``os.environ`` binding is still the captured
+    startup singleton and that its ``_data`` object is still the
+    captured dict. A genuine replacement ``os._Environ`` (before or
+    after import), a replaced ``_data`` dict, or an ``environb``
+    sibling that no longer shares ``_data`` fails closed. Name
     presence uses the native child-inherited environment, never this
     cache and never ``posix.environ`` / ``nt.environ``.
     """
@@ -273,6 +413,7 @@ def _process_environ_dict() -> dict | None:
     environ_type = _CAPTURED_OS_ENVIRON_TYPE
     descriptor = _CAPTURED_OS_ENVIRON_DICT
     captured = _CAPTURED_OS_ENVIRON_DATA
+    environb = _CAPTURED_OS_ENVIRONB
     if (
         environ is None
         or environ_type is None
@@ -282,22 +423,30 @@ def _process_environ_dict() -> dict | None:
         return None
     if type(environ) is not environ_type:
         return None
-    if type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
-        return None
     if type(captured) is not dict:
         return None
-    try:
-        storage = descriptor.__get__(environ, environ_type)
-    except Exception:
+    module_storage = _module_storage(_stdlib_os_module())
+    if module_storage is None:
         return None
-    if type(storage) is not dict:
+    current = _exact_str_dict_value(module_storage, "environ")
+    if current is _MISSING or current is not environ:
         return None
-    data = _exact_str_dict_value(storage, "_data")
-    if data is _MISSING or type(data) is not dict:
+    data = _environ_data_from_instance(environ, environ_type, descriptor)
+    if data is _MISSING or data is not captured:
         return None
-    if data is not captured:
+    current_data = _environ_data_from_instance(current, environ_type, descriptor)
+    if current_data is _MISSING or current_data is not captured:
         return None
-    return data
+    if environb is not None:
+        if type(environb) is not environ_type:
+            return None
+        current_b = _exact_str_dict_value(module_storage, "environb")
+        if current_b is _MISSING or current_b is not environb:
+            return None
+        sibling = _environ_data_from_instance(environb, environ_type, descriptor)
+        if sibling is _MISSING or sibling is not captured:
+            return None
+    return captured
 
 
 def _secret_ref_present(ref: Optional[str]) -> bool:
@@ -342,10 +491,21 @@ def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
 
 
 def _instance_attr(transport: Any, name: str) -> Any:
-    try:
-        return object.__getattribute__(transport, name)
-    except AttributeError:
+    """Read a seam from verified builtin instance-dict storage only.
+
+    Data descriptors, properties, metaclass hooks, and colliding
+    untrusted keys are never executed. Missing or unsafe storage
+    fails closed.
+    """
+    if type(name) is not str:
         return None
+    storage = _concrete_instance_storage(transport)
+    if storage is None:
+        return None
+    value = _exact_str_dict_value(storage, name)
+    if value is _MISSING:
+        return None
+    return value
 
 
 def _concrete_injected_transport(transport: Any, expected_cls: type) -> bool:
