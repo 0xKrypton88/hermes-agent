@@ -2605,6 +2605,11 @@ def _pre_rebound_environ_script(
     platform first so a later ``sys.platform`` spoof does not crash host
     imports (Windows asyncio / ConcurrentRotatingFileHandler). Capture
     entrypoints still load after the replacement.
+
+    The replacement mapping is attacker-controlled and does not copy live
+    environ values. Only synthetic non-secret Windows home/bootstrap names
+    (``HOME`` / ``USERPROFILE`` / ``LOCALAPPDATA``) are seeded from the
+    tempfile home so ``Path.home()`` can resolve during entrypoint import.
     """
     win32_setup = ""
     if win32:
@@ -2636,6 +2641,9 @@ replacement = os._Environ(
 os.environ = replacement
 del old
 replacement["HERMES_HOME"] = home
+replacement["HOME"] = home
+replacement["USERPROFILE"] = home
+replacement["LOCALAPPDATA"] = home
 {after_replace}
 {win32_setup}
 os.putenv("CURSOR_API_KEY", "1")
