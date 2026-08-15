@@ -8,8 +8,12 @@ never reads credential values.
 
 If the repository has no truthful provider request/client for Cursor or
 Slack, the owner-owned request-port attributes are the injectable
-dependency seam. Missing, wrong-typed, secret-ref-mismatched, or
-identity-mismatched sources fail closed (empty attach kwargs).
+dependency seam. Missing, invalid, or mismatched
+``_durable_job_runtime_identity`` fails closed. Owner seam names are
+read only from concrete instance ``__dict__`` storage — never from
+properties, descriptors, or class attributes. Missing, wrong-typed,
+secret-ref-mismatched, or identity-mismatched sources fail closed
+(empty attach kwargs).
 """
 
 from __future__ import annotations
@@ -35,6 +39,28 @@ OWNER_SLACK_TRANSPORT_ATTR = "_durable_job_slack_transport"
 OWNER_RUNTIME_IDENTITY_ATTR = "_durable_job_runtime_identity"
 
 
+def _builtin_instance_dict_descriptor_types() -> frozenset[type]:
+    found: set[type] = set()
+
+    class _Plain:
+        pass
+
+    plain = _Plain.__dict__.get("__dict__")
+    if plain is not None:
+        found.add(type(plain))
+
+    class _SlottedDict:
+        __slots__ = ("__dict__",)
+
+    slotted = _SlottedDict.__dict__.get("__dict__")
+    if slotted is not None:
+        found.add(type(slotted))
+    return frozenset(found)
+
+
+_INSTANCE_DICT_DESCRIPTOR_TYPES = _builtin_instance_dict_descriptor_types()
+
+
 def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if raw_config is not None:
         return raw_config
@@ -49,10 +75,38 @@ def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return {}
 
 
-def _owner_attr(owner: Any, name: str) -> Any:
+def _concrete_instance_storage(owner: Any) -> dict[str, Any] | None:
+    """Return the owner's instance dict, or None when storage is unsafe.
+
+    Looks up the ``__dict__`` descriptor on the type MRO only. Custom
+    ``__dict__`` properties/descriptors and objects without a builtin
+    instance dict (including slotted objects) are denied. Seam names are
+    never resolved through getattr/class lookup.
+    """
     if owner is None:
         return None
-    return getattr(owner, name, None)
+    descriptor = None
+    for base in type(owner).__mro__:
+        found = base.__dict__.get("__dict__")
+        if found is not None:
+            descriptor = found
+            break
+    if descriptor is None or type(descriptor) not in _INSTANCE_DICT_DESCRIPTOR_TYPES:
+        return None
+    try:
+        storage = descriptor.__get__(owner, type(owner))
+    except Exception:
+        return None
+    if type(storage) is not dict:
+        return None
+    return storage
+
+
+def _owner_attr(owner: Any, name: str) -> Any:
+    storage = _concrete_instance_storage(owner)
+    if storage is None:
+        return None
+    return storage.get(name)
 
 
 def _instance_attr(transport: Any, name: str) -> Any:
@@ -78,28 +132,26 @@ def _approved_transport(transport: Any, expected_cls: type, expected_ref: Option
     return callable(request) and secret_ref == expected_ref
 
 
-def _runtime_identity(owner: Any) -> Optional[tuple[str, str]] | bool:
+def _runtime_identity(owner: Any) -> Optional[tuple[str, str]]:
     raw = _owner_attr(owner, OWNER_RUNTIME_IDENTITY_ATTR)
-    if raw is None:
+    if type(raw) is not dict:
         return None
-    if not isinstance(raw, MappingABC):
-        return False
     workspace = raw.get("workspace_id")
     repository = raw.get("repository_identity")
-    if not isinstance(workspace, str) or not workspace.strip():
-        return False
-    if not isinstance(repository, str) or not repository.strip():
-        return False
-    if set(raw) - {"workspace_id", "repository_identity"}:
-        return False
-    return (workspace.strip(), repository.strip())
+    if type(workspace) is not str or type(repository) is not str:
+        return None
+    if workspace != workspace.strip() or repository != repository.strip():
+        return None
+    if not workspace or not repository:
+        return None
+    if set(raw) != {"workspace_id", "repository_identity"}:
+        return None
+    return (workspace, repository)
 
 
 def _identity_matches(cfg: DurableJobsConfig, owner: Any) -> bool:
     runtime = _runtime_identity(owner)
     if runtime is None:
-        return True
-    if runtime is False:
         return False
     binding = cfg.identity_binding
     if binding is None:

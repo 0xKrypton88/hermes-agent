@@ -94,6 +94,12 @@ def _matching_identity(**overrides) -> dict:
     return identity
 
 
+def _owner_with_matching_identity():
+    owner = type("Owner", (), {})()
+    owner.__dict__["_durable_job_runtime_identity"] = _matching_identity()
+    return owner
+
+
 class _SeamDescriptor:
     """Data descriptor that records any get/set of an owner seam name."""
 
@@ -133,10 +139,12 @@ def test_single_request_port_does_not_bind(tmp_path, monkeypatch):
     calls: list = []
     cursor_only = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_request=_idle_request(calls),
     )
     slack_only = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         slack_request=_idle_request(calls),
     )
     assert cursor_only == {}
@@ -169,6 +177,7 @@ def test_wrong_concrete_transport_type_does_not_bind(tmp_path, monkeypatch):
 
     bound_duck = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_transport=DuckCursor(),
         slack_transport=SlackInjectedTransport(
             request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
@@ -178,6 +187,7 @@ def test_wrong_concrete_transport_type_does_not_bind(tmp_path, monkeypatch):
     )
     bound_subclass = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_transport=UnboundCursorSubclass(),
         slack_transport=SlackInjectedTransport(
             request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
@@ -204,6 +214,7 @@ def test_secret_ref_mismatch_does_not_bind(tmp_path, monkeypatch):
     calls: list = []
     bound = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_transport=CursorCloudInjectedTransport(
             request=_idle_request(calls), secret_ref="ACTUAL_CURSOR_REF_MISSING"
         ),
@@ -243,6 +254,7 @@ def test_default_off_does_not_bind_even_with_request_ports(tmp_path, monkeypatch
     calls: list = []
     bound = bind_production_transports(
         _complete(tmp_path, enabled=False),
+        owner=_owner_with_matching_identity(),
         cursor_request=_idle_request(calls),
         slack_request=_idle_request(calls),
     )
@@ -266,6 +278,7 @@ def test_correct_bound_request_ports_return_approved_transports(
     raw = _complete(tmp_path)
     bound = bind_production_transports(
         raw,
+        owner=_owner_with_matching_identity(),
         cursor_request=_idle_request(calls),
         slack_request=_idle_request(calls),
     )
@@ -296,6 +309,7 @@ def test_bind_and_preflight_open_no_sockets_or_provider_calls(
     calls: list = []
     bound = bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_request=_idle_request(calls),
         slack_request=_idle_request(calls),
     )
@@ -311,6 +325,7 @@ def test_binding_does_not_import_provider_sdks(tmp_path, monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     bind_production_transports(
         _complete(tmp_path),
+        owner=_owner_with_matching_identity(),
         cursor_request=_idle_request([]),
         slack_request=_idle_request([]),
     )

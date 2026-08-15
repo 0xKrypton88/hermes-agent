@@ -78,16 +78,13 @@ def _idle_request(calls: list):
     return request
 
 
-def _install_request_ports(owner, cursor_request, slack_request, **identity):
+def _install_request_ports(
+    owner, cursor_request, slack_request, *, install_identity=True, **identity
+):
     owner._durable_job_cursor_request = cursor_request
     owner._durable_job_slack_request = slack_request
-    if identity:
-        owner._durable_job_runtime_identity = {
-            "workspace_id": identity.get("workspace_id", CONFIG_WORKSPACE),
-            "repository_identity": identity.get(
-                "repository_identity", CONFIG_REPO
-            ),
-        }
+    if install_identity:
+        owner._durable_job_runtime_identity = _matching_identity(**identity)
 
 
 def _matching_identity(**overrides) -> dict:
@@ -190,6 +187,7 @@ def test_startup_binds_approved_transports_when_request_ports_are_installed(
 def test_startup_missing_one_request_port_does_not_attach(tmp_path, monkeypatch):
     _, runner = _prepare_startup(tmp_path, monkeypatch)
     calls: list = []
+    runner._durable_job_runtime_identity = _matching_identity()
     runner._durable_job_cursor_request = _idle_request(calls)
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
@@ -226,6 +224,7 @@ def test_startup_secret_ref_mismatch_does_not_attach(tmp_path, monkeypatch):
     monkeypatch.setenv("ACTUAL_CURSOR_REF_MISSING", "cursor-unbound-dummy-value")
     monkeypatch.setenv("ACTUAL_SLACK_REF_MISSING", "xoxb-unbound-dummy-token")
     calls: list = []
+    runner._durable_job_runtime_identity = _matching_identity()
     runner._durable_job_cursor_transport = CursorCloudInjectedTransport(
         request=_idle_request(calls), secret_ref="ACTUAL_CURSOR_REF_MISSING"
     )
