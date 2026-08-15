@@ -85,6 +85,34 @@ def _assert_no_secrets(payload: object) -> None:
     assert SECRET_DSN not in dumped
 
 
+def _matching_identity(**overrides) -> dict:
+    identity = {
+        "workspace_id": CONFIG_WORKSPACE,
+        "repository_identity": CONFIG_REPO,
+    }
+    identity.update(overrides)
+    return identity
+
+
+class _SeamDescriptor:
+    """Data descriptor that records any get/set of an owner seam name."""
+
+    def __init__(self, probes: list, name: str, value):
+        self.probes = probes
+        self.name = name
+        self.value = value
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        self.probes.append(self.name)
+        return self.value
+
+    def __set__(self, obj, value):
+        self.probes.append(f"set:{self.name}")
+        raise AssertionError(f"owner seam descriptor {self.name} must not run")
+
+
 def test_bind_production_transports_module_exists():
     _require_binding()
 
@@ -301,3 +329,217 @@ def test_flags_do_not_invent_a_request_callable(tmp_path, monkeypatch):
     assert bound == {}
     assert "cursor_transport" not in bound
     assert "slack_transport" not in bound
+
+
+def test_missing_runtime_identity_does_not_bind_directly(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    owner = type("Owner", (), {})()
+    owner._durable_job_cursor_request = _idle_request(calls)
+    owner._durable_job_slack_request = _idle_request(calls)
+    assert "_durable_job_runtime_identity" not in vars(owner)
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert calls == []
+
+
+def test_missing_runtime_identity_without_owner_does_not_bind(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    bound = bind_production_transports(
+        _complete(tmp_path),
+        cursor_request=_idle_request(calls),
+        slack_request=_idle_request(calls),
+    )
+    assert bound == {}
+    assert calls == []
+
+
+def test_padded_runtime_identity_does_not_bind(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    owner = type("Owner", (), {})()
+    owner._durable_job_runtime_identity = _matching_identity(workspace_id=" T1 ")
+    owner._durable_job_cursor_request = _idle_request(calls)
+    owner._durable_job_slack_request = _idle_request(calls)
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert calls == []
+
+
+def test_owner_seam_properties_are_not_executed_during_bind_or_preflight(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    identity = _matching_identity()
+
+    class Owner:
+        @property
+        def _durable_job_runtime_identity(self):
+            probes.append("identity")
+            return identity
+
+        @property
+        def _durable_job_cursor_request(self):
+            probes.append("cursor")
+            return request
+
+        @property
+        def _durable_job_slack_request(self):
+            probes.append("slack")
+            return request
+
+        @property
+        def _durable_job_cursor_transport(self):
+            probes.append("cursor_transport")
+            raise AssertionError("cursor transport property must not run")
+
+        @property
+        def _durable_job_slack_transport(self):
+            probes.append("slack_transport")
+            raise AssertionError("slack transport property must not run")
+
+    owner = Owner()
+    raw = _complete(tmp_path)
+    bound = bind_production_transports(raw, owner=owner)
+    assert bound == {}
+    report = preflight_durable_jobs(raw, **bound)
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
+
+
+def test_owner_seam_class_attributes_are_not_read_during_bind(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    request = _idle_request(calls)
+
+    class Owner:
+        _durable_job_runtime_identity = _matching_identity()
+        _durable_job_cursor_request = request
+        _durable_job_slack_request = request
+
+    owner = Owner()
+    assert "_durable_job_runtime_identity" not in vars(owner)
+    assert "_durable_job_cursor_request" not in vars(owner)
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert calls == []
+
+
+def test_owner_seam_data_descriptors_are_not_executed_during_bind(
+    tmp_path, monkeypatch
+):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+
+    class Owner:
+        _durable_job_runtime_identity = _SeamDescriptor(
+            probes, "identity", _matching_identity()
+        )
+        _durable_job_cursor_request = _SeamDescriptor(probes, "cursor", request)
+        _durable_job_slack_request = _SeamDescriptor(probes, "slack", request)
+        _durable_job_cursor_transport = _SeamDescriptor(
+            probes, "cursor_transport", None
+        )
+        _durable_job_slack_transport = _SeamDescriptor(
+            probes, "slack_transport", None
+        )
+
+    owner = Owner()
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert probes == []
+    assert calls == []
+
+
+def test_owner_without_concrete_instance_storage_is_denied(tmp_path, monkeypatch):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    request = _idle_request(calls)
+
+    class Slotted:
+        __slots__ = (
+            "_durable_job_runtime_identity",
+            "_durable_job_cursor_request",
+            "_durable_job_slack_request",
+        )
+
+        def __init__(self):
+            self._durable_job_runtime_identity = _matching_identity()
+            self._durable_job_cursor_request = request
+            self._durable_job_slack_request = request
+
+    owner = Slotted()
+    with pytest.raises(TypeError):
+        vars(owner)
+    bound = bind_production_transports(_complete(tmp_path), owner=owner)
+    assert bound == {}
+    assert calls == []
+
+
+def test_concrete_instance_storage_is_used_without_executing_class_descriptors(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+
+    class Owner:
+        _durable_job_runtime_identity = _SeamDescriptor(
+            probes, "identity", _matching_identity(workspace_id="T-TRAP")
+        )
+        _durable_job_cursor_request = _SeamDescriptor(probes, "cursor", request)
+        _durable_job_slack_request = _SeamDescriptor(probes, "slack", request)
+        _durable_job_cursor_transport = _SeamDescriptor(
+            probes, "cursor_transport", None
+        )
+        _durable_job_slack_transport = _SeamDescriptor(
+            probes, "slack_transport", None
+        )
+
+    owner = Owner()
+    storage = object.__getattribute__(owner, "__dict__")
+    storage["_durable_job_runtime_identity"] = _matching_identity()
+    storage["_durable_job_cursor_request"] = request
+    storage["_durable_job_slack_request"] = request
+    raw = _complete(tmp_path)
+    bound = bind_production_transports(raw, owner=owner)
+    assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
+    assert type(bound.get("slack_transport")) is SlackInjectedTransport
+    report = preflight_durable_jobs(raw, **bound)
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert probes == []
+    assert calls == []

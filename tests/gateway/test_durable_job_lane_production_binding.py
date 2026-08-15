@@ -90,11 +90,40 @@ def _install_request_ports(owner, cursor_request, slack_request, **identity):
         }
 
 
-def _make_runner(tmp_path: Path):
+def _matching_identity(**overrides) -> dict:
+    identity = {
+        "workspace_id": CONFIG_WORKSPACE,
+        "repository_identity": CONFIG_REPO,
+    }
+    identity.update(overrides)
+    return identity
+
+
+class _SeamDescriptor:
+    """Data descriptor that records any get/set of an owner seam name."""
+
+    def __init__(self, probes: list, name: str, value):
+        self.probes = probes
+        self.name = name
+        self.value = value
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        self.probes.append(self.name)
+        return self.value
+
+    def __set__(self, obj, value):
+        self.probes.append(f"set:{self.name}")
+        raise AssertionError(f"owner seam descriptor {self.name} must not run")
+
+
+def _make_runner(tmp_path: Path, runner_cls=None):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
 
-    return GatewayRunner(
+    cls = runner_cls or GatewayRunner
+    return cls(
         GatewayConfig(
             platforms={},
             sessions_dir=tmp_path / "sessions",
@@ -391,3 +420,149 @@ def test_startup_does_not_construct_network_clients_from_flags(
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
     assert constructed == []
+
+
+def test_startup_missing_runtime_identity_does_not_attach(tmp_path, monkeypatch):
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    runner._durable_job_cursor_request = _idle_request(calls)
+    runner._durable_job_slack_request = _idle_request(calls)
+    assert "_durable_job_runtime_identity" not in vars(runner)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_owner_seam_properties_are_not_executed(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+    identity = _matching_identity()
+
+    class TrapRunner(GatewayRunner):
+        @property
+        def _durable_job_runtime_identity(self):
+            probes.append("identity")
+            return identity
+
+        @property
+        def _durable_job_cursor_request(self):
+            probes.append("cursor")
+            return request
+
+        @property
+        def _durable_job_slack_request(self):
+            probes.append("slack")
+            return request
+
+        @property
+        def _durable_job_cursor_transport(self):
+            probes.append("cursor_transport")
+            raise AssertionError("cursor transport property must not run")
+
+        @property
+        def _durable_job_slack_transport(self):
+            probes.append("slack_transport")
+            raise AssertionError("slack transport property must not run")
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_owner_seam_class_attributes_are_not_read(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    calls: list = []
+    request = _idle_request(calls)
+
+    class AttrRunner(GatewayRunner):
+        _durable_job_runtime_identity = _matching_identity()
+        _durable_job_cursor_request = request
+        _durable_job_slack_request = request
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=AttrRunner)
+    assert "_durable_job_runtime_identity" not in vars(runner)
+    assert "_durable_job_cursor_request" not in vars(runner)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_owner_seam_data_descriptors_are_not_executed(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+
+    class TrapRunner(GatewayRunner):
+        _durable_job_runtime_identity = _SeamDescriptor(
+            probes, "identity", _matching_identity()
+        )
+        _durable_job_cursor_request = _SeamDescriptor(probes, "cursor", request)
+        _durable_job_slack_request = _SeamDescriptor(probes, "slack", request)
+        _durable_job_cursor_transport = _SeamDescriptor(
+            probes, "cursor_transport", None
+        )
+        _durable_job_slack_transport = _SeamDescriptor(
+            probes, "slack_transport", None
+        )
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_concrete_instance_storage_ignores_class_descriptors(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from gateway.durable_job_lane import get_active_durable_job_lane
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+    request = _idle_request(calls)
+
+    class TrapRunner(GatewayRunner):
+        _durable_job_runtime_identity = _SeamDescriptor(
+            probes, "identity", _matching_identity(workspace_id="T-TRAP")
+        )
+        _durable_job_cursor_request = _SeamDescriptor(probes, "cursor", request)
+        _durable_job_slack_request = _SeamDescriptor(probes, "slack", request)
+        _durable_job_cursor_transport = _SeamDescriptor(
+            probes, "cursor_transport", None
+        )
+        _durable_job_slack_transport = _SeamDescriptor(
+            probes, "slack_transport", None
+        )
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    storage = object.__getattribute__(runner, "__dict__")
+    storage["_durable_job_runtime_identity"] = _matching_identity()
+    storage["_durable_job_cursor_request"] = request
+    storage["_durable_job_slack_request"] = request
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+    assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+    assert handle.preflight.runtime_ready is True
+    assert handle.preflight.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
