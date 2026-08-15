@@ -459,12 +459,12 @@ def _process_environ_dict() -> dict | None:
 
     Proves the current ``os.environ`` binding is still the captured
     singleton and that its ``_data`` object is still the captured
-    dict. POSIX also requires that dict ``is`` the live
-    ``posix.environ`` mapping — a pre-import ``environ``+``environb``
-    pair sharing a fresh dict is not that mapping. Windows requires
-    ``environb`` stay absent; ``GetEnvironmentVariableW`` remains the
-    sole presence authority. Name presence never reads this cache and
-    never consults ``posix.environ`` / ``nt.environ`` as an oracle.
+    dict. Capture already required POSIX ``_data is posix.environ``;
+    this function does not re-read ``posix.environ`` / ``nt.environ``
+    (those attributes may be rebound and are never a presence oracle).
+    Windows requires ``environb`` stay absent; presence stays on
+    ``GetEnvironmentVariableW``. A later sibling that no longer shares
+    the captured ``_data`` fails closed.
     """
     environ = _CAPTURED_OS_ENVIRON
     environ_type = _CAPTURED_OS_ENVIRON_TYPE
@@ -504,18 +504,13 @@ def _process_environ_dict() -> dict | None:
         if current_b is not _MISSING:
             return None
         return captured
-    posix_environ = _posix_process_environ_mapping()
-    if posix_environ is None or captured is not posix_environ:
-        return None
-    if data is not posix_environ or current_data is not posix_environ:
-        return None
     if environb is None or type(environb) is not environ_type:
         return None
     current_b = _exact_str_dict_value(module_storage, "environb")
     if current_b is _MISSING or current_b is not environb:
         return None
     sibling = _environ_data_from_instance(environb, environ_type, descriptor)
-    if sibling is _MISSING or sibling is not posix_environ:
+    if sibling is _MISSING or sibling is not captured:
         return None
     return captured
 
