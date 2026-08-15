@@ -709,6 +709,7 @@ def test_package2_modules_do_not_import_psycopg_or_live_sdks():
 
     import agent.durable_jobs.injected_transports  # noqa: F401
     import agent.durable_jobs.preflight  # noqa: F401
+    import agent.durable_jobs.request_ports  # noqa: F401
 
     assert "psycopg" not in sys.modules
     assert "slack_sdk" not in sys.modules

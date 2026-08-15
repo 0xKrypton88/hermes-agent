@@ -94,9 +94,15 @@ Hermes `state.db`.
   lifecycle-owned Gateway startup seam: `_maybe_attach_durable_job_lane`
   injects only those approved concrete types when a truthful request
   port is already installed on the runner. Config flags and secret-ref
-  *names* cannot mint a client. This repository has no Cursor Cloud or
-  Slack `InjectedRequestPort` implementation; missing ports fail closed
-  rather than inventing HTTP/SDK behavior
+  *names* cannot mint a client. ENG-58 adds explicit
+  `CursorCloudInjectedRequestPort` / `SlackInjectedRequestPort`
+  adapters that wrap an already-injected client seam
+  (`create_agent`/`get_agent`/`get_run`, `chat_postMessage`/
+  `conversations_replies`). They are not auto-activated: attach still
+  requires the ports (or already-injected clients plus bound Slack
+  channel/thread identity) to be installed on the owner. Missing or
+  mismatched ports fail closed rather than inventing HTTP/SDK behavior.
+  Isolated shadow/E2E uses deterministic fakes only.
 - Preflight validates config/backend/schema/path/adapter modes/bindings/
   secret-ref names/runtime readiness with no sockets and no `psycopg`
   import on the SQLite path

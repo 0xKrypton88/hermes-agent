@@ -33,6 +33,11 @@ OWNER_SLACK_REQUEST_ATTR = "_durable_job_slack_request"
 OWNER_CURSOR_TRANSPORT_ATTR = "_durable_job_cursor_transport"
 OWNER_SLACK_TRANSPORT_ATTR = "_durable_job_slack_transport"
 OWNER_RUNTIME_IDENTITY_ATTR = "_durable_job_runtime_identity"
+OWNER_CURSOR_CLIENT_ATTR = "_durable_job_cursor_client"
+OWNER_SLACK_CLIENT_ATTR = "_durable_job_slack_client"
+OWNER_SLACK_CHANNEL_ATTR = "_durable_job_slack_channel_id"
+OWNER_SLACK_THREAD_ATTR = "_durable_job_slack_root_thread_ts"
+OWNER_CREDENTIAL_RESOLVER_ATTR = "_durable_job_credential_resolver"
 
 
 def _load_raw_config(raw_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -95,6 +100,66 @@ def _runtime_identity(owner: Any) -> Optional[tuple[str, str]] | bool:
     return (workspace.strip(), repository.strip())
 
 
+def _wrap_injected_clients(
+    cfg: DurableJobsConfig,
+    owner: Any,
+    *,
+    cursor_client: Any = None,
+    slack_client: Any = None,
+    slack_channel_id: Any = None,
+    slack_root_thread_ts: Any = None,
+    credential_resolver: Any = None,
+) -> Optional[tuple[Any, Any]]:
+    """Wrap already-injected clients. Never constructs HTTP/SDK clients."""
+    if cursor_client is None:
+        cursor_client = _owner_attr(owner, OWNER_CURSOR_CLIENT_ATTR)
+    if slack_client is None:
+        slack_client = _owner_attr(owner, OWNER_SLACK_CLIENT_ATTR)
+    if slack_channel_id is None:
+        slack_channel_id = _owner_attr(owner, OWNER_SLACK_CHANNEL_ATTR)
+    if slack_root_thread_ts is None:
+        slack_root_thread_ts = _owner_attr(owner, OWNER_SLACK_THREAD_ATTR)
+    if credential_resolver is None:
+        credential_resolver = _owner_attr(owner, OWNER_CREDENTIAL_RESOLVER_ATTR)
+    if cursor_client is None or slack_client is None:
+        return None
+    binding = cfg.identity_binding
+    if binding is None:
+        return None
+    if not isinstance(slack_channel_id, str) or not slack_channel_id.strip():
+        return None
+    if not isinstance(slack_root_thread_ts, str) or not slack_root_thread_ts.strip():
+        return None
+    if not cfg.cursor_secret_ref or not cfg.slack_secret_ref:
+        return None
+    from agent.durable_jobs.request_ports import (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    )
+
+    try:
+        return (
+            CursorCloudInjectedRequestPort(
+                client=cursor_client,
+                secret_ref=cfg.cursor_secret_ref,
+                workspace_id=binding.workspace_id,
+                repository_identity=binding.repository_identity,
+                credential_resolver=credential_resolver,
+            ),
+            SlackInjectedRequestPort(
+                client=slack_client,
+                secret_ref=cfg.slack_secret_ref,
+                workspace_id=binding.workspace_id,
+                channel_id=slack_channel_id,
+                repository_identity=binding.repository_identity,
+                root_thread_ts=slack_root_thread_ts,
+                credential_resolver=credential_resolver,
+            ),
+        )
+    except (TypeError, ValueError, DurableJobsConfigError):
+        return None
+
+
 def _identity_matches(cfg: DurableJobsConfig, owner: Any) -> bool:
     runtime = _runtime_identity(owner)
     if runtime is None:
@@ -115,6 +180,11 @@ def bind_production_transports(
     slack_request: Any = None,
     cursor_transport: Any = None,
     slack_transport: Any = None,
+    cursor_client: Any = None,
+    slack_client: Any = None,
+    slack_channel_id: Any = None,
+    slack_root_thread_ts: Any = None,
+    credential_resolver: Any = None,
 ) -> dict[str, Any]:
     """Return attach kwargs, or ``{}`` when production binding is unbound.
 
@@ -174,7 +244,18 @@ def bind_production_transports(
         and cfg.cursor_secret_ref
         and cfg.slack_secret_ref
     ):
-        return {}
+        wrapped = _wrap_injected_clients(
+            cfg,
+            owner,
+            cursor_client=cursor_client,
+            slack_client=slack_client,
+            slack_channel_id=slack_channel_id,
+            slack_root_thread_ts=slack_root_thread_ts,
+            credential_resolver=credential_resolver,
+        )
+        if wrapped is None:
+            return {}
+        cursor_request, slack_request = wrapped
 
     try:
         return {
