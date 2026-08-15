@@ -1,0 +1,393 @@
+"""ENG-50: Gateway startup must bind production transports without activation.
+
+``GatewayRunner._maybe_attach_durable_job_lane`` is the lifecycle-owned
+startup path. Complete candidate-bound config + secret refs is not enough:
+approved concrete transports must be injected from the production binding
+seam. Missing/wrong transports, secret-ref mismatch, and identity mismatch
+fail closed. Attach/preflight make no sockets or provider calls.
+
+No live Slack/Cursor/network. No Gateway adapter connect.
+"""
+
+from __future__ import annotations
+
+import socket
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tests.agent.durable_jobs.package2_support import bind_runtime_secret_env
+
+
+CURSOR_TOKEN = "cursor-secret-token-value"
+SLACK_TOKEN = "xoxb-super-secret-token"
+CONFIG_WORKSPACE = "T1"
+CONFIG_REPO = "github.com/example/repo"
+
+
+@pytest.fixture(autouse=True)
+def _reset_lane_seam():
+    from gateway.durable_job_lane import detach_durable_job_lane
+
+    detach_durable_job_lane()
+    yield
+    detach_durable_job_lane()
+
+
+def _complete(tmp_path: Path, **overrides) -> dict:
+    section = {
+        "enabled": True,
+        "dispatch_enabled": False,
+        "backend": "sqlite",
+        "sqlite_path": str(tmp_path / "jobs.sqlite"),
+        "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+        "cursor_adapter_mode": "injected",
+        "slack_adapter_mode": "injected",
+        "cursor_secret_ref": "CURSOR_API_KEY",
+        "slack_secret_ref": "SLACK_BOT_TOKEN",
+        "policy_version": "eng29-matrix-v1",
+        "identity_binding": {
+            "workspace_id": CONFIG_WORKSPACE,
+            "repository_identity": CONFIG_REPO,
+        },
+    }
+    section.update(overrides)
+    return {"durable_jobs": section}
+
+
+def _write_active_config(tmp_path: Path, raw: dict) -> None:
+    import yaml
+    from hermes_cli import config as cfg
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+
+
+def _idle_request(calls: list):
+    def request(*, operation: str, secret_ref: str, payload: dict):
+        calls.append(
+            {"operation": operation, "secret_ref": secret_ref, "payload": dict(payload)}
+        )
+        raise AssertionError("startup attach/preflight must not call the provider")
+
+    return request
+
+
+def _install_request_ports(owner, cursor_request, slack_request, **identity):
+    owner._durable_job_cursor_request = cursor_request
+    owner._durable_job_slack_request = slack_request
+    if identity:
+        owner._durable_job_runtime_identity = {
+            "workspace_id": identity.get("workspace_id", CONFIG_WORKSPACE),
+            "repository_identity": identity.get(
+                "repository_identity", CONFIG_REPO
+            ),
+        }
+
+
+def _make_runner(tmp_path: Path):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
+    return GatewayRunner(
+        GatewayConfig(
+            platforms={},
+            sessions_dir=tmp_path / "sessions",
+            loop_watchdog=False,
+        )
+    )
+
+
+def _prepare_startup(tmp_path: Path, monkeypatch, **overrides):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    bind_runtime_secret_env(monkeypatch)
+    raw = _complete(tmp_path, **overrides)
+    _write_active_config(tmp_path, raw)
+    return raw, _make_runner(tmp_path)
+
+
+def test_startup_without_production_ports_does_not_attach_valid_candidate_config(
+    tmp_path, monkeypatch
+):
+    """Config + secrets alone cannot mint runtime_ready — no transports."""
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert get_active_durable_job_lane() is None
+
+
+def test_startup_binds_approved_transports_when_request_ports_are_installed(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.slack_bridge import SlackClientBridge
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    raw, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(
+        runner, _idle_request(calls), _idle_request(calls)
+    )
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    assert isinstance(handle.cursor_adapter, CursorCloudAdapter)
+    assert isinstance(handle.slack_adapter, SlackClientBridge)
+    assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+    assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+    assert handle.preflight.runtime_ready is True
+    assert handle.config.dispatch_allowed is False
+    assert handle.preflight.dispatch_allowed is False
+    assert calls == []
+    dumped = f"{handle!r} {handle.preflight!r} {raw!r}"
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+
+
+def test_startup_missing_one_request_port_does_not_attach(tmp_path, monkeypatch):
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    runner._durable_job_cursor_request = _idle_request(calls)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_wrong_concrete_transport_does_not_attach(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import SlackInjectedTransport
+
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+
+    class DuckCursor:
+        _secret_ref = "CURSOR_API_KEY"
+        _request = _idle_request(calls)
+
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._durable_job_cursor_transport = DuckCursor()
+    runner._durable_job_slack_transport = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+    )
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_secret_ref_mismatch_does_not_attach(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    monkeypatch.setenv("ACTUAL_CURSOR_REF_MISSING", "cursor-unbound-dummy-value")
+    monkeypatch.setenv("ACTUAL_SLACK_REF_MISSING", "xoxb-unbound-dummy-token")
+    calls: list = []
+    runner._durable_job_cursor_transport = CursorCloudInjectedTransport(
+        request=_idle_request(calls), secret_ref="ACTUAL_CURSOR_REF_MISSING"
+    )
+    runner._durable_job_slack_transport = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="ACTUAL_SLACK_REF_MISSING"
+    )
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_identity_mismatch_does_not_attach(tmp_path, monkeypatch):
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(
+        runner,
+        _idle_request(calls),
+        _idle_request(calls),
+        workspace_id="T-FOREIGN",
+        repository_identity=CONFIG_REPO,
+    )
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_default_off_does_not_attach(tmp_path, monkeypatch):
+    _, runner = _prepare_startup(tmp_path, monkeypatch, enabled=False)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert calls == []
+
+
+def test_startup_attach_and_preflight_open_no_sockets(tmp_path, monkeypatch):
+    def _deny(*_a, **_k):
+        raise AssertionError("durable job lane startup must not open sockets")
+
+    monkeypatch.setattr(socket.socket, "connect", _deny)
+    monkeypatch.setattr(socket.socket, "connect_ex", _deny)
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is not None
+    assert calls == []
+
+
+def test_startup_attach_detach_lifecycle(tmp_path, monkeypatch):
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    handle = runner._durable_job_lane
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    runner._maybe_detach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert get_active_durable_job_lane() is None
+    runner._maybe_attach_durable_job_lane()
+    restarted = runner._durable_job_lane
+    assert restarted is not None
+    assert restarted is not handle
+    assert get_active_durable_job_lane() is restarted
+    assert calls == []
+
+
+def test_startup_close_fences_holders_and_preserves_lane_closed(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.lane import LaneClosedError
+    from tests.agent.durable_jobs.eng28_support import RecordingAckPort
+    from tests.agent.durable_jobs.test_handle_shutdown_lease_holder import _inbound
+    from tests.gateway.test_durable_job_lane_seam import _seed_bound_job
+
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    handle = runner._durable_job_lane
+    assert handle is not None
+    job, store = _seed_bound_job(handle, idempotency_key="idem-prod-close")
+
+    with pytest.raises(LaneClosedError):
+        with handle.lane._mutation_lease():
+            handle.shutdown()
+
+    result = handle.lane.consume_inbound_action(
+        RecordingAckPort(),
+        **_inbound(job, decision_idempotency_key="dec-prod-close"),
+    )
+    assert result.ok is False
+    assert result.ack_status == "pending"
+    assert result.retryable is True
+    assert calls == []
+    conn = __import__("sqlite3").connect(store.sqlite_path)
+    try:
+        inbound = conn.execute("SELECT COUNT(*) FROM job_inbound_actions").fetchone()[0]
+        decisions = conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0]
+    finally:
+        conn.close()
+    assert inbound == 0
+    assert decisions == 0
+
+
+def test_startup_old_runner_stop_does_not_retire_new_runner_lane(
+    tmp_path, monkeypatch
+):
+    from gateway.durable_job_lane import consume_slack_action_if_active
+    from tests.gateway.test_durable_job_lane_seam import (
+        _action,
+        _count_rows,
+        _seed_bound_job,
+        _verified_body,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    bind_runtime_secret_env(monkeypatch)
+    old_raw = _complete(tmp_path / "old")
+    new_raw = _complete(tmp_path / "new")
+    _write_active_config(tmp_path, new_raw)
+    old = _make_runner(tmp_path / "old")
+    new = _make_runner(tmp_path / "new")
+    calls: list = []
+    _install_request_ports(old, _idle_request(calls), _idle_request(calls))
+    _install_request_ports(new, _idle_request(calls), _idle_request(calls))
+    from gateway.durable_job_lane import attach_to_gateway_runner
+    from agent.durable_jobs.production_binding import bind_production_transports
+
+    attach_to_gateway_runner(
+        old,
+        raw_config=old_raw,
+        **bind_production_transports(
+            old_raw,
+            owner=old,
+            cursor_request=old._durable_job_cursor_request,
+            slack_request=old._durable_job_slack_request,
+        ),
+    )
+    attach_to_gateway_runner(
+        new,
+        raw_config=new_raw,
+        **bind_production_transports(
+            new_raw,
+            owner=new,
+            cursor_request=new._durable_job_cursor_request,
+            slack_request=new._durable_job_slack_request,
+        ),
+    )
+    assert old._durable_job_lane is not None
+    assert new._durable_job_lane is not None
+    assert old._durable_job_lane is not new._durable_job_lane
+    job, store = _seed_bound_job(new._durable_job_lane, idempotency_key="idem-prod-live")
+    old._maybe_detach_durable_job_lane()
+    assert getattr(old, "_durable_job_lane", None) is None
+    assert new._durable_job_lane is not None
+    result = consume_slack_action_if_active(
+        _verified_body(),
+        _action(
+            "hermes_durable_go",
+            {
+                "job_id": job.job_id,
+                "decision_idempotency_key": "dec-prod-live",
+                "policy_version": "pol-1",
+                "candidate_id": "cand-1",
+                "candidate_version": "v1",
+            },
+        ),
+    )
+    assert result is not None
+    assert result.ok is True
+    assert _count_rows(store.sqlite_path, "job_inbound_actions") == 1
+    assert calls == []
+
+
+def test_startup_does_not_construct_network_clients_from_flags(
+    tmp_path, monkeypatch
+):
+    constructed: list = []
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            constructed.append((a, k))
+            raise AssertionError("flags must not construct a provider client")
+
+    monkeypatch.setitem(__import__("sys").modules, "slack_sdk", SimpleNamespace(WebClient=_Boom))
+    _prepare_startup(tmp_path, monkeypatch, dispatch_enabled=True)
+    runner = _make_runner(tmp_path)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert constructed == []
