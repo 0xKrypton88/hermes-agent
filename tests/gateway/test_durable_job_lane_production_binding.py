@@ -1514,7 +1514,20 @@ else:
     b_decodekey = bytes
     b_encodevalue = b_encodekey
     b_decodevalue = bytes
+# Cache home/temp before the empty spoof so Windows/SYSTEM Path.home()
+# and hermes_constants still resolve. Insert via captured codecs only.
+bootstrap = tempfile.mkdtemp()
 new_data = {}
+for _home_name in (
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HERMES_HOME",
+):
+    dict.__setitem__(new_data, encodekey(_home_name), encodevalue(bootstrap))
 hostile = _Hostile(probes)
 dict.__setitem__(new_data, hostile, object())
 new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
@@ -1531,7 +1544,7 @@ from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
 data = _process_environ_dict()
 present = _secret_ref_present("HERMES_ENG50_V8_DOUBLE")
-td = tempfile.mkdtemp()
+td = bootstrap
 home = Path(td)
 (home / "config.yaml").write_text(
     "durable_jobs:\n"
@@ -1550,7 +1563,6 @@ home = Path(td)
     "    repository_identity: github.com/example/repo\n",
     encoding="utf-8",
 )
-os.environ["HERMES_HOME"] = td
 from hermes_cli import config as cfg
 cfg._LOAD_CONFIG_CACHE.clear()
 cfg._RAW_CONFIG_CACHE.clear()
