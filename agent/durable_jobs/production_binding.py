@@ -28,6 +28,7 @@ from agent.durable_jobs.config import (
     DurableJobsConfigError,
     load_durable_jobs_config,
 )
+from agent.durable_jobs.preflight import _secret_ref_present
 from agent.durable_jobs.injected_transports import (
     CursorCloudInjectedTransport,
     SlackInjectedTransport,
@@ -206,7 +207,9 @@ def _approved_transport(transport: Any, expected_cls: type, expected_ref: Option
         return False
     request = _instance_attr(transport, "_request")
     secret_ref = _instance_attr(transport, "_secret_ref")
-    return callable(request) and secret_ref == expected_ref
+    if type(expected_ref) is not str or type(secret_ref) is not str:
+        return False
+    return callable(request) and str.__eq__(secret_ref, expected_ref)
 
 
 def _runtime_identity(owner: Any) -> Optional[tuple[str, str]]:
@@ -283,6 +286,13 @@ def bind_production_transports(
     ):
         return {}
     if not _identity_matches(cfg, owner):
+        return {}
+    if (
+        type(cfg.cursor_secret_ref) is not str
+        or type(cfg.slack_secret_ref) is not str
+        or not _secret_ref_present(cfg.cursor_secret_ref)
+        or not _secret_ref_present(cfg.slack_secret_ref)
+    ):
         return {}
 
     if cursor_transport is None:

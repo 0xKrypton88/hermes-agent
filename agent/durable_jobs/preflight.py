@@ -7,6 +7,7 @@ default path. Status never includes DSN, token, or other secret values.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
@@ -56,58 +57,234 @@ class DurableJobsPreflight:
 
 _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
 _GETSET_DESCRIPTOR_TYPE = type(_TYPE_DICT_DESCRIPTOR)
+_MISSING = object()
+_WIN32_ENVVAR_NOT_FOUND = 203
+
+
+def _is_stdlib_os_environ_type(environ_type: Any) -> bool:
+    """True when ``environ_type`` is CPython's stdlib ``os._Environ``."""
+    try:
+        os_file = object.__getattribute__(os, "__file__")
+        setitem = object.__getattribute__(environ_type, "__setitem__")
+    except AttributeError:
+        return False
+    if type(os_file) is not str:
+        return False
+    if type(setitem) is not type(lambda: None):
+        return False
+    try:
+        code = object.__getattribute__(setitem, "__code__")
+        qualname = object.__getattribute__(setitem, "__qualname__")
+        module = object.__getattribute__(setitem, "__module__")
+        filename = object.__getattribute__(code, "co_filename")
+    except AttributeError:
+        return False
+    if type(qualname) is not str or type(module) is not str or type(filename) is not str:
+        return False
+    if not str.__eq__(qualname, "_Environ.__setitem__"):
+        return False
+    if not str.__eq__(module, "os"):
+        return False
+    if str.__eq__(filename, "<frozen os>"):
+        return True
+    return str.__eq__(filename, os_file)
+
+
+def _exact_str_dict_value(storage: Any, name: str):
+    """Return a builtin-dict value for an exact-str key, or ``_MISSING``.
+
+    Walks ``dict.items`` so untrusted keys are never hashed or compared.
+    Any non-exact-str key fails closed. Values are not inspected.
+    """
+    if type(storage) is not dict or type(name) is not str:
+        return _MISSING
+    found = False
+    value = None
+    try:
+        items = dict.items(storage)
+    except Exception:
+        return _MISSING
+    for pair in items:
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
+            return _MISSING
+        key = tuple.__getitem__(pair, 0)
+        item = tuple.__getitem__(pair, 1)
+        if type(key) is not str:
+            return _MISSING
+        if str.__eq__(key, name):
+            if found:
+                return _MISSING
+            found = True
+            value = item
+    if not found:
+        return _MISSING
+    return value
 
 
 def _capture_os_environ_boundary():
-    """Capture the CPython ``os._Environ`` instance and ``__dict__`` descriptor."""
+    """Capture the real CPython ``os._Environ`` instance and backing dict."""
     try:
         environ_type = object.__getattribute__(os, "_Environ")
         environ = object.__getattribute__(os, "environ")
     except AttributeError:
-        return None, None, None
+        return None, None, None, None
     if type(environ) is not environ_type:
-        return None, None, None
+        return None, None, None, None
+    if not _is_stdlib_os_environ_type(environ_type):
+        return None, None, None, None
     try:
         namespace = _TYPE_DICT_DESCRIPTOR.__get__(environ_type, type)
     except Exception:
-        return None, None, None
+        return None, None, None, None
     if type(namespace) is not MappingProxyType:
-        return None, None, None
+        return None, None, None, None
     try:
         descriptor = namespace.get("__dict__")
     except Exception:
-        return None, None, None
+        return None, None, None, None
     if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
-        return None, None, None
-    return environ, environ_type, descriptor
+        return None, None, None, None
+    try:
+        storage = descriptor.__get__(environ, environ_type)
+    except Exception:
+        return None, None, None, None
+    if type(storage) is not dict:
+        return None, None, None, None
+    data = _exact_str_dict_value(storage, "_data")
+    if data is _MISSING or type(data) is not dict:
+        return None, None, None, None
+    return environ, environ_type, descriptor, data
 
 
-_CAPTURED_OS_ENVIRON, _CAPTURED_OS_ENVIRON_TYPE, _CAPTURED_OS_ENVIRON_DICT = (
-    _capture_os_environ_boundary()
-)
+(
+    _CAPTURED_OS_ENVIRON,
+    _CAPTURED_OS_ENVIRON_TYPE,
+    _CAPTURED_OS_ENVIRON_DICT,
+    _CAPTURED_OS_ENVIRON_DATA,
+) = _capture_os_environ_boundary()
+
+
+def _bind_native_env_name_probe():
+    """Bind a C-level name-presence probe. Never wraps credential values."""
+    try:
+        import ctypes
+
+        platform = object.__getattribute__(sys, "platform")
+    except Exception:
+        return None
+    if type(platform) is not str:
+        return None
+    if str.__eq__(platform, "win32"):
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_var = kernel32.GetEnvironmentVariableW
+            get_var.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+            ]
+            get_var.restype = ctypes.c_uint32
+            wgetenv = None
+            try:
+                msvcrt = ctypes.CDLL("msvcrt")
+                wgetenv = msvcrt._wgetenv
+                wgetenv.argtypes = [ctypes.c_wchar_p]
+                wgetenv.restype = ctypes.c_void_p
+            except Exception:
+                wgetenv = None
+            return ("win32", get_var, wgetenv, ctypes)
+        except Exception:
+            return None
+    try:
+        libc = ctypes.CDLL(None)
+        getenv = libc.getenv
+        getenv.argtypes = [ctypes.c_char_p]
+        getenv.restype = ctypes.c_void_p
+        return ("posix", getenv, None, None)
+    except Exception:
+        return None
+
+
+_NATIVE_ENV_NAME_PROBE = _bind_native_env_name_probe()
+
+
+def _native_env_name_present(name: str) -> bool | None:
+    """True/False for child-inherited name presence; None fail-closed.
+
+    POSIX uses libc ``getenv`` with a void pointer so the value is never
+    dereferenced. Windows uses ``GetEnvironmentVariableW`` size-only
+    (and CRT ``_wgetenv`` as a pointer check). Values are never copied,
+    logged, or compared. ``posix.environ`` / ``nt.environ`` are unused.
+    """
+    if type(name) is not str or str.__len__(name) == 0:
+        return None
+    probe = _NATIVE_ENV_NAME_PROBE
+    if probe is None or type(probe) is not tuple:
+        return None
+    kind = tuple.__getitem__(probe, 0)
+    if type(kind) is not str:
+        return None
+    if str.__eq__(kind, "win32"):
+        get_var = tuple.__getitem__(probe, 1)
+        wgetenv = tuple.__getitem__(probe, 2)
+        ctypes_mod = tuple.__getitem__(probe, 3)
+        try:
+            size = get_var(name, None, 0)
+        except Exception:
+            size = 0
+        if size != 0:
+            return True
+        try:
+            err = ctypes_mod.get_last_error()
+        except Exception:
+            err = None
+        if wgetenv is not None:
+            try:
+                ptr = wgetenv(name)
+            except Exception:
+                ptr = None
+            if ptr is not None:
+                return True
+        if err == _WIN32_ENVVAR_NOT_FOUND or err == 0:
+            return False
+        return False
+    getenv = tuple.__getitem__(probe, 1)
+    try:
+        encoded = str.encode(name, "ascii")
+    except UnicodeEncodeError:
+        return False
+    try:
+        ptr = getenv(encoded)
+    except Exception:
+        return None
+    return ptr is not None
 
 
 def _process_environ_dict() -> dict | None:
-    """Return the live CPython ``os._Environ`` backing dict, or None.
+    """Return the captured CPython ``os._Environ._data`` dict, or None.
 
-    Runtime boundary: name presence follows ``os.environ._data``, the
-    exact ``dict`` updated by ``os.environ`` / ``setenv``. ``posix.environ``
-    and ``nt.environ`` are not consulted — on Windows, ``nt.environ`` is
-    an exact ``dict`` that is not synchronized with ``os.environ``.
-
-    The ``os._Environ`` instance and its builtin ``__dict__`` descriptor
-    are captured at import. Lookup uses exact type / identity checks and
-    builtin descriptor / ``dict`` operations only. Credential values are
-    never retrieved. Unsupported or tampered runtimes fail closed.
+    The backing dict object captured at import must still be present
+    under the authentic ``os._Environ`` instance. A replaced exact
+    ``dict`` fails closed. This helper is a tamper check only — name
+    presence uses the native child-inherited environment, never this
+    cache and never ``posix.environ`` / ``nt.environ``.
     """
     environ = _CAPTURED_OS_ENVIRON
     environ_type = _CAPTURED_OS_ENVIRON_TYPE
     descriptor = _CAPTURED_OS_ENVIRON_DICT
-    if environ is None or environ_type is None or descriptor is None:
+    captured = _CAPTURED_OS_ENVIRON_DATA
+    if (
+        environ is None
+        or environ_type is None
+        or descriptor is None
+        or captured is None
+    ):
         return None
     if type(environ) is not environ_type:
         return None
     if type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None
+    if type(captured) is not dict:
         return None
     try:
         storage = descriptor.__get__(environ, environ_type)
@@ -115,42 +292,32 @@ def _process_environ_dict() -> dict | None:
         return None
     if type(storage) is not dict:
         return None
-    try:
-        if not dict.__contains__(storage, "_data"):
-            return None
-        data = dict.__getitem__(storage, "_data")
-    except Exception:
+    data = _exact_str_dict_value(storage, "_data")
+    if data is _MISSING or type(data) is not dict:
         return None
-    if type(data) is not dict:
+    if data is not captured:
         return None
     return data
 
 
 def _secret_ref_present(ref: Optional[str]) -> bool:
-    """True when the process environment contains this reference *name*.
+    """True when the child-inherited process environment has this *name*.
 
-    Accepts only an exact ``str`` name. Detects key presence via the
-    captured CPython ``os._Environ`` backing dict (see
-    ``_process_environ_dict``). Never retrieves, resolves, stringifies,
-    logs, or otherwise accesses the credential value, and never calls
-    overridable ``os.environ`` mapping APIs (get, contains, keys, items,
-    values, iteration) or user equality/hash hooks.
+    Accepts only an exact ``str`` name. Requires an intact captured
+    ``os._Environ`` boundary, then probes native name presence without
+    retrieving, resolving, stringifying, logging, or comparing credential
+    values. Never calls overridable ``os.environ`` mapping APIs or user
+    equality/hash hooks, and never consults ``posix.environ`` /
+    ``nt.environ`` or a replaced ``_data`` cache.
     """
-    if type(ref) is not str or not ref:
+    if type(ref) is not str or str.__len__(ref) == 0:
         return False
-    data = _process_environ_dict()
-    if data is None:
+    if _process_environ_dict() is None:
         return False
-    try:
-        encoded = str.encode(ref, "ascii")
-    except UnicodeEncodeError:
+    native = _native_env_name_present(ref)
+    if native is None:
         return False
-    try:
-        if dict.__contains__(data, ref):
-            return True
-        return dict.__contains__(data, encoded)
-    except Exception:
-        return False
+    return native is True
 
 
 def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
@@ -190,9 +357,9 @@ def _concrete_injected_transport(transport: Any, expected_cls: type) -> bool:
         return False
     request = _instance_attr(transport, "_request")
     secret_ref = _instance_attr(transport, "_secret_ref")
-    return callable(request) and isinstance(secret_ref, str) and bool(
-        secret_ref.strip()
-    )
+    if type(secret_ref) is not str:
+        return False
+    return callable(request) and str.__len__(str.strip(secret_ref)) != 0
 
 
 def _injected_transport_capability(
@@ -220,10 +387,12 @@ def _transport_secret_ref(transport: Any) -> Optional[str]:
     ):
         return None
     raw = _instance_attr(transport, "_secret_ref")
-    if not isinstance(raw, str):
+    if type(raw) is not str:
         return None
-    text = raw.strip()
-    return text or None
+    text = str.strip(raw)
+    if type(text) is not str or str.__len__(text) == 0:
+        return None
+    return text
 
 
 def _injected_secret_ref_binding_reason(
@@ -237,13 +406,23 @@ def _injected_secret_ref_binding_reason(
     """
     if cfg.cursor_adapter_mode == ADAPTER_MODE_INJECTED:
         declared = _transport_secret_ref(cursor_transport)
-        if declared is None or declared != cfg.cursor_secret_ref:
+        expected = cfg.cursor_secret_ref
+        if (
+            declared is None
+            or type(expected) is not str
+            or not str.__eq__(declared, expected)
+        ):
             return "transport_secret_ref_mismatch"
         if not _secret_ref_present(declared):
             return "secret_refs_missing"
     if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
         declared = _transport_secret_ref(slack_transport)
-        if declared is None or declared != cfg.slack_secret_ref:
+        expected = cfg.slack_secret_ref
+        if (
+            declared is None
+            or type(expected) is not str
+            or not str.__eq__(declared, expected)
+        ):
             return "transport_secret_ref_mismatch"
         if not _secret_ref_present(declared):
             return "secret_refs_missing"

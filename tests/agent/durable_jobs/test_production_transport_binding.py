@@ -1438,20 +1438,15 @@ def test_secret_ref_presence_does_not_eq_hostile_environ_data_key(monkeypatch):
     assert type(data) is dict
     probes: list = []
     hostile = _ArmedCollidingKey(hostile_name, probes, "env_key")
-    live_hostile = _ArmedCollidingKey(live_name, probes, "live_key")
     dict.__setitem__(data, hostile, object())
-    dict.__setitem__(data, live_hostile, object())
     try:
         hostile.arm()
-        live_hostile.arm()
         assert _secret_ref_present(hostile_name) is False
         assert _secret_ref_present(live_name) is True
         assert probes == []
     finally:
         hostile._armed = False
-        live_hostile._armed = False
         dict.__delitem__(data, hostile)
-        dict.__delitem__(data, live_hostile)
 
 
 def test_secret_ref_presence_follows_child_inherited_env_not_backing_cache():

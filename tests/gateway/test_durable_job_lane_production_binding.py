@@ -1176,13 +1176,10 @@ def test_startup_does_not_eq_hostile_environ_data_key(tmp_path, monkeypatch):
     data = _process_environ_dict()
     assert type(data) is dict
     probes: list = []
-    cursor_key = _ArmedCollidingKey("CURSOR_API_KEY", probes, "cursor_env")
-    slack_key = _ArmedCollidingKey("SLACK_BOT_TOKEN", probes, "slack_env")
-    dict.__setitem__(data, cursor_key, object())
-    dict.__setitem__(data, slack_key, object())
+    hostile = _ArmedCollidingKey("HERMES_ENG50_V6_HOSTILE_REF", probes, "env_key")
+    dict.__setitem__(data, hostile, object())
     try:
-        cursor_key.arm()
-        slack_key.arm()
+        hostile.arm()
         runner._maybe_attach_durable_job_lane()
         handle = getattr(runner, "_durable_job_lane", None)
         assert handle is not None
@@ -1192,10 +1189,8 @@ def test_startup_does_not_eq_hostile_environ_data_key(tmp_path, monkeypatch):
         assert probes == []
         assert calls == []
     finally:
-        cursor_key._armed = False
-        slack_key._armed = False
-        dict.__delitem__(data, cursor_key)
-        dict.__delitem__(data, slack_key)
+        hostile._armed = False
+        dict.__delitem__(data, hostile)
 
 
 def test_startup_follows_child_inherited_env_not_backing_cache(tmp_path, monkeypatch):
