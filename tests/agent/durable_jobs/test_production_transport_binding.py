@@ -150,6 +150,126 @@ def _install_secret_value_traps(monkeypatch, *, extra_names=()):
     monkeypatch.setattr(os._Environ, "__getitem__", _deny_getitem)
 
 
+def _deny_environ_mapping_api(*_a, **_k):
+    raise AssertionError("must not use overridable environ mapping APIs")
+
+
+def _install_preflight_os_environ(monkeypatch, environ, *, getenv=None):
+    """Replace only preflight's os.environ view; leave process os.environ intact."""
+    import agent.durable_jobs.preflight as preflight
+
+    real_os = preflight.os
+    getenv_fn = _deny_environ_mapping_api if getenv is None else getenv
+
+    class _OsView:
+        def __getattr__(self, name):
+            if name == "environ":
+                return environ
+            if name == "getenv":
+                return getenv_fn
+            return getattr(real_os, name)
+
+    monkeypatch.setattr(preflight, "os", _OsView())
+
+
+def _install_overridable_environ_traps(monkeypatch):
+    """Fail if preflight uses overridable os.environ mapping APIs."""
+    _install_preflight_os_environ(monkeypatch, _AdversarialEnviron())
+
+
+class _AdversarialEnviron:
+    """Proxy whose mapping/equality/hash hooks fail if invoked."""
+
+    def __getattribute__(self, name):
+        if name in {
+            "get",
+            "keys",
+            "items",
+            "values",
+            "copy",
+            "setdefault",
+            "pop",
+            "popitem",
+            "update",
+            "clear",
+        }:
+            raise AssertionError(f"environ.{name} must not run")
+        return object.__getattribute__(self, name)
+
+    def __contains__(self, key):
+        raise AssertionError("environ.__contains__ must not run")
+
+    def __iter__(self):
+        raise AssertionError("environ.__iter__ must not run")
+
+    def __getitem__(self, key):
+        raise AssertionError("environ.__getitem__ must not run")
+
+    def __len__(self):
+        raise AssertionError("environ.__len__ must not run")
+
+    def __eq__(self, other):
+        raise AssertionError("environ.__eq__ must not run")
+
+    def __hash__(self):
+        raise AssertionError("environ.__hash__ must not run")
+
+
+class _HookProbe:
+    def __init__(self, probes, label, *, truthy=True):
+        self._probes = probes
+        self._label = label
+        self._truthy = truthy
+
+    def __bool__(self):
+        self._probes.append(f"{self._label}.__bool__")
+        return self._truthy
+
+    def __eq__(self, other):
+        self._probes.append(f"{self._label}.__eq__")
+        raise AssertionError(f"{self._label}.__eq__ must not run")
+
+    def __hash__(self):
+        self._probes.append(f"{self._label}.__hash__")
+        raise AssertionError(f"{self._label}.__hash__ must not run")
+
+
+class _EvilStr(str):
+    def __eq__(self, other):
+        raise AssertionError("str-subclass __eq__ must not run")
+
+    def __hash__(self):
+        raise AssertionError("str-subclass __hash__ must not run")
+
+
+def _getset_descriptor_type():
+    return type(type.__dict__["__dict__"])
+
+
+def _evil_dict_descriptor(probes):
+    getset = _getset_descriptor_type()
+
+    class EvilMeta(type):
+        def __eq__(cls, other):
+            probes.append(("eq", other is getset))
+            raise AssertionError("metaclass __eq__ must not compare to getset_descriptor")
+
+        def __hash__(cls):
+            probes.append("hash")
+            return hash(getset)
+
+    class EvilDictDesc(metaclass=EvilMeta):
+        def __get__(self, obj, owner=None):
+            probes.append("desc_get")
+            raise AssertionError("custom __dict__ descriptor must not run")
+
+        def __set__(self, obj, value):
+            probes.append("desc_set")
+            raise AssertionError("custom __dict__ descriptor must not run")
+
+    return EvilDictDesc()
+
+
 def test_bind_production_transports_module_exists():
     _require_binding()
 
@@ -751,6 +871,164 @@ def test_owner_metaclass_does_not_revive_class_attribute_or_property_seams(
     raw = _complete(tmp_path)
     armed["on"] = True
     bound = bind_production_transports(raw, owner=owner)
+    assert bound == {}
+    assert probes == []
+    assert calls == []
+
+
+def test_preflight_presence_survives_adversarial_environ_proxy(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    _install_preflight_os_environ(monkeypatch, _AdversarialEnviron())
+    calls: list = []
+    report = preflight_durable_jobs(
+        _complete(tmp_path),
+        cursor_transport=CursorCloudInjectedTransport(
+            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+        ),
+        slack_transport=SlackInjectedTransport(
+            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+        ),
+    )
+    assert report.secret_refs_present is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert calls == []
+    _assert_no_secrets(report)
+
+
+def test_preflight_presence_does_not_use_overridable_environ_mapping_apis(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    _install_overridable_environ_traps(monkeypatch)
+    calls: list = []
+    report = preflight_durable_jobs(
+        _complete(tmp_path),
+        cursor_transport=CursorCloudInjectedTransport(
+            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+        ),
+        slack_transport=SlackInjectedTransport(
+            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+        ),
+    )
+    assert report.secret_refs_present is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert "secret_refs_missing" not in report.reasons
+    assert calls == []
+    _assert_no_secrets(report)
+
+
+def test_preflight_absence_ignores_lying_environ_mapping(tmp_path, monkeypatch):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    class _LyingEnviron:
+        def keys(self):
+            return ["CURSOR_API_KEY", "SLACK_BOT_TOKEN"]
+
+        def get(self, *_a, **_k):
+            raise AssertionError("lying environ.get must not run")
+
+        def items(self):
+            raise AssertionError("lying environ.items must not run")
+
+        def values(self):
+            raise AssertionError("lying environ.values must not run")
+
+        def __iter__(self):
+            return iter(("CURSOR_API_KEY", "SLACK_BOT_TOKEN"))
+
+        def __contains__(self, key):
+            return key in ("CURSOR_API_KEY", "SLACK_BOT_TOKEN")
+
+        def __getitem__(self, key):
+            raise AssertionError("lying environ.__getitem__ must not run")
+
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    _install_preflight_os_environ(monkeypatch, _LyingEnviron())
+    report = preflight_durable_jobs(_complete(tmp_path))
+    assert report.secret_refs_present is False
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert "secret_refs_missing" in report.reasons
+    _assert_no_secrets(report)
+
+
+def test_secret_ref_present_ignores_user_controlled_eq_and_hash_hooks():
+    from agent.durable_jobs.preflight import _secret_ref_present
+
+    probes: list = []
+    assert _secret_ref_present(_HookProbe(probes, "ref")) is False
+    assert probes == []
+    assert _secret_ref_present(_EvilStr("CURSOR_API_KEY")) is False
+
+
+def test_bind_and_preflight_do_not_use_overridable_environ_mapping_apis(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    _install_overridable_environ_traps(monkeypatch)
+    calls: list = []
+    raw = _complete(tmp_path)
+    bound = bind_production_transports(
+        raw,
+        owner=_owner_with_matching_identity(),
+        cursor_request=_idle_request(calls),
+        slack_request=_idle_request(calls),
+    )
+    report = preflight_durable_jobs(raw, **bound)
+    assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
+    assert type(bound.get("slack_transport")) is SlackInjectedTransport
+    assert report.secret_refs_present is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is False
+    assert calls == []
+    _assert_no_secrets(bound)
+    _assert_no_secrets(report)
+
+
+def test_owner_dict_descriptor_metaclass_eq_is_not_compared_to_getset(
+    tmp_path, monkeypatch
+):
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    probes: list = []
+    calls: list = []
+
+    class Owner:
+        __dict__ = _evil_dict_descriptor(probes)
+
+    owner = Owner()
+    bound = bind_production_transports(
+        _complete(tmp_path),
+        owner=owner,
+        cursor_request=_idle_request(calls),
+        slack_request=_idle_request(calls),
+    )
     assert bound == {}
     assert probes == []
     assert calls == []

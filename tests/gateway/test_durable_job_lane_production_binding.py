@@ -146,6 +146,48 @@ def _install_secret_value_traps(monkeypatch, *, extra_names=()):
     monkeypatch.setattr(os._Environ, "__getitem__", _deny_getitem)
 
 
+def _deny_environ_mapping_api(*_a, **_k):
+    raise AssertionError("must not use overridable environ mapping APIs")
+
+
+def _install_overridable_environ_traps(monkeypatch):
+    """Fail if startup uses overridable os.environ mapping APIs."""
+    monkeypatch.setattr(os.environ, "keys", _deny_environ_mapping_api)
+    monkeypatch.setattr(os.environ, "items", _deny_environ_mapping_api)
+    monkeypatch.setattr(os.environ, "values", _deny_environ_mapping_api)
+    monkeypatch.setattr(os._Environ, "__iter__", _deny_environ_mapping_api)
+    monkeypatch.setattr(os._Environ, "__contains__", _deny_environ_mapping_api)
+    _install_secret_value_traps(monkeypatch)
+
+
+def _getset_descriptor_type():
+    return type(type.__dict__["__dict__"])
+
+
+def _evil_dict_descriptor(probes):
+    getset = _getset_descriptor_type()
+
+    class EvilMeta(type):
+        def __eq__(cls, other):
+            probes.append(("eq", other is getset))
+            raise AssertionError("metaclass __eq__ must not compare to getset_descriptor")
+
+        def __hash__(cls):
+            probes.append("hash")
+            return hash(getset)
+
+    class EvilDictDesc(metaclass=EvilMeta):
+        def __get__(self, obj, owner=None):
+            probes.append("desc_get")
+            raise AssertionError("custom __dict__ descriptor must not run")
+
+        def __set__(self, obj, value):
+            probes.append("desc_set")
+            raise AssertionError("custom __dict__ descriptor must not run")
+
+    return EvilDictDesc()
+
+
 def _make_runner(tmp_path: Path, runner_cls=None):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
@@ -696,6 +738,58 @@ def test_startup_owner_metaclass_does_not_revive_class_attribute_seams(
     runner = _make_runner(tmp_path, runner_cls=TrapRunner)
     assert "_durable_job_runtime_identity" not in vars(runner)
     armed["on"] = True
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_presence_does_not_use_overridable_environ_mapping_apis(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    raw, runner = _prepare_startup(tmp_path, monkeypatch)
+    calls: list = []
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    _install_overridable_environ_traps(monkeypatch)
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert get_active_durable_job_lane() is handle
+    assert type(handle.cursor_adapter._transport) is CursorCloudInjectedTransport
+    assert type(handle.slack_adapter._transport) is SlackInjectedTransport
+    assert handle.preflight.secret_refs_present is True
+    assert handle.preflight.runtime_ready is True
+    assert handle.config.dispatch_allowed is False
+    assert handle.preflight.dispatch_allowed is False
+    assert calls == []
+    dumped = f"{handle!r} {handle.preflight!r} {raw!r}"
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+    assert "cursor-test-ref-value" not in dumped
+    assert "slack-test-ref-value" not in dumped
+
+
+def test_startup_owner_dict_descriptor_metaclass_eq_is_not_compared_to_getset(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    probes: list = []
+    calls: list = []
+
+    class TrapRunner(GatewayRunner):
+        __dict__ = _evil_dict_descriptor(probes)
+
+    _prepare_startup(tmp_path, monkeypatch)
+    runner = _make_runner(tmp_path, runner_cls=TrapRunner)
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
     assert probes == []
