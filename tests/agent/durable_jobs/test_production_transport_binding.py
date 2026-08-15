@@ -1959,9 +1959,11 @@ new_data = {}
 new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
 os.environ = new
 del old
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
 from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
 data = _process_environ_dict()
-present = _secret_ref_present("HERMES_ENG50_V7_GENUINE")
+present = _secret_ref_present("CURSOR_API_KEY")
 sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
 sys.stdout.write(" present=" + ("1" if present else "0"))
 sys.stdout.write(" none=" + ("1" if data is None else "0"))
@@ -2014,10 +2016,12 @@ try:
 except AttributeError:
     pass
 object.__setattr__(sys, "platform", "win32")
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
 hostile.arm()
 from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
 data = _process_environ_dict()
-present = _secret_ref_present("HERMES_ENG50_V7_GENUINE")
+present = _secret_ref_present("CURSOR_API_KEY")
 sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
 sys.stdout.write(" present=" + ("1" if present else "0"))
 sys.stdout.write(" none=" + ("1" if data is None else "0"))
@@ -2036,6 +2040,7 @@ sys.stdout.write(" probes=" + ("1" if probes else "0"))
 def test_preimport_double_environ_and_environb_replacement_fails_closed():
     script = r"""
 import os
+import shutil
 import sys
 import tempfile
 sys.path.insert(0, sys.argv[1])
@@ -2092,7 +2097,7 @@ hostile.arm()
 from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
 from agent.durable_jobs.production_binding import bind_production_transports
 data = _process_environ_dict()
-present = _secret_ref_present("HERMES_ENG50_V8_DOUBLE")
+present = _secret_ref_present("CURSOR_API_KEY")
 td = tempfile.mkdtemp()
 owner = type("Owner", (), {})()
 object.__getattribute__(owner, "__dict__")["_durable_job_runtime_identity"] = {
@@ -2132,6 +2137,7 @@ sys.stdout.write(" present=" + ("1" if present else "0"))
 sys.stdout.write(" none=" + ("1" if data is None else "0"))
 sys.stdout.write(" bound=" + ("1" if bound else "0"))
 sys.stdout.write(" probes=" + ("1" if probes else "0"))
+shutil.rmtree(td, ignore_errors=True)
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(_repo_root())],
@@ -2144,3 +2150,230 @@ sys.stdout.write(" probes=" + ("1" if probes else "0"))
         result.stdout
         == "double_preimport_replacement_accepted=0 present=0 none=1 bound=0 probes=0"
     )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix.environ triple-rebind is POSIX-only")
+def test_preimport_posix_triple_environ_rebind_fails_closed():
+    script = r"""
+import os
+import posix
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+
+class _Hostile:
+    def __init__(self, probes):
+        self._probes = probes
+        self._armed = False
+    def arm(self):
+        self._armed = True
+    def __hash__(self):
+        if self._armed:
+            self._probes.append("hash")
+            raise AssertionError("hostile backing __hash__ must not run")
+        return 1
+    def __eq__(self, other):
+        self._probes.append("eq")
+        raise AssertionError("hostile backing __eq__ must not run")
+
+probes = []
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+old_b = object.__getattribute__(os, "environb")
+b_encodekey = object.__getattribute__(old_b, "encodekey")
+b_decodekey = object.__getattribute__(old_b, "decodekey")
+b_encodevalue = object.__getattribute__(old_b, "encodevalue")
+b_decodevalue = object.__getattribute__(old_b, "decodevalue")
+new_data = {}
+hostile = _Hostile(probes)
+dict.__setitem__(new_data, hostile, object())
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+new_b = os._Environ(new_data, b_encodekey, b_decodekey, b_encodevalue, b_decodevalue)
+os.environ = new
+os.environb = new_b
+posix.environ = new_data
+del old
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
+hostile.arm()
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+from agent.durable_jobs.production_binding import bind_production_transports
+data = _process_environ_dict()
+present = _secret_ref_present("CURSOR_API_KEY")
+td = tempfile.mkdtemp()
+try:
+    owner = type("Owner", (), {})()
+    object.__getattribute__(owner, "__dict__")["_durable_job_runtime_identity"] = {
+        "workspace_id": "T1",
+        "repository_identity": "github.com/example/repo",
+    }
+    def _idle(*, operation, secret_ref, payload):
+        raise AssertionError("bind/preflight must not call the provider")
+    object.__getattribute__(owner, "__dict__")["_durable_job_cursor_request"] = _idle
+    object.__getattribute__(owner, "__dict__")["_durable_job_slack_request"] = _idle
+    bound = bind_production_transports(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": False,
+                "backend": "sqlite",
+                "sqlite_path": td + "/jobs.sqlite",
+                "checkpoint_sqlite_path": td + "/checkpoints.sqlite",
+                "cursor_adapter_mode": "injected",
+                "slack_adapter_mode": "injected",
+                "cursor_secret_ref": "CURSOR_API_KEY",
+                "slack_secret_ref": "SLACK_BOT_TOKEN",
+                "policy_version": "eng29-matrix-v1",
+                "identity_binding": {
+                    "workspace_id": "T1",
+                    "repository_identity": "github.com/example/repo",
+                },
+            }
+        },
+        owner=owner,
+    )
+    sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
+    sys.stdout.write(" present=" + ("1" if present else "0"))
+    sys.stdout.write(" none=" + ("1" if data is None else "0"))
+    sys.stdout.write(" bound=" + ("1" if bound else "0"))
+    sys.stdout.write(" probes=" + ("1" if probes else "0"))
+finally:
+    shutil.rmtree(td, ignore_errors=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "accepted=0 present=0 none=1 bound=0 probes=0"
+
+
+def test_preimport_win32_late_constants_import_does_not_self_attest():
+    script = r"""
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+
+class _Hostile:
+    def __init__(self, probes):
+        self._probes = probes
+        self._armed = False
+    def arm(self):
+        self._armed = True
+    def __hash__(self):
+        if self._armed:
+            self._probes.append("hash")
+            raise AssertionError("hostile backing __hash__ must not run")
+        return 1
+    def __eq__(self, other):
+        self._probes.append("eq")
+        raise AssertionError("hostile backing __eq__ must not run")
+
+probes = []
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+new_data = {}
+hostile = _Hostile(probes)
+dict.__setitem__(new_data, hostile, object())
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+os.environ = new
+del old
+try:
+    object.__delattr__(os, "environb")
+except AttributeError:
+    pass
+object.__setattr__(sys, "platform", "win32")
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
+import hermes_constants
+hostile.arm()
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+data = _process_environ_dict()
+present = _secret_ref_present("CURSOR_API_KEY")
+sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
+sys.stdout.write(" present=" + ("1" if present else "0"))
+sys.stdout.write(" none=" + ("1" if data is None else "0"))
+sys.stdout.write(" probes=" + ("1" if probes else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "accepted=0 present=0 none=1 probes=0"
+
+
+def test_startup_module_import_does_not_self_attest_current_environ():
+    script = r"""
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+new_data = {}
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+os.environ = new
+del old
+os.putenv("CURSOR_API_KEY", "1")
+import hermes_environ_startup
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+ready = hermes_environ_startup.trusted_startup_ready()
+data = _process_environ_dict()
+present = _secret_ref_present("CURSOR_API_KEY")
+sys.stdout.write("ready=" + ("1" if ready else "0"))
+sys.stdout.write(" accepted=" + ("1" if data is new_data else "0"))
+sys.stdout.write(" present=" + ("1" if present else "0"))
+sys.stdout.write(" none=" + ("1" if data is None else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ready=0 accepted=0 present=0 none=1"
+
+
+def test_cli_entry_captures_trusted_startup_before_preflight():
+    script = r"""
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+home = tempfile.mkdtemp()
+os.environ["HERMES_HOME"] = home
+try:
+    import hermes_cli.main
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import _process_environ_dict
+    ready = hermes_environ_startup.trusted_startup_ready()
+    data = _process_environ_dict()
+    sys.stdout.write("trusted=" + ("1" if ready else "0"))
+    sys.stdout.write(" accepted=" + ("1" if data is not None else "0"))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trusted=1 accepted=1"
