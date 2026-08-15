@@ -59,31 +59,6 @@ _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
 _TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
 _GETSET_DESCRIPTOR_TYPE = type(_TYPE_DICT_DESCRIPTOR)
 _MISSING = object()
-_STARTUP_READY_SIGNATURE = None
-_STARTUP_SNAPSHOT_SIGNATURE = None
-try:
-    import hermes_environ_startup as _startup_module
-
-    _startup_ready = object.__getattribute__(_startup_module, "trusted_startup_ready")
-    _startup_snapshot = object.__getattribute__(_startup_module, "startup_pin_snapshot")
-    _STARTUP_READY_SIGNATURE = (
-        object.__getattribute__(_startup_ready, "__code__"),
-        object.__getattribute__(_startup_ready, "__qualname__"),
-        object.__getattribute__(_startup_ready, "__module__"),
-    )
-    _STARTUP_SNAPSHOT_SIGNATURE = (
-        object.__getattribute__(_startup_snapshot, "__code__"),
-        object.__getattribute__(_startup_snapshot, "__qualname__"),
-        object.__getattribute__(_startup_snapshot, "__module__"),
-    )
-    del _startup_ready
-    del _startup_snapshot
-    del _startup_module
-except Exception:
-    _STARTUP_READY_SIGNATURE = None
-    _STARTUP_SNAPSHOT_SIGNATURE = None
-
-
 _WIN32_ENVVAR_NOT_FOUND = 203
 
 
@@ -224,65 +199,234 @@ def _stdlib_os_module():
     return module
 
 
-def _trusted_startup_pins():
-    """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
+def _bind_trusted_startup_pins():
+    """Bind pin verification to closure state, not replaceable module globals."""
+    missing = _MISSING
+    exact_str_dict_value = _exact_str_dict_value
+    function_type = type(lambda: None)
+    expected_module = "hermes_environ_startup"
+    expected_basename = "hermes_environ_startup.py"
+    frozen_name = "<frozen hermes_environ_startup>"
+    capture_qualname = "_startup_pin_state.<locals>.capture_trusted_startup"
+    ready_qualname = "_startup_pin_state.<locals>.trusted_startup_ready"
+    snapshot_qualname = "_startup_pin_state.<locals>.startup_pin_snapshot"
+    capture_name = "capture_trusted_startup"
+    ready_name = "trusted_startup_ready"
+    snapshot_name = "startup_pin_snapshot"
+    capture_freevars = ("pinned_os", "pinned_posix", "ready")
+    ready_freevars = ("pinned_os", "ready")
+    snapshot_freevars = ("pinned_os", "pinned_posix", "ready")
+    alias_capture = "_capture_trusted_startup"
+    alias_ready = "_trusted_startup_ready"
+    alias_snapshot = "_startup_pin_snapshot"
 
-    Reads ``hermes_environ_startup`` only if that module is already in
-    ``sys.modules``. Does not import it and does not call capture.
-    A missing, unready, or empty pin is not provenance.
-    """
-    try:
-        modules = object.__getattribute__(sys, "modules")
-    except AttributeError:
-        return False, None, None
-    if type(modules) is not dict:
-        return False, None, None
-    module = _exact_str_dict_value(modules, "hermes_environ_startup")
-    if module is _MISSING:
-        return False, None, None
-    storage = _module_storage(module)
-    if storage is None:
-        return False, None, None
+    def _basename(filename):
+        if type(filename) is not str:
+            return None
+        last = -1
+        i = 0
+        n = str.__len__(filename)
+        while i < n:
+            ch = str.__getitem__(filename, i)
+            if str.__eq__(ch, "/") or str.__eq__(ch, "\\"):
+                last = i
+            i += 1
+        if last < 0:
+            return filename
+        return str.__getitem__(filename, slice(last + 1, None))
 
-    ready_fn = _exact_str_dict_value(storage, "trusted_startup_ready")
-    if ready_fn is _MISSING or not callable(ready_fn):
-        return False, None, None
-    snapshot_fn = _exact_str_dict_value(storage, "startup_pin_snapshot")
-    if snapshot_fn is _MISSING or not callable(snapshot_fn):
-        return False, None, None
-    try:
-        ready_signature = (
-            object.__getattribute__(ready_fn, "__code__"),
-            object.__getattribute__(ready_fn, "__qualname__"),
-            object.__getattribute__(ready_fn, "__module__"),
-        )
-        snapshot_signature = (
-            object.__getattribute__(snapshot_fn, "__code__"),
-            object.__getattribute__(snapshot_fn, "__qualname__"),
-            object.__getattribute__(snapshot_fn, "__module__"),
-        )
-    except Exception:
-        return False, None, None
-    if ready_signature != _STARTUP_READY_SIGNATURE or snapshot_signature != _STARTUP_SNAPSHOT_SIGNATURE:
-        return False, None, None
-    try:
-        ready = ready_fn()
-    except Exception:
-        return False, None, None
-    if ready is not True:
-        return False, None, None
-    try:
-        snapshot = snapshot_fn()
-    except Exception:
-        return False, None, None
-    if type(snapshot) is not tuple or len(snapshot) != 3:
-        return False, None, None
-    ready_value, pinned_environ, pinned_posix = snapshot
-    if ready_value is not True or pinned_environ is _MISSING or pinned_environ is None:
-        return False, None, None
-    if pinned_posix is _MISSING:
-        pinned_posix = None
-    return True, pinned_environ, pinned_posix
+    def _code_filename_matches_module(code, storage):
+        try:
+            filename = object.__getattribute__(code, "co_filename")
+        except Exception:
+            return False
+        if type(filename) is not str:
+            return False
+        if str.__eq__(filename, frozen_name):
+            return True
+        base = _basename(filename)
+        if type(base) is not str or not str.__eq__(base, expected_basename):
+            return False
+        mod_file = exact_str_dict_value(storage, "__file__")
+        if mod_file is missing or type(mod_file) is not str:
+            return False
+        return str.__eq__(filename, mod_file)
+
+    def _freevars_match(fn, expected):
+        try:
+            code = object.__getattribute__(fn, "__code__")
+            freevars = object.__getattribute__(code, "co_freevars")
+        except Exception:
+            return False
+        if type(freevars) is not tuple or type(expected) is not tuple:
+            return False
+        if tuple.__len__(freevars) != tuple.__len__(expected):
+            return False
+        i = 0
+        n = tuple.__len__(expected)
+        while i < n:
+            actual = tuple.__getitem__(freevars, i)
+            want = tuple.__getitem__(expected, i)
+            if type(actual) is not str or type(want) is not str:
+                return False
+            if not str.__eq__(actual, want):
+                return False
+            i += 1
+        return True
+
+    def _is_original_pin_function(fn, qualname, code_name, expected_freevars, storage):
+        if type(fn) is not function_type:
+            return False
+        try:
+            code = object.__getattribute__(fn, "__code__")
+            fn_qualname = object.__getattribute__(fn, "__qualname__")
+            fn_module = object.__getattribute__(fn, "__module__")
+            fn_globals = object.__getattribute__(fn, "__globals__")
+            fn_defaults = object.__getattribute__(fn, "__defaults__")
+            fn_kwdefaults = object.__getattribute__(fn, "__kwdefaults__")
+            fn_name = object.__getattribute__(code, "co_name")
+        except Exception:
+            return False
+        if type(fn_qualname) is not str or type(fn_module) is not str or type(fn_name) is not str:
+            return False
+        if not str.__eq__(fn_qualname, qualname):
+            return False
+        if not str.__eq__(fn_module, expected_module):
+            return False
+        if not str.__eq__(fn_name, code_name):
+            return False
+        if fn_globals is not storage:
+            return False
+        if fn_defaults is not None or fn_kwdefaults is not None:
+            return False
+        if not _code_filename_matches_module(code, storage):
+            return False
+        if not _freevars_match(fn, expected_freevars):
+            return False
+        return True
+
+    def _closure_cell(fn, name):
+        if type(fn) is not function_type or type(name) is not str:
+            return missing
+        try:
+            code = object.__getattribute__(fn, "__code__")
+            closure = object.__getattribute__(fn, "__closure__")
+            freevars = object.__getattribute__(code, "co_freevars")
+        except Exception:
+            return missing
+        if closure is None or type(closure) is not tuple or type(freevars) is not tuple:
+            return missing
+        if tuple.__len__(closure) != tuple.__len__(freevars):
+            return missing
+        found = False
+        cell = None
+        i = 0
+        n = tuple.__len__(freevars)
+        while i < n:
+            var = tuple.__getitem__(freevars, i)
+            if type(var) is not str:
+                return missing
+            if str.__eq__(var, name):
+                if found:
+                    return missing
+                found = True
+                cell = tuple.__getitem__(closure, i)
+            i += 1
+        if not found:
+            return missing
+        return cell
+
+    def _alias_is_original(storage, alias_name, original):
+        alias = exact_str_dict_value(storage, alias_name)
+        if alias is missing:
+            return True
+        return alias is original
+
+    def _trusted_startup_pins():
+        """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
+
+        Reads ``hermes_environ_startup`` only if that module is already in
+        ``sys.modules``. Does not import it and does not call capture.
+        A missing, unready, or empty pin is not provenance. Replaceable
+        module globals and public facades are not evidence; pin values
+        are read from the original capture closures' cells.
+        """
+        try:
+            modules = object.__getattribute__(sys, "modules")
+        except AttributeError:
+            return False, None, None
+        if type(modules) is not dict:
+            return False, None, None
+        module = exact_str_dict_value(modules, "hermes_environ_startup")
+        if module is missing:
+            return False, None, None
+        storage = _module_storage(module)
+        if storage is None:
+            return False, None, None
+
+        capture_fn = exact_str_dict_value(storage, capture_name)
+        ready_fn = exact_str_dict_value(storage, ready_name)
+        snapshot_fn = exact_str_dict_value(storage, snapshot_name)
+        if capture_fn is missing or ready_fn is missing or snapshot_fn is missing:
+            return False, None, None
+        if not _is_original_pin_function(
+            capture_fn, capture_qualname, capture_name, capture_freevars, storage
+        ):
+            return False, None, None
+        if not _is_original_pin_function(
+            ready_fn, ready_qualname, ready_name, ready_freevars, storage
+        ):
+            return False, None, None
+        if not _is_original_pin_function(
+            snapshot_fn, snapshot_qualname, snapshot_name, snapshot_freevars, storage
+        ):
+            return False, None, None
+        if not _alias_is_original(storage, alias_capture, capture_fn):
+            return False, None, None
+        if not _alias_is_original(storage, alias_ready, ready_fn):
+            return False, None, None
+        if not _alias_is_original(storage, alias_snapshot, snapshot_fn):
+            return False, None, None
+
+        ready_cell = _closure_cell(ready_fn, "ready")
+        pinned_os_cell = _closure_cell(ready_fn, "pinned_os")
+        snap_ready_cell = _closure_cell(snapshot_fn, "ready")
+        snap_os_cell = _closure_cell(snapshot_fn, "pinned_os")
+        snap_posix_cell = _closure_cell(snapshot_fn, "pinned_posix")
+        cap_ready_cell = _closure_cell(capture_fn, "ready")
+        cap_os_cell = _closure_cell(capture_fn, "pinned_os")
+        cap_posix_cell = _closure_cell(capture_fn, "pinned_posix")
+        if (
+            ready_cell is missing
+            or pinned_os_cell is missing
+            or snap_ready_cell is missing
+            or snap_os_cell is missing
+            or snap_posix_cell is missing
+            or cap_ready_cell is missing
+            or cap_os_cell is missing
+            or cap_posix_cell is missing
+        ):
+            return False, None, None
+        if ready_cell is not snap_ready_cell or ready_cell is not cap_ready_cell:
+            return False, None, None
+        if pinned_os_cell is not snap_os_cell or pinned_os_cell is not cap_os_cell:
+            return False, None, None
+        if snap_posix_cell is not cap_posix_cell:
+            return False, None, None
+        try:
+            ready_value = object.__getattribute__(ready_cell, "cell_contents")
+            pinned_environ = object.__getattribute__(pinned_os_cell, "cell_contents")
+            pinned_posix = object.__getattribute__(snap_posix_cell, "cell_contents")
+        except Exception:
+            return False, None, None
+        if ready_value is not True or pinned_environ is None:
+            return False, None, None
+        return True, pinned_environ, pinned_posix
+
+    return _trusted_startup_pins
+
+
+_trusted_startup_pins = _bind_trusted_startup_pins()
 
 
 def _module_storage(module: Any):
@@ -364,7 +508,7 @@ def _environ_data_from_instance(environ: Any, environ_type: Any, descriptor: Any
     return data
 
 
-def _capture_os_environ_boundary():
+def _capture_os_environ_boundary(*, _pins=_trusted_startup_pins):
     """Pin ``os.environ`` only when a prior trusted startup pin exists.
 
     A replaced ``os.environ`` / ``os.environb`` / ``posix.environ``
@@ -408,7 +552,7 @@ def _capture_os_environ_boundary():
     platform = _sys_platform()
     if platform is None:
         return None, None, None, None, None
-    ready, pinned_environ, pinned_posix = _trusted_startup_pins()
+    ready, pinned_environ, pinned_posix = _pins()
     if not ready or environ is not pinned_environ:
         return None, None, None, None, None
     if str.__eq__(platform, "win32"):
@@ -521,7 +665,7 @@ def _native_env_name_present(name: str) -> bool | None:
     return ptr is not None
 
 
-def _process_environ_dict() -> dict | None:
+def _process_environ_dict(*, _pins=_trusted_startup_pins) -> dict | None:
     """Return the pinned startup ``os.environ._data`` dict, or None.
 
     Proves the current ``os.environ`` binding is still the captured
@@ -564,7 +708,7 @@ def _process_environ_dict() -> dict | None:
     current_data = _environ_data_from_instance(current, environ_type, descriptor)
     if current_data is _MISSING or current_data is not captured:
         return None
-    ready, pinned_environ, pinned_posix = _trusted_startup_pins()
+    ready, pinned_environ, pinned_posix = _pins()
     if not ready or environ is not pinned_environ or current is not pinned_environ:
         return None
     if str.__eq__(platform, "win32"):

@@ -10,6 +10,8 @@ Identity-only behavior:
 
 - The capture function records environment singletons and the current
   platform once.
+- Pin state lives only in the capture/ready/snapshot closures. It is
+  not stored in module globals, ``os.environ``, or replaceable facades.
 - No secrets are read. No environment values are iterated or compared.
 - No module-level startup attributes are reused as mutable witnesses.
 """
@@ -27,6 +29,7 @@ def _startup_pin_state():
     pinned_posix = None
 
     def capture_trusted_startup() -> bool:
+        """Pin original ``os.environ`` / ``posix.environ`` identities."""
         nonlocal ready
         nonlocal pinned_os
         nonlocal pinned_posix
@@ -64,34 +67,19 @@ def _startup_pin_state():
         return True
 
     def trusted_startup_ready() -> bool:
+        """True when a prior ``capture_trusted_startup()`` pinned ``os.environ``."""
         return ready is True and pinned_os is not None
 
     def startup_pin_snapshot():
+        """Return the raw pinned witness tuple for internal preflight checks."""
         return ready, pinned_os, pinned_posix
 
     return capture_trusted_startup, trusted_startup_ready, startup_pin_snapshot
 
 
-(_capture_trusted_startup, _trusted_startup_ready, _startup_pin_snapshot) = _startup_pin_state()
+capture_trusted_startup, trusted_startup_ready, startup_pin_snapshot = _startup_pin_state()
 
 
-def capture_trusted_startup() -> bool:
-    """Pin original ``os.environ`` / ``posix.environ`` identities."""
-    return _capture_trusted_startup()
-
-
-def trusted_startup_ready() -> bool:
-    """True when a prior ``capture_trusted_startup()`` pinned ``os.environ``."""
-    try:
-        return bool(_trusted_startup_ready())
-    except Exception:
-        return False
-
-
-def startup_pin_snapshot():
-    """Return the raw pinned witness tuple for internal preflight checks."""
-    try:
-        ready, pinned_os, pinned_posix = _startup_pin_snapshot()
-    except Exception:
-        return False, None, None
-    return ready, pinned_os, pinned_posix
+def _startup_pin_state():
+    """Return the import-time pin callables. Does not create a new pin universe."""
+    return capture_trusted_startup, trusted_startup_ready, startup_pin_snapshot

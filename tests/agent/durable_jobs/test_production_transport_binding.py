@@ -2375,6 +2375,126 @@ sys.stdout.write(" mutated=" + ("1" if ready2 else "0"))
     assert result.stdout == "baseline=1 mutated=0"
 
 
+def _replacement_environ_script_preamble():
+    return r"""
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+old = os.environ
+replacement = os._Environ(
+    {},
+    object.__getattribute__(old, "encodekey"),
+    object.__getattribute__(old, "decodekey"),
+    object.__getattribute__(old, "encodevalue"),
+    object.__getattribute__(old, "decodevalue"),
+)
+"""
+
+
+def test_startup_internal_callable_replacement_before_preflight_is_rejected():
+    script = _replacement_environ_script_preamble() + r"""
+import hermes_environ_startup as s
+s.capture_trusted_startup()
+s._trusted_startup_ready = lambda: True
+s._startup_pin_snapshot = lambda: (True, replacement, None)
+from agent.durable_jobs.preflight import _trusted_startup_pins
+ready, env, _posix = _trusted_startup_pins()
+sys.stdout.write("internal_mutation_ready=" + ("1" if ready else "0"))
+sys.stdout.write(" accepted_replacement=" + ("1" if env is replacement else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "internal_mutation_ready=0 accepted_replacement=0"
+
+
+def test_startup_public_facade_replacement_before_preflight_is_rejected():
+    script = _replacement_environ_script_preamble() + r"""
+import hermes_environ_startup as s
+s.capture_trusted_startup()
+s.trusted_startup_ready = lambda: True
+s.startup_pin_snapshot = lambda: (True, replacement, None)
+from agent.durable_jobs.preflight import _trusted_startup_pins
+ready, env, _posix = _trusted_startup_pins()
+sys.stdout.write("ready=" + ("1" if ready else "0"))
+sys.stdout.write(" accepted_replacement=" + ("1" if env is replacement else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ready=0 accepted_replacement=0"
+
+
+def test_startup_internal_callable_mutation_after_preflight_is_rejected():
+    script = _replacement_environ_script_preamble() + r"""
+import hermes_environ_startup as s
+from agent.durable_jobs.preflight import _trusted_startup_pins
+s.capture_trusted_startup()
+ready, env, _posix = _trusted_startup_pins()
+s._trusted_startup_ready = lambda: True
+s._startup_pin_snapshot = lambda: (True, replacement, None)
+ready2, env2, _posix2 = _trusted_startup_pins()
+sys.stdout.write("baseline=" + ("1" if ready else "0"))
+sys.stdout.write(" internal_mutation_ready=" + ("1" if ready2 else "0"))
+sys.stdout.write(" accepted_replacement=" + ("1" if env2 is replacement else "0"))
+sys.stdout.write(" baseline_kept=" + ("1" if env is old else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "baseline=1 internal_mutation_ready=0 accepted_replacement=0 baseline_kept=1"
+    )
+
+
+def test_preflight_expected_signature_globals_cannot_attest_replacement():
+    script = _replacement_environ_script_preamble() + r"""
+import hermes_environ_startup as s
+s.capture_trusted_startup()
+from agent.durable_jobs.preflight import _trusted_startup_pins
+import agent.durable_jobs.preflight as preflight
+
+def fake_ready():
+    return True
+def fake_snap():
+    return True, replacement, None
+preflight._STARTUP_READY_SIGNATURE = (
+    fake_ready.__code__,
+    fake_ready.__qualname__,
+    fake_ready.__module__,
+)
+preflight._STARTUP_SNAPSHOT_SIGNATURE = (
+    fake_snap.__code__,
+    fake_snap.__qualname__,
+    fake_snap.__module__,
+)
+s.trusted_startup_ready = fake_ready
+s.startup_pin_snapshot = fake_snap
+ready, env, _posix = _trusted_startup_pins()
+sys.stdout.write("ready=" + ("1" if ready else "0"))
+sys.stdout.write(" accepted_replacement=" + ("1" if env is replacement else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ready=0 accepted_replacement=0"
+
 
 def test_cli_entry_captures_trusted_startup_before_preflight():
     script = r"""
@@ -2404,3 +2524,69 @@ finally:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "trusted=1 accepted=1"
+
+
+def test_run_agent_entry_captures_trusted_startup_before_preflight():
+    script = r"""
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+home = tempfile.mkdtemp()
+os.environ["HERMES_HOME"] = home
+try:
+    import run_agent
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import _process_environ_dict
+    ready = hermes_environ_startup.trusted_startup_ready()
+    data = _process_environ_dict()
+    sys.stdout.write("trusted=" + ("1" if ready else "0"))
+    sys.stdout.write(" accepted=" + ("1" if data is not None else "0"))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trusted=1 accepted=1"
+
+
+def test_gateway_entrypoint_capture_helper_pins_trusted_startup():
+    script = r"""
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+home = tempfile.mkdtemp()
+os.environ["HERMES_HOME"] = home
+try:
+    import hermes_environ_startup
+    before = hermes_environ_startup.trusted_startup_ready()
+    from gateway.run import _capture_trusted_environ_startup
+    imported = hermes_environ_startup.trusted_startup_ready()
+    _capture_trusted_environ_startup()
+    from agent.durable_jobs.preflight import _trusted_startup_pins
+    after = hermes_environ_startup.trusted_startup_ready()
+    ready, env, _posix = _trusted_startup_pins()
+    sys.stdout.write("before=" + ("1" if before else "0"))
+    sys.stdout.write(" imported=" + ("1" if imported else "0"))
+    sys.stdout.write(" after=" + ("1" if after else "0"))
+    sys.stdout.write(" pins=" + ("1" if ready else "0"))
+    sys.stdout.write(" env=" + ("1" if env is os.environ else "0"))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "before=0 imported=0 after=1 pins=1 env=1"
