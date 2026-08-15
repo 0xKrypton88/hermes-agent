@@ -199,6 +199,31 @@ def _stdlib_os_module():
     return module
 
 
+def _already_imported_startup_environ_singleton():
+    """Return the hermes_constants pin if that module is already imported.
+
+    Does not import ``hermes_constants``. A first import after a pre-import
+    ``os.environ`` replacement would pin the replacement and look like
+    provenance. ``_MISSING`` means no prior pin exists.
+    """
+    try:
+        modules = object.__getattribute__(sys, "modules")
+    except AttributeError:
+        return _MISSING
+    if type(modules) is not dict:
+        return _MISSING
+    module = _exact_str_dict_value(modules, "hermes_constants")
+    if module is _MISSING:
+        return _MISSING
+    storage = _module_storage(module)
+    if storage is None:
+        return _MISSING
+    pinned = _exact_str_dict_value(storage, "_STARTUP_OS_ENVIRON_SINGLETON")
+    if pinned is _MISSING:
+        return _MISSING
+    return pinned
+
+
 def _posix_process_environ_mapping():
     """Return the ``posix.environ`` object, or None.
 
@@ -318,6 +343,10 @@ def _capture_os_environ_boundary():
     ``environb`` is not a supported surface and must stay absent; a
     created sibling pair fails closed. ``nt.environ`` is a copy, not
     ``_data``, and is never treated as provenance or a presence oracle.
+    Provenance requires a prior ``hermes_constants`` pin of the original
+    ``os.environ`` object (``is``). This module does not import
+    ``hermes_constants`` to create that pin. Missing or mismatched pin
+    fails closed.
     """
     module = _stdlib_os_module()
     storage = _module_storage(module)
@@ -349,6 +378,11 @@ def _capture_os_environ_boundary():
     if str.__eq__(platform, "win32"):
         environb = _exact_str_dict_value(storage, "environb")
         if environb is not _MISSING:
+            return None, None, None, None, None
+        witnessed = _already_imported_startup_environ_singleton()
+        if witnessed is _MISSING or witnessed is None:
+            return None, None, None, None, None
+        if environ is not witnessed:
             return None, None, None, None, None
         return environ, environ_type, descriptor, data, None
     posix_environ = _posix_process_environ_mapping()
@@ -503,6 +537,11 @@ def _process_environ_dict() -> dict | None:
             return None
         current_b = _exact_str_dict_value(module_storage, "environb")
         if current_b is not _MISSING:
+            return None
+        witnessed = _already_imported_startup_environ_singleton()
+        if witnessed is _MISSING or witnessed is None:
+            return None
+        if environ is not witnessed or current is not witnessed:
             return None
         return captured
     if environb is None or type(environb) is not environ_type:

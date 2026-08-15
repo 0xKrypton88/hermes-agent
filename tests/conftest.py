@@ -35,6 +35,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Pin os.environ identity before any test imports durable-job preflight.
+# Windows capture cannot prove _data via nt.environ; a missing prior pin
+# fails closed. This import must happen while os.environ is still original.
+import hermes_constants as _hermes_constants_environ_witness  # noqa: E402,F401
+
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves

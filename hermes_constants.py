@@ -18,6 +18,25 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
 
+
+def _pin_startup_os_environ_singleton():
+    """Pin ``os.environ`` object identity at first import of this module.
+
+    Identity only: never iterates keys and never reads or compares values.
+    Durable-job preflight uses this on Windows, where ``nt.environ`` is a
+    copy and cannot prove ``os.environ._data`` provenance. A later first
+    import (after a genuine ``os.environ`` replacement) must not be treated
+    as startup provenance — callers must not import this module to create
+    the pin after a spoof.
+    """
+    try:
+        return object.__getattribute__(os, "environ")
+    except AttributeError:
+        return None
+
+
+_STARTUP_OS_ENVIRON_SINGLETON = _pin_startup_os_environ_singleton()
+
 # ── TUI busy-indicator styles ─────────────────────────────────────────
 # Single source of truth shared by the CLI /indicator command, the TUI
 # gateway config handler, and the /help command registry. Keep in sync

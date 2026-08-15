@@ -15,6 +15,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+import hermes_constants as _hermes_constants_environ_witness  # noqa: F401
 from agent.durable_jobs.config import (
     DurableJobsConfig,
     DurableJobsConfigError,
