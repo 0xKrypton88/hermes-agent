@@ -176,6 +176,16 @@ def _type_namespace(cls: Any):
     return namespace
 
 
+def _sys_platform():
+    try:
+        platform = object.__getattribute__(sys, "platform")
+    except AttributeError:
+        return None
+    if type(platform) is not str:
+        return None
+    return platform
+
+
 def _stdlib_os_module():
     try:
         modules = object.__getattribute__(sys, "modules")
@@ -187,6 +197,33 @@ def _stdlib_os_module():
     if module is _MISSING:
         return None
     return module
+
+
+def _posix_process_environ_mapping():
+    """Return the ``posix.environ`` object, or None.
+
+    Identity only: never iterates the mapping, never hashes its keys,
+    and never reads or compares values. Unused as a presence oracle.
+    """
+    platform = _sys_platform()
+    if platform is None or str.__eq__(platform, "win32"):
+        return None
+    try:
+        modules = object.__getattribute__(sys, "modules")
+    except AttributeError:
+        return None
+    if type(modules) is not dict:
+        return None
+    posix_mod = _exact_str_dict_value(modules, "posix")
+    if posix_mod is _MISSING:
+        return None
+    storage = _module_storage(posix_mod)
+    if storage is None:
+        return None
+    mapping = _exact_str_dict_value(storage, "environ")
+    if mapping is _MISSING or type(mapping) is not dict:
+        return None
+    return mapping
 
 
 def _module_storage(module: Any):
@@ -269,7 +306,18 @@ def _environ_data_from_instance(environ: Any, environ_type: Any, descriptor: Any
 
 
 def _capture_os_environ_boundary():
-    """Pin the startup ``os.environ`` singleton and its exact ``_data`` dict."""
+    """Pin ``os.environ`` only when ``_data`` provenance can be established.
+
+    POSIX: ``_data`` must be the interpreter ``posix.environ`` mapping
+    (``is``), and ``environb`` must share that same object. A pre-import
+    replacement pair whose shared ``_data`` is a fresh dict is not that
+    mapping and fails closed.
+
+    Windows: ``GetEnvironmentVariableW`` is the presence authority.
+    ``environb`` is not a supported surface and must stay absent; a
+    created sibling pair fails closed. ``nt.environ`` is a copy, not
+    ``_data``, and is never treated as provenance or a presence oracle.
+    """
     module = _stdlib_os_module()
     storage = _module_storage(module)
     if storage is None:
@@ -294,15 +342,23 @@ def _capture_os_environ_boundary():
     data = _environ_data_from_instance(environ, environ_type, descriptor)
     if data is _MISSING:
         return None, None, None, None, None
-    environb = _exact_str_dict_value(storage, "environb")
-    if environb is _MISSING:
-        environb = None
-    elif type(environb) is not environ_type:
+    platform = _sys_platform()
+    if platform is None:
         return None, None, None, None, None
-    else:
-        sibling = _environ_data_from_instance(environb, environ_type, descriptor)
-        if sibling is _MISSING or sibling is not data:
+    if str.__eq__(platform, "win32"):
+        environb = _exact_str_dict_value(storage, "environb")
+        if environb is not _MISSING:
             return None, None, None, None, None
+        return environ, environ_type, descriptor, data, None
+    posix_environ = _posix_process_environ_mapping()
+    if posix_environ is None or data is not posix_environ:
+        return None, None, None, None, None
+    environb = _exact_str_dict_value(storage, "environb")
+    if environb is _MISSING or type(environb) is not environ_type:
+        return None, None, None, None, None
+    sibling = _environ_data_from_instance(environb, environ_type, descriptor)
+    if sibling is _MISSING or sibling is not posix_environ:
+        return None, None, None, None, None
     return environ, environ_type, descriptor, data, environb
 
 
@@ -402,12 +458,13 @@ def _process_environ_dict() -> dict | None:
     """Return the pinned startup ``os.environ._data`` dict, or None.
 
     Proves the current ``os.environ`` binding is still the captured
-    startup singleton and that its ``_data`` object is still the
-    captured dict. A genuine replacement ``os._Environ`` (before or
-    after import), a replaced ``_data`` dict, or an ``environb``
-    sibling that no longer shares ``_data`` fails closed. Name
-    presence uses the native child-inherited environment, never this
-    cache and never ``posix.environ`` / ``nt.environ``.
+    singleton and that its ``_data`` object is still the captured
+    dict. POSIX also requires that dict ``is`` the live
+    ``posix.environ`` mapping — a pre-import ``environ``+``environb``
+    pair sharing a fresh dict is not that mapping. Windows requires
+    ``environb`` stay absent; ``GetEnvironmentVariableW`` remains the
+    sole presence authority. Name presence never reads this cache and
+    never consults ``posix.environ`` / ``nt.environ`` as an oracle.
     """
     environ = _CAPTURED_OS_ENVIRON
     environ_type = _CAPTURED_OS_ENVIRON_TYPE
@@ -425,6 +482,9 @@ def _process_environ_dict() -> dict | None:
         return None
     if type(captured) is not dict:
         return None
+    platform = _sys_platform()
+    if platform is None:
+        return None
     module_storage = _module_storage(_stdlib_os_module())
     if module_storage is None:
         return None
@@ -437,15 +497,26 @@ def _process_environ_dict() -> dict | None:
     current_data = _environ_data_from_instance(current, environ_type, descriptor)
     if current_data is _MISSING or current_data is not captured:
         return None
-    if environb is not None:
-        if type(environb) is not environ_type:
+    if str.__eq__(platform, "win32"):
+        if environb is not None:
             return None
         current_b = _exact_str_dict_value(module_storage, "environb")
-        if current_b is _MISSING or current_b is not environb:
+        if current_b is not _MISSING:
             return None
-        sibling = _environ_data_from_instance(environb, environ_type, descriptor)
-        if sibling is _MISSING or sibling is not captured:
-            return None
+        return captured
+    posix_environ = _posix_process_environ_mapping()
+    if posix_environ is None or captured is not posix_environ:
+        return None
+    if data is not posix_environ or current_data is not posix_environ:
+        return None
+    if environb is None or type(environb) is not environ_type:
+        return None
+    current_b = _exact_str_dict_value(module_storage, "environb")
+    if current_b is _MISSING or current_b is not environb:
+        return None
+    sibling = _environ_data_from_instance(environb, environ_type, descriptor)
+    if sibling is _MISSING or sibling is not posix_environ:
+        return None
     return captured
 
 
