@@ -405,6 +405,51 @@ def _evil_dict_descriptor(probes):
     return EvilDictDesc()
 
 
+class _RecordingDataDescriptor:
+    """Data descriptor that records get/set/eq/hash and can fake a seam value."""
+
+    def __init__(self, probes, label, value):
+        self.probes = probes
+        self.label = label
+        self.value = value
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self
+        self.probes.append(f"{self.label}.__get__")
+        return self.value
+
+    def __set__(self, obj, value):
+        self.probes.append(f"{self.label}.__set__")
+        raise AssertionError(f"{self.label}.__set__ must not run")
+
+    def __eq__(self, other):
+        self.probes.append(f"{self.label}.__eq__")
+        raise AssertionError(f"{self.label}.__eq__ must not run")
+
+    def __hash__(self):
+        self.probes.append(f"{self.label}.__hash__")
+        raise AssertionError(f"{self.label}.__hash__ must not run")
+
+
+def _drop_instance_name(obj, name):
+    storage = object.__getattribute__(obj, "__dict__")
+    if type(storage) is dict and dict.__contains__(storage, name):
+        dict.__delitem__(storage, name)
+    return storage
+
+
+def _genuine_os_environ_replacement(data=None):
+    old = os.environ
+    encodekey = object.__getattribute__(old, "encodekey")
+    decodekey = object.__getattribute__(old, "decodekey")
+    encodevalue = object.__getattribute__(old, "encodevalue")
+    decodevalue = object.__getattribute__(old, "decodevalue")
+    if data is None:
+        data = {}
+    return os._Environ(data, encodekey, decodekey, encodevalue, decodevalue), old
+
+
 def _make_runner(tmp_path: Path, runner_cls=None):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
@@ -1261,3 +1306,163 @@ def test_startup_rejects_str_subclass_secret_ref_without_hooks(tmp_path, monkeyp
     assert getattr(runner, "_durable_job_lane", None) is None
     assert probes == []
     assert calls == []
+
+
+def test_startup_rejects_transport_secret_ref_data_descriptor(tmp_path, monkeypatch):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    probes: list = []
+    calls: list = []
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    cursor = CursorCloudInjectedTransport(
+        request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+    )
+    slack = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+    )
+    _drop_instance_name(cursor, "_secret_ref")
+    type.__setattr__(
+        CursorCloudInjectedTransport,
+        "_secret_ref",
+        _RecordingDataDescriptor(probes, "secret_ref", "CURSOR_API_KEY"),
+    )
+    try:
+        storage = object.__getattribute__(runner, "__dict__")
+        storage["_durable_job_runtime_identity"] = _matching_identity()
+        storage["_durable_job_cursor_transport"] = cursor
+        storage["_durable_job_slack_transport"] = slack
+        runner._maybe_attach_durable_job_lane()
+        assert getattr(runner, "_durable_job_lane", None) is None
+        assert probes == []
+        assert calls == []
+    finally:
+        type.__delattr__(CursorCloudInjectedTransport, "_secret_ref")
+
+
+def test_startup_transport_colliding_instance_dict_key_hooks_are_not_executed(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+
+    probes: list = []
+    calls: list = []
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    cursor = CursorCloudInjectedTransport(
+        request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+    )
+    slack = SlackInjectedTransport(
+        request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+    )
+    storage = _drop_instance_name(cursor, "_secret_ref")
+    key = _ArmedCollidingKey("_secret_ref", probes, "transport_key")
+    dict.__setitem__(storage, key, "CURSOR_API_KEY")
+    key.arm()
+    runner_storage = object.__getattribute__(runner, "__dict__")
+    runner_storage["_durable_job_runtime_identity"] = _matching_identity()
+    runner_storage["_durable_job_cursor_transport"] = cursor
+    runner_storage["_durable_job_slack_transport"] = slack
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert probes == []
+    assert calls == []
+
+
+def test_startup_win32_envvar_not_found_is_not_overridden_by_stale_wgetenv(
+    tmp_path, monkeypatch
+):
+    import agent.durable_jobs.preflight as preflight
+
+    calls: list = []
+
+    def get_var(name, buf, size):
+        calls.append(("get_var", name, buf, size))
+        return 0
+
+    def wgetenv(name):
+        calls.append(("wgetenv", name))
+        return 0x1234
+
+    class _Ctypes:
+        def get_last_error(self):
+            calls.append("get_last_error")
+            return 203
+
+    monkeypatch.setattr(
+        preflight,
+        "_NATIVE_ENV_NAME_PROBE",
+        ("win32", get_var, wgetenv, _Ctypes()),
+    )
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    provider_calls: list = []
+    _install_request_ports(
+        runner, _idle_request(provider_calls), _idle_request(provider_calls)
+    )
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert ("wgetenv", "CURSOR_API_KEY") not in calls
+    assert ("wgetenv", "SLACK_BOT_TOKEN") not in calls
+    assert provider_calls == []
+    for item in calls:
+        if type(item) is tuple and tuple.__len__(item) == 4:
+            assert tuple.__getitem__(item, 2) is None
+            assert tuple.__getitem__(item, 3) == 0
+
+
+def test_startup_postimport_genuine_os_environ_replacement_fails_closed(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.production_binding import production_attach_kwargs
+
+    calls: list = []
+    _, runner = _prepare_startup(tmp_path, monkeypatch)
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    original = os.environ
+    original_storage = object.__getattribute__(original, "__dict__")
+    original_data = dict.__getitem__(original_storage, "_data")
+    replacement, _ = _genuine_os_environ_replacement(original_data)
+    assert replacement is not original
+    os.environ = replacement
+    try:
+        assert production_attach_kwargs(owner=runner) == {}
+        runner._maybe_attach_durable_job_lane()
+        assert getattr(runner, "_durable_job_lane", None) is None
+        assert calls == []
+    finally:
+        os.environ = original
+
+
+def test_startup_preimport_genuine_os_environ_replacement_fails_closed():
+    script = """
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+new_data = {}
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+os.environ = new
+del old
+from agent.durable_jobs.preflight import _process_environ_dict, _secret_ref_present
+data = _process_environ_dict()
+present = _secret_ref_present("HERMES_ENG50_V7_GENUINE")
+sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
+sys.stdout.write(" present=" + ("1" if present else "0"))
+sys.stdout.write(" none=" + ("1" if data is None else "0"))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "accepted=0 present=0 none=1"
