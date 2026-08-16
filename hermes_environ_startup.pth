@@ -1,0 +1,1 @@
+import sys; _r=next((str(__import__("pathlib").Path(m.MAPPING["hermes_cli"]).parent) for m in sys.modules.values() if getattr(m,"MAPPING",None) and "hermes_cli" in getattr(m,"MAPPING",{})), ""); _r and _r not in sys.path and sys.path.insert(0,_r); import hermes_environ_startup; hermes_environ_startup.remember_process_origin()

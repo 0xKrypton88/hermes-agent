@@ -25,9 +25,32 @@ use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
 """
 
 import os
+import site
+from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.sdist import sdist
+
+
+def _install_environ_startup_pth() -> None:
+    """Copy the process-origin .pth into this install's site-packages."""
+    src = Path(__file__).resolve().parent / "hermes_environ_startup.pth"
+    if not src.is_file():
+        return
+    try:
+        text = src.read_text(encoding="utf-8")
+    except OSError:
+        return
+    try:
+        destinations = list(site.getsitepackages())
+    except Exception:
+        return
+    for dest_dir in destinations:
+        dest = Path(dest_dir) / "hermes_environ_startup.pth"
+        try:
+            dest.write_text(text, encoding="utf-8")
+        except OSError:
+            continue
 
 _IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
 
@@ -71,4 +94,5 @@ try:
 except ImportError:
     pass
 
+_install_environ_startup_pth()
 setup(cmdclass=cmdclass)

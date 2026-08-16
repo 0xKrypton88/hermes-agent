@@ -35,11 +35,13 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Pin the genuine process environ before any test imports durable-job
-# preflight. Importing the startup module does not capture; the explicit
-# call must happen while os.environ is still original.
+# Remember the genuine process environ, then pin it, before any test
+# imports durable-job preflight. Importing the startup module does not
+# remember or capture; both explicit calls must happen while os.environ
+# is still original. A site .pth may already have remembered origin.
 import hermes_environ_startup as _hermes_environ_startup  # noqa: E402
 
+_hermes_environ_startup.remember_process_origin()
 _hermes_environ_startup.capture_trusted_startup()
 
 
