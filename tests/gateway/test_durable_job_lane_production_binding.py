@@ -323,6 +323,17 @@ def _hide_ambient_environ_startup_pths():
                 parked.replace(path)
 
 
+def _child_env_with_worktree_startup(repo: Path) -> dict[str, str]:
+    """Make worktree ``sitecustomize`` importable during ``site.main()``."""
+    env = os.environ.copy()
+    repo_s = str(repo)
+    prior = env.get("PYTHONPATH", "")
+    parts = [part for part in prior.split(os.pathsep) if part and part != repo_s]
+    env["PYTHONPATH"] = os.pathsep.join([repo_s, *parts]) if parts else repo_s
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
 def _child_inherits_env_name(name: str) -> bool:
     if type(name) is not str:
         raise AssertionError("name must be an exact str")
@@ -2101,12 +2112,14 @@ def _assert_copied_data_entry_rejected(
         posix_triple=posix_triple,
         early_imports=early_imports,
     )
+    repo = _repo_root()
     with _hide_ambient_environ_startup_pths():
         result = subprocess.run(
-            [sys.executable, "-c", script, str(_repo_root())],
+            [sys.executable, "-c", script, str(repo)],
             check=False,
             capture_output=True,
             text=True,
+            env=_child_env_with_worktree_startup(repo),
         )
     assert result.returncode == 0, result.stderr
     native = "0" if win32 and sys.platform != "win32" else "1"

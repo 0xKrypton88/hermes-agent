@@ -22,35 +22,50 @@ Hermes package derivation, so only that build may create an artifact.
 Editable installs (``uv sync``, ``pip install -e .``, ``nix develop``)
 use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
 ``build_ext`` in editable mode. So the guard does not affect development.
+
+Importing this module does not write into ``site.getsitepackages()``.
+The process-origin ``.pth`` is copied only by install/build commands
+into that command's destination (build lib, install_lib, or the
+editable unpacked wheel), never into every ambient site directory.
 """
 
 import os
-import site
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.install_lib import install_lib as _install_lib
 from setuptools.command.sdist import sdist
 
+_PTH_NAME = "hermes_environ_startup.pth"
 
-def _install_environ_startup_pth() -> None:
-    """Copy the process-origin .pth into this install's site-packages."""
-    src = Path(__file__).resolve().parent / "hermes_environ_startup.pth"
+
+def _environ_startup_pth_src() -> Path:
+    return Path(__file__).resolve().parent / _PTH_NAME
+
+
+def _copy_environ_startup_pth(dest_dir: str | None, copy_file) -> None:
+    """Copy the origin ``.pth`` into one install/build destination."""
+    if not dest_dir:
+        return
+    src = _environ_startup_pth_src()
     if not src.is_file():
         return
-    try:
-        text = src.read_text(encoding="utf-8")
-    except OSError:
-        return
-    try:
-        destinations = list(site.getsitepackages())
-    except Exception:
-        return
-    for dest_dir in destinations:
-        dest = Path(dest_dir) / "hermes_environ_startup.pth"
-        try:
-            dest.write_text(text, encoding="utf-8")
-        except OSError:
-            continue
+    dest = str(Path(dest_dir) / _PTH_NAME)
+    copy_file(str(src), dest)
+
+
+class _BuildPyWithEnvironPth(_build_py):
+    def run(self, *args, **kwargs):
+        super().run(*args, **kwargs)
+        _copy_environ_startup_pth(getattr(self, "build_lib", None), self.copy_file)
+
+
+class _InstallLibWithEnvironPth(_install_lib):
+    def run(self, *args, **kwargs):
+        super().run(*args, **kwargs)
+        _copy_environ_startup_pth(getattr(self, "install_dir", None), self.copy_file)
+
 
 _IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
 
@@ -74,7 +89,11 @@ class _GuardedSdist(sdist):
         return super().run(*args, **kwargs)
 
 
-cmdclass = {"sdist": _GuardedSdist}
+cmdclass = {
+    "sdist": _GuardedSdist,
+    "build_py": _BuildPyWithEnvironPth,
+    "install_lib": _InstallLibWithEnvironPth,
+}
 
 # bdist_wheel is only available when the `wheel` package is installed.
 # setuptools.build_meta.build_wheel() calls it internally, so the guard
@@ -94,5 +113,25 @@ try:
 except ImportError:
     pass
 
-_install_environ_startup_pth()
+try:
+    from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
+
+    class _EditableWheelWithEnvironPth(_editable_wheel):
+        def _configure_build(self, name, unpacked_wheel, build_lib, tmp_dir):
+            super()._configure_build(name, unpacked_wheel, build_lib, tmp_dir)
+            src = _environ_startup_pth_src()
+            if not src.is_file():
+                return
+            text = src.read_text(encoding="utf-8")
+            for dest_dir in (unpacked_wheel, build_lib):
+                if not dest_dir:
+                    continue
+                dest = Path(dest_dir) / _PTH_NAME
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(text, encoding="utf-8")
+
+    cmdclass["editable_wheel"] = _EditableWheelWithEnvironPth
+except ImportError:
+    pass
+
 setup(cmdclass=cmdclass)

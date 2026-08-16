@@ -373,6 +373,35 @@ def _hide_ambient_environ_startup_pths():
                 parked.replace(path)
 
 
+def _child_env_with_worktree_startup(repo: Path) -> dict[str, str]:
+    """Make worktree ``sitecustomize`` importable during ``site.main()``.
+
+    ``python -c`` drops cwd from ``sys.path`` before sitecustomize runs.
+    Putting the checkout on ``PYTHONPATH`` is not a remember/capture call.
+    """
+    env = os.environ.copy()
+    repo_s = str(repo)
+    prior = env.get("PYTHONPATH", "")
+    parts = [part for part in prior.split(os.pathsep) if part and part != repo_s]
+    env["PYTHONPATH"] = os.pathsep.join([repo_s, *parts]) if parts else repo_s
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
+def _child_env_without_startup_hooks(repo: Path) -> dict[str, str]:
+    """Hide worktree sitecustomize and PYTHONSTARTUP from a child process."""
+    env = os.environ.copy()
+    repo_s = str(repo)
+    prior = env.get("PYTHONPATH", "")
+    parts = [part for part in prior.split(os.pathsep) if part and part != repo_s]
+    if parts:
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    else:
+        env.pop("PYTHONPATH", None)
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
 def _child_inherits_env_name(name: str) -> bool:
     """Return whether a child process inherits this environment *name*."""
     if type(name) is not str:
@@ -2409,12 +2438,115 @@ try:
 finally:
     shutil.rmtree(home, ignore_errors=True)
 """
+    repo = _repo_root()
     with _hide_ambient_environ_startup_pths():
         result = subprocess.run(
-            [sys.executable, "-c", script, str(_repo_root())],
+            [sys.executable, "-c", script, str(repo)],
             check=False,
             capture_output=True,
             text=True,
+            env=_child_env_with_worktree_startup(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trusted=1 accepted=1"
+
+
+def test_cli_entry_fail_closed_without_startup_hook(tmp_path):
+    script = r"""
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+home = tempfile.mkdtemp()
+os.environ["HERMES_HOME"] = home
+try:
+    import hermes_cli.main
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import _process_environ_dict
+    ready = hermes_environ_startup.trusted_startup_ready()
+    data = _process_environ_dict()
+    sys.stdout.write("trusted=" + ("1" if ready else "0"))
+    sys.stdout.write(" accepted=" + ("1" if data is not None else "0"))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trusted=0 accepted=0"
+
+
+def test_worktree_sitecustomize_remembers_without_pinning():
+    script = r"""
+import sys
+import hermes_environ_startup as startup
+ready_before = startup.trusted_startup_ready()
+captured = startup.capture_trusted_startup()
+ready_after = startup.trusted_startup_ready()
+sys.stdout.write("before=" + ("1" if ready_before else "0"))
+sys.stdout.write(" captured=" + ("1" if captured else "0"))
+sys.stdout.write(" after=" + ("1" if ready_after else "0"))
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_with_worktree_startup(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "before=0 captured=1 after=1"
+
+
+def test_installed_pth_enables_cli_capture_without_ambient_site_pth(tmp_path):
+    site_dir = tmp_path / "site"
+    site_dir.mkdir()
+    src = _repo_root() / "hermes_environ_startup.pth"
+    (site_dir / "hermes_environ_startup.pth").write_text(
+        src.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    script = r"""
+import os
+import shutil
+import site
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+site.addsitedir(sys.argv[2])
+home = tempfile.mkdtemp()
+os.environ["HERMES_HOME"] = home
+try:
+    import hermes_cli.main
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import _process_environ_dict
+    ready = hermes_environ_startup.trusted_startup_ready()
+    data = _process_environ_dict()
+    sys.stdout.write("trusted=" + ("1" if ready else "0"))
+    sys.stdout.write(" accepted=" + ("1" if data is not None else "0"))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(repo), str(site_dir)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+            env=_child_env_without_startup_hooks(repo),
         )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "trusted=1 accepted=1"
@@ -2450,6 +2582,46 @@ sys.stdout.write("wrote=" + ("1" if wrote else "0"))
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "wrote=0"
+
+
+def test_setup_copy_writes_only_to_command_destination(tmp_path):
+    script = r"""
+import importlib.util
+import shutil
+import site
+import sys
+from pathlib import Path
+dest = Path(sys.argv[1])
+ambient = Path(sys.argv[2])
+root = Path(sys.argv[3])
+site.getsitepackages = lambda: [str(ambient)]
+import setuptools
+setuptools.setup = lambda *a, **k: None
+spec = importlib.util.spec_from_file_location(
+    "hermes_setup_under_test",
+    root / "setup.py",
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod._copy_environ_startup_pth(None, shutil.copy)
+mod._copy_environ_startup_pth(str(dest), shutil.copy)
+wrote_dest = (dest / "hermes_environ_startup.pth").is_file()
+wrote_ambient = (ambient / "hermes_environ_startup.pth").is_file()
+sys.stdout.write("dest=" + ("1" if wrote_dest else "0"))
+sys.stdout.write(" ambient=" + ("1" if wrote_ambient else "0"))
+"""
+    dest = tmp_path / "dest"
+    ambient = tmp_path / "ambient"
+    dest.mkdir()
+    ambient.mkdir()
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(dest), str(ambient), str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "dest=1 ambient=0"
 
 
 _COPIED_DATA_ENTRY_REPORT = """
@@ -2551,12 +2723,14 @@ finally:
 
 def _assert_copied_data_entry_rejected(body: str, *, win32: bool, posix_triple: bool) -> None:
     script = _copied_data_entry_script(body, win32=win32, posix_triple=posix_triple)
+    repo = _repo_root()
     with _hide_ambient_environ_startup_pths():
         result = subprocess.run(
-            [sys.executable, "-c", script, str(_repo_root())],
+            [sys.executable, "-c", script, str(repo)],
             check=False,
             capture_output=True,
             text=True,
+            env=_child_env_with_worktree_startup(repo),
         )
     assert result.returncode == 0, result.stderr
     # Fail-closed: the copied mapping must not become the process dict or

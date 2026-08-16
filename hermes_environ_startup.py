@@ -1,10 +1,13 @@
 """Trusted process-environment witness captured at Hermes entry.
 
-Importing this module does not remember or pin anything. A site ``.pth``
-hook calls ``remember_process_origin()`` at interpreter start, before
-user code or plugins can replace ``os.environ``. Real process entry
-points then call ``capture_trusted_startup()`` before loading plugins or
-durable-job preflight.
+Importing this module does not remember or pin anything. Interpreter
+start records origin via a source-checkout ``sitecustomize`` (when the
+checkout is on ``PYTHONPATH`` during ``site.main()``) and, when
+installed, a site ``.pth`` copied only into that install's destination.
+Both call ``remember_process_origin()`` before user code or plugins can
+replace ``os.environ``. Real process entry points then call
+``capture_trusted_startup()`` before loading plugins or durable-job
+preflight.
 
 Capture succeeds only when the current mappings are still the objects
 recorded as process origin. A pre-import exact ``os._Environ`` whose
