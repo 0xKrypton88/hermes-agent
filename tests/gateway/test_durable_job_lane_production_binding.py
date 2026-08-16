@@ -1946,3 +1946,154 @@ finally:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "trusted=0"
+
+
+_COPIED_DATA_ENTRY_REPORT = """
+    import hermes_environ_startup
+    from agent.durable_jobs.preflight import (
+        _native_env_name_present,
+        _process_environ_dict,
+        _secret_ref_present,
+        _trusted_startup_pins,
+    )
+    ready = hermes_environ_startup.trusted_startup_ready()
+    pins_ready, env, _posix = _trusted_startup_pins()
+    data = _process_environ_dict()
+    present = _secret_ref_present("CURSOR_API_KEY")
+    native = _native_env_name_present("CURSOR_API_KEY")
+    sys.stdout.write("accepted=" + ("1" if data is new_data else "0"))
+    sys.stdout.write(" present=" + ("1" if present else "0"))
+    sys.stdout.write(" env_is_new=" + ("1" if env is new else "0"))
+    sys.stdout.write(" none=" + ("1" if data is None else "0"))
+    sys.stdout.write(" native=" + ("1" if native else "0"))
+    sys.stdout.write(" ready=" + ("1" if ready or pins_ready else "0"))
+"""
+
+
+def _copied_data_entry_script(
+    body: str,
+    *,
+    win32: bool,
+    posix_triple: bool,
+    early_imports: str = "",
+) -> str:
+    """Pre-import exact ``os._Environ`` whose ``_data`` is a mapping copy.
+
+    Seeds only synthetic home/temp names from a tempfile so Windows
+    ``Path.home()`` works. Does not read, log, or compare secret values.
+    ``os.putenv`` installs ``CURSOR_API_KEY`` so native presence is not
+    vacuous. Host imports that crash under a ``win32`` spoof run first.
+    """
+    if win32 and posix_triple:
+        raise AssertionError("win32 copied-_data and posix triple-rebind are distinct cases")
+    prelude = """
+import asyncio
+import os
+import shutil
+import sys
+import tempfile
+sys.path.insert(0, sys.argv[1])
+import hermes_logging
+"""
+    if posix_triple:
+        prelude += "import posix\n"
+    prelude += early_imports
+    setup = """
+home = tempfile.mkdtemp()
+old = os.environ
+encodekey = object.__getattribute__(old, "encodekey")
+decodekey = object.__getattribute__(old, "decodekey")
+encodevalue = object.__getattribute__(old, "encodevalue")
+decodevalue = object.__getattribute__(old, "decodevalue")
+old_storage = object.__getattribute__(old, "__dict__")
+old_data = dict.__getitem__(old_storage, "_data")
+new_data = dict.copy(old_data)
+for _home_name in (
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HERMES_HOME",
+):
+    dict.__setitem__(new_data, encodekey(_home_name), encodevalue(home))
+new = os._Environ(new_data, encodekey, decodekey, encodevalue, decodevalue)
+os.environ = new
+"""
+    if posix_triple:
+        setup += """
+old_b = object.__getattribute__(os, "environb")
+b_encodekey = object.__getattribute__(old_b, "encodekey")
+b_decodekey = object.__getattribute__(old_b, "decodekey")
+b_encodevalue = object.__getattribute__(old_b, "encodevalue")
+b_decodevalue = object.__getattribute__(old_b, "decodevalue")
+new_b = os._Environ(new_data, b_encodekey, b_decodekey, b_encodevalue, b_decodevalue)
+os.environb = new_b
+posix.environ = new_data
+"""
+    setup += "del old\n"
+    if win32:
+        setup += """
+try:
+    object.__delattr__(os, "environb")
+except AttributeError:
+    pass
+object.__setattr__(sys, "platform", "win32")
+"""
+    setup += """
+os.putenv("CURSOR_API_KEY", "1")
+os.putenv("SLACK_BOT_TOKEN", "1")
+try:
+"""
+    return prelude + setup + body + """
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+
+
+def _assert_copied_data_entry_rejected(
+    body: str,
+    *,
+    win32: bool,
+    posix_triple: bool,
+    early_imports: str = "",
+) -> None:
+    script = _copied_data_entry_script(
+        body,
+        win32=win32,
+        posix_triple=posix_triple,
+        early_imports=early_imports,
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_repo_root())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    native = "0" if win32 and sys.platform != "win32" else "1"
+    assert result.stdout.startswith(
+        f"accepted=0 present=0 env_is_new=0 none=1 native={native}"
+    ), (win32, posix_triple, result.stdout, result.stderr)
+
+
+def test_copied_data_win32_environ_rejected_for_gateway_preflight():
+    body = "    _capture_trusted_environ_startup()\n" + _COPIED_DATA_ENTRY_REPORT
+    _assert_copied_data_entry_rejected(
+        body,
+        win32=True,
+        posix_triple=False,
+        early_imports="from gateway.run import _capture_trusted_environ_startup\n",
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix.environ triple-rebind is POSIX-only")
+def test_copied_data_posix_triple_rebind_rejected_for_gateway_preflight():
+    body = "    _capture_trusted_environ_startup()\n" + _COPIED_DATA_ENTRY_REPORT
+    _assert_copied_data_entry_rejected(
+        body,
+        win32=False,
+        posix_triple=True,
+        early_imports="from gateway.run import _capture_trusted_environ_startup\n",
+    )
