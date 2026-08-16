@@ -12,9 +12,11 @@ No live Slack/Cursor/network. PostgreSQL is not imported.
 from __future__ import annotations
 
 import os
+import site
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -331,6 +333,44 @@ def _repo_root() -> Path:
         if (parent / "agent" / "durable_jobs" / "preflight.py").is_file():
             return parent
     raise AssertionError("repository root not found")
+
+
+@contextmanager
+def _hide_ambient_environ_startup_pths():
+    """Hide site-packages ``hermes_environ_startup.pth`` for a child process.
+
+    Proves startup provenance does not depend on a prior ``setup.py``
+    write into the ambient interpreter. Restores parked files afterwards.
+    """
+    hidden = []
+    destinations = []
+    try:
+        destinations.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user = site.getusersitepackages()
+        if user:
+            destinations.append(user)
+    except Exception:
+        pass
+    seen = set()
+    try:
+        for dest_dir in destinations:
+            if dest_dir in seen:
+                continue
+            seen.add(dest_dir)
+            path = Path(dest_dir) / "hermes_environ_startup.pth"
+            if not path.is_file():
+                continue
+            parked = path.with_name(path.name + ".hermes-hidden")
+            path.replace(parked)
+            hidden.append((path, parked))
+        yield
+    finally:
+        for path, parked in hidden:
+            if parked.is_file() and not path.exists():
+                parked.replace(path)
 
 
 def _child_inherits_env_name(name: str) -> bool:
@@ -2369,14 +2409,47 @@ try:
 finally:
     shutil.rmtree(home, ignore_errors=True)
 """
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(_repo_root())],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trusted=1 accepted=1"
+
+
+def test_setup_module_import_does_not_write_site_pth(tmp_path):
+    script = r"""
+import importlib.util
+import site
+import sys
+from pathlib import Path
+fake = Path(sys.argv[1])
+root = Path(sys.argv[2])
+site.getsitepackages = lambda: [str(fake)]
+import setuptools
+setuptools.setup = lambda *a, **k: None
+spec = importlib.util.spec_from_file_location(
+    "hermes_setup_under_test",
+    root / "setup.py",
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+wrote = (fake / "hermes_environ_startup.pth").is_file()
+sys.stdout.write("wrote=" + ("1" if wrote else "0"))
+"""
+    fake = tmp_path / "site-packages"
+    fake.mkdir()
     result = subprocess.run(
-        [sys.executable, "-c", script, str(_repo_root())],
+        [sys.executable, "-c", script, str(fake), str(_repo_root())],
         check=False,
         capture_output=True,
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "trusted=1 accepted=1"
+    assert result.stdout == "wrote=0"
 
 
 _COPIED_DATA_ENTRY_REPORT = """
@@ -2478,12 +2551,13 @@ finally:
 
 def _assert_copied_data_entry_rejected(body: str, *, win32: bool, posix_triple: bool) -> None:
     script = _copied_data_entry_script(body, win32=win32, posix_triple=posix_triple)
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(_repo_root())],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(_repo_root())],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     assert result.returncode == 0, result.stderr
     # Fail-closed: the copied mapping must not become the process dict or
     # the startup pin. ``present`` is gated on that dict. ``native`` proves

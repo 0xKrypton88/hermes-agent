@@ -12,9 +12,11 @@ No live Slack/Cursor/network. No Gateway adapter connect.
 from __future__ import annotations
 
 import os
+import site
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -285,6 +287,40 @@ def _repo_root() -> Path:
         if (parent / "agent" / "durable_jobs" / "preflight.py").is_file():
             return parent
     raise AssertionError("repository root not found")
+
+
+@contextmanager
+def _hide_ambient_environ_startup_pths():
+    """Hide site-packages ``hermes_environ_startup.pth`` for a child process."""
+    hidden = []
+    destinations = []
+    try:
+        destinations.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user = site.getusersitepackages()
+        if user:
+            destinations.append(user)
+    except Exception:
+        pass
+    seen = set()
+    try:
+        for dest_dir in destinations:
+            if dest_dir in seen:
+                continue
+            seen.add(dest_dir)
+            path = Path(dest_dir) / "hermes_environ_startup.pth"
+            if not path.is_file():
+                continue
+            parked = path.with_name(path.name + ".hermes-hidden")
+            path.replace(parked)
+            hidden.append((path, parked))
+        yield
+    finally:
+        for path, parked in hidden:
+            if parked.is_file() and not path.exists():
+                parked.replace(path)
 
 
 def _child_inherits_env_name(name: str) -> bool:
@@ -2065,12 +2101,13 @@ def _assert_copied_data_entry_rejected(
         posix_triple=posix_triple,
         early_imports=early_imports,
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(_repo_root())],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(_repo_root())],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     assert result.returncode == 0, result.stderr
     native = "0" if win32 and sys.platform != "win32" else "1"
     assert result.stdout.startswith(
