@@ -1222,7 +1222,15 @@ def recover_with_credential_pool(
         refresh_kwargs = {"api_key_hint": _api_key_hint}
         if _credential_id:
             refresh_kwargs["credential_id"] = _credential_id
-        refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        try:
+            refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        except OSError as exc:
+            _ra().logger.error(
+                "Credential refresh persistence failed (%s); preserving the "
+                "original provider error without fallback/rotation",
+                type(exc).__name__,
+            )
+            return False, has_retried_429
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry

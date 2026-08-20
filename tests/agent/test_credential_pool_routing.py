@@ -228,6 +228,21 @@ class TestPoolRotationCycle:
         assert has_retried is True
         agent._swap_credential.assert_not_called()
 
+    def test_refresh_persistence_failure_surfaces_provider_error(self):
+        """A locked auth store during refresh must not mask the upstream 401."""
+        agent, pool, _ = self._make_agent_with_pool(2)
+        pool.try_refresh_matching.side_effect = PermissionError(
+            "auth.json is locked"
+        )
+
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=401, has_retried_429=False
+        )
+
+        assert recovered is False
+        assert has_retried is False
+        agent._swap_credential.assert_not_called()
+
     def test_pool_exhaustion_returns_false(self):
         """When all credentials exhausted, recovery should return False."""
         agent, pool, _ = self._make_agent_with_pool(1)
@@ -368,6 +383,55 @@ class TestApiKeyHintRealPool:
         statuses = {e.id: e.last_status for e in pool._entries}
         assert statuses["cred-healthy"] == "exhausted"
         assert statuses["cred-failed"] in (None, "ok")
+
+    def test_rotation_persistence_failure_rolls_back_memory(self, tmp_path, monkeypatch):
+        """A failed auth-store write must not advance only the in-memory pool."""
+        import pytest
+
+        pool = self._seed_pool(tmp_path, monkeypatch)
+        selected = pool.select()
+        before_entries = list(pool._entries)
+        before_current_id = pool._current_id
+        before_streak = pool._unmatched_rotation_streak
+        monkeypatch.setattr(
+            pool,
+            "_persist",
+            MagicMock(side_effect=PermissionError("auth.json is locked")),
+        )
+
+        with pytest.raises(PermissionError, match="auth.json is locked"):
+            pool.mark_exhausted_and_rotate(
+                status_code=429,
+                error_context={"reason": "rate_limit_exceeded"},
+                api_key_hint=selected.runtime_api_key,
+            )
+
+        assert pool._entries == before_entries
+        assert pool._current_id == before_current_id
+        assert pool._unmatched_rotation_streak == before_streak
+
+    def test_refresh_persistence_failure_rolls_back_memory(self, tmp_path, monkeypatch):
+        """Refresh I/O failure must restore entries and selection atomically."""
+        import pytest
+        from dataclasses import replace
+
+        pool = self._seed_pool(tmp_path, monkeypatch)
+        selected = pool.select()
+        before_entries = list(pool._entries)
+        before_current_id = pool._current_id
+
+        def mutate_then_fail():
+            pool._entries[0] = replace(pool._entries[0], last_status="exhausted")
+            pool._current_id = pool._entries[1].id
+            raise PermissionError("auth.json is locked")
+
+        monkeypatch.setattr(pool, "_try_refresh_current_unlocked", mutate_then_fail)
+
+        with pytest.raises(PermissionError, match="auth.json is locked"):
+            pool.try_refresh_matching(api_key_hint=selected.runtime_api_key)
+
+        assert pool._entries == before_entries
+        assert pool._current_id == before_current_id
 
 
 # ---------------------------------------------------------------------------

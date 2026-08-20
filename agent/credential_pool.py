@@ -2028,7 +2028,49 @@ class CredentialPool:
             available, _pending = self._available_entries()
             return available[0] if available else None
 
+    def _run_recovery_transaction(self, operation):
+        """Roll back in-memory recovery state if durable persistence fails.
+
+        Rotation and forced refresh update immutable entry records before
+        writing auth.json.  If that write raises, retaining only the memory
+        mutation makes the running process disagree with durable state and can
+        rotate again on the next request.  Keep the whole recovery mutation
+        atomic from the caller's perspective.
+        """
+        with self._lock:
+            entries_before = list(self._entries)
+            current_id_before = self._current_id
+            unmatched_before = self._unmatched_rotation_streak
+            last_no_entries_log_before = self._last_no_entries_log_at
+            try:
+                return operation()
+            except OSError:
+                self._entries = entries_before
+                self._current_id = current_id_before
+                self._unmatched_rotation_streak = unmatched_before
+                self._last_no_entries_log_at = last_no_entries_log_before
+                raise
+
     def mark_exhausted_and_rotate(
+        self,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+        api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+        failure_reason: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        return self._run_recovery_transaction(
+            lambda: self._mark_exhausted_and_rotate_unlocked(
+                status_code=status_code,
+                error_context=error_context,
+                api_key_hint=api_key_hint,
+                credential_id=credential_id,
+                failure_reason=failure_reason,
+            )
+        )
+
+    def _mark_exhausted_and_rotate_unlocked(
         self,
         *,
         status_code: Optional[int],
@@ -2260,6 +2302,18 @@ class CredentialPool:
             return self._try_refresh_current_unlocked()
 
     def try_refresh_matching(
+        self,
+        api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        return self._run_recovery_transaction(
+            lambda: self._try_refresh_matching_unlocked(
+                api_key_hint=api_key_hint,
+                credential_id=credential_id,
+            )
+        )
+
+    def _try_refresh_matching_unlocked(
         self,
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
