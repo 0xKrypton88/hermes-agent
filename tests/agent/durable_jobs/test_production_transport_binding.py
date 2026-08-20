@@ -2326,6 +2326,7 @@ finally:
 def test_preimport_win32_late_constants_import_does_not_self_attest():
     script = r"""
 import os
+import shutil
 import sys
 sys.path.insert(0, sys.argv[1])
 

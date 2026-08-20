@@ -107,13 +107,22 @@ def _is_trusted_instance_dict_descriptor(descriptor: Any) -> bool:
 
 
 def _is_stdlib_os_environ_type(environ_type: Any) -> bool:
-    """True when ``environ_type`` is CPython's stdlib ``os._Environ``."""
+    """True when ``environ_type`` is CPython's stdlib ``os._Environ``.
+
+    Reads ``os.__file__`` from ``sys.modules['os']``, never from this
+    module's ``os`` global. Tests may replace ``preflight.os`` with a
+    proxy; that must not make a genuine ``_Environ`` look untrusted.
+    """
+    os_module = _stdlib_os_module()
+    storage = _module_storage(os_module)
+    if storage is None:
+        return False
+    os_file = _exact_str_dict_value(storage, "__file__")
+    if os_file is _MISSING or type(os_file) is not str:
+        return False
     try:
-        os_file = object.__getattribute__(os, "__file__")
         setitem = object.__getattribute__(environ_type, "__setitem__")
     except AttributeError:
-        return False
-    if type(os_file) is not str:
         return False
     if type(setitem) is not type(lambda: None):
         return False
@@ -264,29 +273,17 @@ def _read_trusted_startup_pins():
     return True, pinned_environ, pinned_posix
 
 
-# Sticky fail-closed after the first missing pin. Not the trust root:
-# a True result is always re-checked against the process-bound seal.
-_PIN_DENIED = []
-
-
 def _trusted_startup_pins():
     """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
 
     Provenance is a write-once seal on the genuine ``os.environ`` instance
     dict. Does not import ``hermes_environ_startup`` and does not call
     capture. A ``types.ModuleType`` injection or mutated module globals
-    is not provenance.
-
-    The first missing pin is sticky so a later ``sys.modules`` /
-    module-global mutation cannot take the result from false to true.
-    A cached True is never trusted on its own; ready still requires the
-    live process-bound seal.
+    is not provenance. Ready is re-checked against the live seal so a
+    mutable Python global cannot mint true on its own.
     """
-    if _PIN_DENIED:
-        return False, None, None
     result = _read_trusted_startup_pins()
     if result[0] is not True:
-        _PIN_DENIED.append(True)
         return False, None, None
     return result
 
