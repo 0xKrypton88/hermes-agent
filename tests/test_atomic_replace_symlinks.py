@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+import utils
 
 # Ensure the repo root is importable when running via `pytest tests/...`.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +71,83 @@ def test_atomic_replace_regular_file(tmp_path: Path) -> None:
     assert Path(returned) == target
     assert target.read_text(encoding="utf-8") == "fresh\n"
     assert not target.is_symlink()
+
+
+@pytest.mark.parametrize("winerror", [5, 32])
+def test_atomic_replace_retries_transient_windows_share_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    calls = 0
+    sleeps: list[float] = []
+    real_replace = os.replace
+
+    def flaky_replace(source: str, destination: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            error = PermissionError("temporarily locked")
+            error.winerror = winerror
+            raise error
+        real_replace(source, destination)
+
+    monkeypatch.setattr(utils.os, "replace", flaky_replace)
+    monkeypatch.setattr(utils.time, "sleep", sleeps.append)
+
+    atomic_replace(tmp, target)
+
+    assert calls == 3
+    assert sleeps == [0.05, 0.1]
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_atomic_replace_windows_retry_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    calls = 0
+    sleeps: list[float] = []
+
+    def always_locked(_source: str, _destination: str) -> None:
+        nonlocal calls
+        calls += 1
+        error = PermissionError("still locked")
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr(utils.os, "replace", always_locked)
+    monkeypatch.setattr(utils.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError, match="still locked"):
+        atomic_replace(tmp, target)
+
+    assert calls == 5
+    assert sleeps == [0.05, 0.1, 0.2, 0.4]
+
+
+def test_atomic_replace_does_not_retry_non_windows_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    calls = 0
+
+    def denied(_source: str, _destination: str) -> None:
+        nonlocal calls
+        calls += 1
+        raise PermissionError("not a transient Windows lock")
+
+    monkeypatch.setattr(utils.os, "replace", denied)
+
+    with pytest.raises(PermissionError, match="not a transient Windows lock"):
+        atomic_replace(tmp, target)
+
+    assert calls == 1
 
 
 

@@ -1037,7 +1037,20 @@ def recover_with_credential_pool(
         # ``effective_reason`` is resolved below; this closure runs after.
         if effective_reason is not None:
             kwargs["failure_reason"] = effective_reason.value
-        return pool.mark_exhausted_and_rotate(**kwargs)
+        try:
+            return pool.mark_exhausted_and_rotate(**kwargs)
+        except OSError as exc:
+            # Credential quarantine is a recovery side effect.  A transient or
+            # persistent auth-store write failure must not replace the original
+            # provider error with an unrelated gateway crash.  The pool mutates
+            # in memory before persistence, so fail closed for this turn and let
+            # the caller surface the upstream error instead of rotating again.
+            _ra().logger.warning(
+                "Credential rotation persistence failed (%s); surfacing the "
+                "original provider error without fallback/rotation",
+                type(exc).__name__,
+            )
+            return None
 
     effective_reason = classified_reason
     if effective_reason is None:

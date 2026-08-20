@@ -213,6 +213,21 @@ class TestPoolRotationCycle:
         pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None, api_key_hint="test-api-key", failure_reason="rate_limit")
         agent._swap_credential.assert_called_once_with(entries[1])
 
+    def test_rotation_persistence_failure_surfaces_provider_error(self):
+        """A locked auth store must not replace the upstream 429 with a crash."""
+        agent, pool, _ = self._make_agent_with_pool(2)
+        pool.mark_exhausted_and_rotate.side_effect = PermissionError(
+            "auth.json is locked"
+        )
+
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=429, has_retried_429=True
+        )
+
+        assert recovered is False
+        assert has_retried is True
+        agent._swap_credential.assert_not_called()
+
     def test_pool_exhaustion_returns_false(self):
         """When all credentials exhausted, recovery should return False."""
         agent, pool, _ = self._make_agent_with_pool(1)
