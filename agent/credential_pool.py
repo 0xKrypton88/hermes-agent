@@ -2298,8 +2298,7 @@ class CredentialPool:
                 self._active_leases[credential_id] = count - 1
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
-        with self._lock:
-            return self._try_refresh_current_unlocked()
+        return self._run_recovery_transaction(self._try_refresh_current_unlocked)
 
     def try_refresh_matching(
         self,

@@ -433,6 +433,28 @@ class TestApiKeyHintRealPool:
         assert pool._entries == before_entries
         assert pool._current_id == before_current_id
 
+    def test_current_refresh_persistence_failure_rolls_back_memory(
+        self, tmp_path, monkeypatch
+    ):
+        """Direct refresh users must get the same atomic rollback contract."""
+        import pytest
+
+        pool = self._seed_pool(tmp_path, monkeypatch)
+        pool.select()
+        before_entries = list(pool._entries)
+        before_current_id = pool._current_id
+        before_streak = pool._unmatched_rotation_streak
+        persist = MagicMock(side_effect=PermissionError("auth.json is locked"))
+        monkeypatch.setattr(pool, "_persist", persist)
+
+        with pytest.raises(PermissionError, match="auth.json is locked"):
+            pool.try_refresh_current()
+
+        persist.assert_called_once()
+        assert pool._entries == before_entries
+        assert pool._current_id == before_current_id
+        assert pool._unmatched_rotation_streak == before_streak
+
 
 # ---------------------------------------------------------------------------
 # 7. Failure attribution — mark the key that failed, not pool.current()
