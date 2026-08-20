@@ -198,6 +198,44 @@ def _seal_put(storage, name, payload) -> bool:
     return _seal_get(storage, name) is payload
 
 
+def _called_during_initial_site_bootstrap() -> bool:
+    """Return whether the caller runs inside CPython's initial ``site.main``.
+
+    ``remember_process_origin`` mints the process capability only from the
+    interpreter's startup path.  A later direct call, ``site.addsitedir`` call,
+    worker-thread call, or ``python -S`` process has no such frame chain and
+    therefore cannot self-attest.  Code executed from startup ``.pth`` files or
+    ``sitecustomize`` is part of the trusted installation boundary.
+    """
+    try:
+        frame = sys._getframe()
+    except (AttributeError, ValueError):
+        return False
+    found_site_main = False
+    while frame is not None:
+        try:
+            globals_dict = frame.f_globals
+            code = frame.f_code
+            module_name = dict.get(globals_dict, "__name__")
+            function_name = code.co_name
+        except Exception:
+            return False
+        if type(module_name) is not str or type(function_name) is not str:
+            return False
+        if str.__eq__(module_name, "__main__"):
+            return False
+        if str.__eq__(module_name, "site") and str.__eq__(function_name, "main"):
+            found_site_main = True
+        elif found_site_main and not (
+            str.__eq__(module_name, "site")
+            or str.__eq__(module_name, "importlib._bootstrap")
+            or str.__eq__(module_name, "_frozen_importlib")
+        ):
+            return False
+        frame = frame.f_back
+    return found_site_main
+
+
 def remember_process_origin() -> bool:
     """Record interpreter-original mapping identities. Does not pin.
 
@@ -220,6 +258,8 @@ def remember_process_origin() -> bool:
         _ORIGIN_RECORDED = True
         return True
     if _ORIGIN_RECORDED:
+        return False
+    if not _called_during_initial_site_bootstrap():
         return False
     _ORIGIN_RECORDED = True
     if environ is None or storage is None:

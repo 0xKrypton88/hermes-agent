@@ -2510,7 +2510,8 @@ sys.stdout.write(" after=" + ("1" if ready_after else "0"))
     assert result.stdout == "before=0 captured=1 after=1"
 
 
-def test_installed_pth_enables_cli_capture_without_ambient_site_pth(tmp_path):
+def test_late_installed_pth_addition_cannot_mint_startup_witness(tmp_path):
+    """Calling ``site.addsitedir`` from user code is not interpreter startup."""
     site_dir = tmp_path / "site"
     site_dir.mkdir()
     src = _repo_root() / "hermes_environ_startup.pth"
@@ -2550,7 +2551,7 @@ finally:
             env=_child_env_without_startup_hooks(repo),
         )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "trusted=1 accepted=1"
+    assert result.stdout == "trusted=0 accepted=0"
 
 
 def test_setup_module_import_does_not_write_site_pth(tmp_path):
@@ -2696,6 +2697,37 @@ sys.stdout.write(" readyfn=" + ("1" if real.trusted_startup_ready() else "0"))
         result.stdout
         == "initial=00 exact=00 complete=00 globals=00 readyfn=0"
     )
+
+
+def test_late_direct_bootstrap_calls_cannot_mint_witness_without_site_startup():
+    """A ``python -S`` process cannot promote a late direct call to trust."""
+    script = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import hermes_environ_startup as startup
+remembered = startup.remember_process_origin()
+captured = startup.capture_trusted_startup()
+ready = startup.trusted_startup_ready()
+from agent.durable_jobs.preflight import _trusted_startup_pins
+pins_ready = _trusted_startup_pins()[0]
+sys.stdout.write(
+    "remembered=" + ("1" if remembered else "0")
+    + " captured=" + ("1" if captured else "0")
+    + " ready=" + ("1" if ready else "0")
+    + " pins=" + ("1" if pins_ready else "0")
+)
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "remembered=0 captured=0 ready=0 pins=0"
 
 
 def test_plant_known_environ_seal_keys_before_import_cannot_mint_witness():
