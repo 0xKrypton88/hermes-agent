@@ -208,6 +208,16 @@ def _called_during_initial_site_bootstrap() -> bool:
     ``sitecustomize`` is part of the trusted installation boundary.
     """
     try:
+        flags = sys.flags
+        no_site = flags.no_site
+    except (AttributeError, TypeError):
+        return False
+    # ``python -S`` remains a no-site process even if user code later calls
+    # ``site.main()`` (including from ``atexit``).  Such a replay must never
+    # become indistinguishable from interpreter startup.
+    if type(no_site) is not int or no_site != 0:
+        return False
+    try:
         frame = sys._getframe()
     except (AttributeError, ValueError):
         return False

@@ -2510,23 +2510,87 @@ sys.stdout.write(" after=" + ("1" if ready_after else "0"))
     assert result.stdout == "before=0 captured=1 after=1"
 
 
+def test_shipped_pth_mints_witness_during_real_initial_site_main(tmp_path):
+    """The shipped .pth remains a positive, hermetic startup path."""
+    import venv
+
+    repo = _repo_root().resolve()
+    venv_dir = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False).create(venv_dir)
+    if os.name == "nt":
+        child_python = venv_dir / "Scripts" / "python.exe"
+        site_dir = venv_dir / "Lib" / "site-packages"
+    else:
+        child_python = venv_dir / "bin" / "python"
+        site_dir = (
+            venv_dir
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "hermes_test_mapping.py").write_text(
+        f"MAPPING = {{'hermes_cli': {str(repo / 'hermes_cli')!r}}}\n",
+        encoding="utf-8",
+    )
+    (site_dir / "00-hermes-test-editable.pth").write_text(
+        "import hermes_test_mapping\n",
+        encoding="utf-8",
+    )
+    (site_dir / "01-hermes-environ-startup.pth").write_text(
+        (repo / "hermes_environ_startup.pth").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    script = r"""
+import pathlib
+import sys
+import hermes_environ_startup as startup
+candidate = pathlib.Path(startup.__file__).resolve() == pathlib.Path(sys.argv[1]).resolve()
+captured = startup.capture_trusted_startup()
+ready = startup.trusted_startup_ready()
+sys.stdout.write("candidate=" + ("1" if candidate else "0"))
+sys.stdout.write(" captured=" + ("1" if captured else "0"))
+sys.stdout.write(" ready=" + ("1" if ready else "0"))
+"""
+    result = subprocess.run(
+        [str(child_python), "-c", script, str(repo / "hermes_environ_startup.py")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_child_env_without_startup_hooks(repo),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "candidate=1 captured=1 ready=1"
+
+
 def test_late_installed_pth_addition_cannot_mint_startup_witness(tmp_path):
     """Calling ``site.addsitedir`` from user code is not interpreter startup."""
     site_dir = tmp_path / "site"
     site_dir.mkdir()
     src = _repo_root() / "hermes_environ_startup.pth"
-    (site_dir / "hermes_environ_startup.pth").write_text(
-        src.read_text(encoding="utf-8"),
+    pth = site_dir / "hermes_environ_startup.pth"
+    pth.write_text(
+        src.read_text(encoding="utf-8")
+        + "import builtins,hermes_environ_startup; "
+        + "builtins.__hermes_late_pth_loaded__=hermes_environ_startup.__file__\n",
         encoding="utf-8",
     )
     script = r"""
+import builtins
 import os
+import pathlib
 import shutil
 import site
 import sys
 import tempfile
-sys.path.insert(0, sys.argv[1])
+repo = pathlib.Path(sys.argv[1]).resolve()
+# The shipped editable-install .pth discovers the project root through an
+# already-loaded module's MAPPING.  Supply that mapping explicitly so this
+# test cannot fall through to an unrelated ambient editable checkout.
+MAPPING = {"hermes_cli": str(repo / "hermes_cli")}
 site.addsitedir(sys.argv[2])
+loaded = getattr(builtins, "__hermes_late_pth_loaded__", "")
+candidate = pathlib.Path(loaded).resolve() == (repo / "hermes_environ_startup.py").resolve()
 home = tempfile.mkdtemp()
 os.environ["HERMES_HOME"] = home
 try:
@@ -2535,7 +2599,9 @@ try:
     from agent.durable_jobs.preflight import _process_environ_dict
     ready = hermes_environ_startup.trusted_startup_ready()
     data = _process_environ_dict()
-    sys.stdout.write("trusted=" + ("1" if ready else "0"))
+    sys.stdout.write("executed=" + ("1" if loaded else "0"))
+    sys.stdout.write(" candidate=" + ("1" if candidate else "0"))
+    sys.stdout.write(" trusted=" + ("1" if ready else "0"))
     sys.stdout.write(" accepted=" + ("1" if data is not None else "0"))
 finally:
     shutil.rmtree(home, ignore_errors=True)
@@ -2551,7 +2617,7 @@ finally:
             env=_child_env_without_startup_hooks(repo),
         )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "trusted=0 accepted=0"
+    assert result.stdout == "executed=1 candidate=1 trusted=0 accepted=0"
 
 
 def test_setup_module_import_does_not_write_site_pth(tmp_path):
@@ -2728,6 +2794,39 @@ sys.stdout.write(
         )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "remembered=0 captured=0 ready=0 pins=0"
+
+
+def test_python_s_atexit_site_main_replay_cannot_mint_startup_witness():
+    """A late ``site.main`` replay from ``atexit`` is not startup provenance."""
+    script = r"""
+import atexit
+import sys
+sys.path.insert(0, sys.argv[1])
+import site
+
+def report():
+    import hermes_environ_startup as startup
+    captured = startup.capture_trusted_startup()
+    ready = startup.trusted_startup_ready()
+    sys.stdout.write(
+        "captured=" + ("1" if captured else "0")
+        + " ready=" + ("1" if ready else "0")
+    )
+
+atexit.register(report)
+atexit.register(site.main)
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "captured=0 ready=0"
 
 
 def test_plant_known_environ_seal_keys_before_import_cannot_mint_witness():
