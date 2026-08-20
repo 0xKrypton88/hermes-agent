@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -88,6 +89,29 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+def _replace_with_windows_retry(tmp_path: str, target: str) -> None:
+    """Retry brief Windows access/share locks before failing the replace."""
+    retry_delays = (0.05, 0.1, 0.2, 0.4)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            os.replace(tmp_path, target)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror not in (5, 32) or attempt == len(retry_delays):
+                raise
+            delay = retry_delays[attempt]
+            logger.debug(
+                "atomic_replace: %s -> %s temporarily blocked by WinError %s; "
+                "retrying in %.2fs",
+                tmp_path,
+                target,
+                winerror,
+                delay,
+            )
+            time.sleep(delay)
+
+
 def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
@@ -112,7 +136,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
     try:
-        os.replace(tmp_str, real_path)
+        _replace_with_windows_retry(tmp_str, real_path)
     except OSError as exc:
         if exc.errno not in (errno.EXDEV, errno.EBUSY):
             raise
