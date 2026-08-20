@@ -22,13 +22,26 @@ create a pin; it only reads pins if a prior capture already succeeded.
 Identity only: never iterates environment keys and never reads or
 compares secret values.
 
-The process-bound trust root is a write-once seal on the genuine
-``os.environ`` instance dict. Module globals, ``sys.modules`` entries,
-and a later ``types.ModuleType`` injection are not provenance.
+Threat interval
+---------------
+Trust is a bootstrap-unique capability: ``remember_process_origin()``
+draws ``os.urandom(32)`` and HMAC-binds origin/pin payloads. Deterministic
+string keys on ``os.environ.__dict__`` are not provenance. A process
+without the install ``.pth`` / worktree ``sitecustomize`` / explicit
+remember call has no token, so planting known fields before a late
+import cannot mint ``trusted_startup_ready()``.
+
+This is not an immutable boundary against arbitrary Python mutation after
+a real remember() (rewriting this module's token and recomputing HMAC is
+equivalent to invoking bootstrap). Module globals, ``sys.modules``
+entries, and ``types.ModuleType`` injection are not a witness by
+themselves.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import sys
 
@@ -38,9 +51,13 @@ _ORIGIN_POSIX_ENVIRON = None
 _TRUSTED_CAPTURE_READY = False
 _PINNED_OS_ENVIRON = None
 _PINNED_POSIX_ENVIRON = None
+_BOOTSTRAP_TOKEN = None
 _MISSING = object()
 _ORIGIN_SEAL_ATTR = "__hermes_trusted_environ_origin__"
 _PIN_SEAL_ATTR = "__hermes_trusted_environ_pin__"
+_BOOTSTRAP_TOKEN_LEN = 32
+_ORIGIN_MAC_KIND = b"hermes-environ-origin-v1"
+_PIN_MAC_KIND = b"hermes-environ-pin-v1"
 
 
 def _current_os_environ():
@@ -88,8 +105,50 @@ def _environ_instance_storage(environ):
     return storage
 
 
+def _id_bytes(obj):
+    if obj is None:
+        return b"\x00" * 8
+    try:
+        return int.to_bytes(id(obj), 8, "little", signed=False)
+    except (OverflowError, TypeError):
+        return None
+
+
+def _identity_mac(token, kind, environ, posix):
+    """HMAC over mapping identities. Never hashes env keys or values."""
+    if type(token) is not bytes or bytes.__len__(token) != _BOOTSTRAP_TOKEN_LEN:
+        return None
+    if type(kind) is not bytes:
+        return None
+    env_b = _id_bytes(environ)
+    posix_b = _id_bytes(posix)
+    if env_b is None or posix_b is None:
+        return None
+    try:
+        return hmac.new(token, kind + b"\0" + env_b + posix_b, hashlib.sha256).digest()
+    except Exception:
+        return None
+
+
+def _valid_identity_seal(payload, token, kind, environ) -> bool:
+    if type(payload) is not tuple or tuple.__len__(payload) != 3:
+        return False
+    pinned_environ = tuple.__getitem__(payload, 0)
+    pinned_posix = tuple.__getitem__(payload, 1)
+    mac = tuple.__getitem__(payload, 2)
+    if pinned_environ is not environ:
+        return False
+    expected = _identity_mac(token, kind, pinned_environ, pinned_posix)
+    if expected is None or type(mac) is not bytes:
+        return False
+    try:
+        return hmac.compare_digest(mac, expected)
+    except Exception:
+        return False
+
+
 def _seal_get(storage, name):
-    """Return the ``(environ, posix)`` tuple stored under ``name``, or None.
+    """Return the seal tuple stored under ``name``, or None.
 
     Walks ``dict.items`` and matches an exact ``str`` key with ``str.__eq__``.
     """
@@ -113,7 +172,10 @@ def _seal_get(storage, name):
             found = value
     if found is _MISSING:
         return None
-    if type(found) is not tuple or tuple.__len__(found) != 2:
+    if type(found) is not tuple:
+        return None
+    n = tuple.__len__(found)
+    if n != 2 and n != 3:
         return None
     return found
 
@@ -122,7 +184,10 @@ def _seal_put(storage, name, payload) -> bool:
     """Write-once seal. Fails if ``name`` is already a key."""
     if type(storage) is not dict or type(name) is not str:
         return False
-    if type(payload) is not tuple or tuple.__len__(payload) != 2:
+    if type(payload) is not tuple:
+        return False
+    n = tuple.__len__(payload)
+    if n != 2 and n != 3:
         return False
     if _seal_get(storage, name) is not None:
         return False
@@ -136,28 +201,46 @@ def _seal_put(storage, name, payload) -> bool:
 def remember_process_origin() -> bool:
     """Record interpreter-original mapping identities. Does not pin.
 
-    First call wins. Intended for a site ``.pth`` hook at interpreter
-    start, while ``os.environ`` is still the process original. Importing
-    this module does not remember.
+    First successful call wins and is the only way to mint the
+    process-unique bootstrap token. Intended for a site ``.pth`` hook at
+    interpreter start, while ``os.environ`` is still the process original.
+    Importing this module does not remember. A pre-import plant of the
+    known origin/pin string keys is not origin.
     """
-    global _ORIGIN_RECORDED, _ORIGIN_OS_ENVIRON, _ORIGIN_POSIX_ENVIRON
+    global _BOOTSTRAP_TOKEN, _ORIGIN_RECORDED, _ORIGIN_OS_ENVIRON, _ORIGIN_POSIX_ENVIRON
     environ = _current_os_environ()
     storage = _environ_instance_storage(environ)
-    existing = _seal_get(storage, _ORIGIN_SEAL_ATTR)
-    if existing is not None:
+    token = _BOOTSTRAP_TOKEN
+    if type(token) is bytes and bytes.__len__(token) == _BOOTSTRAP_TOKEN_LEN:
+        existing = _seal_get(storage, _ORIGIN_SEAL_ATTR)
+        if not _valid_identity_seal(existing, token, _ORIGIN_MAC_KIND, environ):
+            return False
         _ORIGIN_OS_ENVIRON = existing[0]
         _ORIGIN_POSIX_ENVIRON = existing[1]
         _ORIGIN_RECORDED = True
-        return existing[0] is environ
+        return True
     if _ORIGIN_RECORDED:
         return False
-    posix = _current_posix_environ()
     _ORIGIN_RECORDED = True
     if environ is None or storage is None:
         return False
-    payload = (environ, posix)
+    existing = _seal_get(storage, _ORIGIN_SEAL_ATTR)
+    if existing is not None:
+        return False
+    try:
+        token = os.urandom(_BOOTSTRAP_TOKEN_LEN)
+    except Exception:
+        return False
+    if type(token) is not bytes or bytes.__len__(token) != _BOOTSTRAP_TOKEN_LEN:
+        return False
+    posix = _current_posix_environ()
+    mac = _identity_mac(token, _ORIGIN_MAC_KIND, environ, posix)
+    if mac is None:
+        return False
+    payload = (environ, posix, mac)
     if not _seal_put(storage, _ORIGIN_SEAL_ATTR, payload):
         return False
+    _BOOTSTRAP_TOKEN = token
     _ORIGIN_OS_ENVIRON = environ
     _ORIGIN_POSIX_ENVIRON = posix
     return True
@@ -179,25 +262,26 @@ def capture_trusted_startup() -> bool:
     the interpreter-original objects and the current mappings are still
     those objects. First successful call wins. A later call after a
     mapping replacement does not overwrite the pin. Importing this
-    module does not capture. Missing origin is not provenance.
+    module does not capture. Missing origin is not provenance. A
+    planted 2-tuple under the known pin key is not a pin.
     """
     global _TRUSTED_CAPTURE_READY, _PINNED_OS_ENVIRON, _PINNED_POSIX_ENVIRON
+    token = _BOOTSTRAP_TOKEN
     environ = _current_os_environ()
     storage = _environ_instance_storage(environ)
     existing_pin = _seal_get(storage, _PIN_SEAL_ATTR)
     if existing_pin is not None:
-        pinned_environ = existing_pin[0]
-        if pinned_environ is None or pinned_environ is not environ:
+        if not _valid_identity_seal(existing_pin, token, _PIN_MAC_KIND, environ):
             _TRUSTED_CAPTURE_READY = True
             return False
-        _PINNED_OS_ENVIRON = pinned_environ
+        _PINNED_OS_ENVIRON = existing_pin[0]
         _PINNED_POSIX_ENVIRON = existing_pin[1]
         _TRUSTED_CAPTURE_READY = True
         return True
     if _TRUSTED_CAPTURE_READY:
         return False
     origin = _seal_get(storage, _ORIGIN_SEAL_ATTR)
-    if origin is None or origin[0] is not environ:
+    if not _valid_identity_seal(origin, token, _ORIGIN_MAC_KIND, environ):
         return _fail_capture(storage)
     if environ is None or environ is not origin[0]:
         return _fail_capture(storage)
@@ -224,7 +308,10 @@ def capture_trusted_startup() -> bool:
             pass
         else:
             return _fail_capture(storage)
-        payload = (environ, None)
+        mac = _identity_mac(token, _PIN_MAC_KIND, environ, None)
+        if mac is None:
+            return _fail_capture(storage)
+        payload = (environ, None, mac)
         if not _seal_put(storage, _PIN_SEAL_ATTR, payload):
             return _fail_capture(storage)
         _PINNED_OS_ENVIRON = environ
@@ -253,7 +340,10 @@ def capture_trusted_startup() -> bool:
         return _fail_capture(storage)
     if sibling is not origin_posix:
         return _fail_capture(storage)
-    payload = (environ, origin_posix)
+    mac = _identity_mac(token, _PIN_MAC_KIND, environ, origin_posix)
+    if mac is None:
+        return _fail_capture(storage)
+    payload = (environ, origin_posix, mac)
     if not _seal_put(storage, _PIN_SEAL_ATTR, payload):
         return _fail_capture(storage)
     _PINNED_OS_ENVIRON = environ
@@ -263,10 +353,15 @@ def capture_trusted_startup() -> bool:
 
 
 def trusted_startup_ready() -> bool:
-    """True when a prior ``capture_trusted_startup()`` sealed ``os.environ``."""
+    """True when a prior ``capture_trusted_startup()`` sealed ``os.environ``.
+
+    Requires this process's remember() token. Planting known string keys
+    on ``os.environ.__dict__`` is not sufficient.
+    """
+    token = _BOOTSTRAP_TOKEN
+    if type(token) is not bytes or bytes.__len__(token) != _BOOTSTRAP_TOKEN_LEN:
+        return False
     environ = _current_os_environ()
     storage = _environ_instance_storage(environ)
     pin = _seal_get(storage, _PIN_SEAL_ATTR)
-    if pin is None:
-        return False
-    return pin[0] is environ
+    return _valid_identity_seal(pin, token, _PIN_MAC_KIND, environ)

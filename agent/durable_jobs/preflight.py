@@ -6,6 +6,8 @@ default path. Status never includes DSN, token, or other secret values.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import sys
 from dataclasses import dataclass
@@ -209,6 +211,104 @@ def _stdlib_os_module():
 
 
 _PIN_SEAL_ATTR = "__hermes_trusted_environ_pin__"
+_PIN_MAC_KIND = b"hermes-environ-pin-v1"
+_BOOTSTRAP_TOKEN_LEN = 32
+_STARTUP_MODULE_NAME = "hermes_environ_startup"
+
+
+def _id_bytes(obj):
+    if obj is None:
+        return b"\x00" * 8
+    try:
+        return int.to_bytes(id(obj), 8, "little", signed=False)
+    except (OverflowError, TypeError):
+        return None
+
+
+def _identity_mac(token, kind, environ, posix):
+    """HMAC over mapping identities. Never hashes env keys or values."""
+    if type(token) is not bytes or bytes.__len__(token) != _BOOTSTRAP_TOKEN_LEN:
+        return None
+    if type(kind) is not bytes:
+        return None
+    env_b = _id_bytes(environ)
+    posix_b = _id_bytes(posix)
+    if env_b is None or posix_b is None:
+        return None
+    try:
+        return hmac.new(token, kind + b"\0" + env_b + posix_b, hashlib.sha256).digest()
+    except Exception:
+        return None
+
+
+def _hermes_environ_startup_path():
+    try:
+        here = __file__
+    except NameError:
+        return None
+    if type(here) is not str:
+        return None
+    try:
+        durable = os.path.dirname(here)
+        agent = os.path.dirname(durable)
+        root = os.path.dirname(agent)
+        return os.path.join(root, "hermes_environ_startup.py")
+    except Exception:
+        return None
+
+
+def _same_realpath(left, right) -> bool:
+    if type(left) is not str or type(right) is not str:
+        return False
+    try:
+        return str.__eq__(os.path.realpath(left), os.path.realpath(right))
+    except Exception:
+        return False
+
+
+def _startup_bootstrap_token():
+    """Return the remember() token from the real startup module, or None.
+
+    Does not import ``hermes_environ_startup`` and does not call remember
+    or capture. A ``types.ModuleType`` injection without the real source
+    file's ``remember_process_origin`` code object is not a token.
+    """
+    expected = _hermes_environ_startup_path()
+    if expected is None:
+        return None
+    try:
+        modules = object.__getattribute__(sys, "modules")
+    except AttributeError:
+        return None
+    if type(modules) is not dict:
+        return None
+    module = _exact_str_dict_value(modules, _STARTUP_MODULE_NAME)
+    if module is _MISSING:
+        return None
+    if type(module) is not _MODULE_TYPE:
+        return None
+    storage = _module_storage(module)
+    if storage is None:
+        return None
+    file = _exact_str_dict_value(storage, "__file__")
+    if file is _MISSING or type(file) is not str:
+        return None
+    if not _same_realpath(file, expected):
+        return None
+    remember = _exact_str_dict_value(storage, "remember_process_origin")
+    if remember is _MISSING:
+        return None
+    try:
+        code = object.__getattribute__(remember, "__code__")
+        filename = object.__getattribute__(code, "co_filename")
+    except AttributeError:
+        return None
+    if type(filename) is not str or not _same_realpath(filename, expected):
+        return None
+    token = _exact_str_dict_value(storage, "_BOOTSTRAP_TOKEN")
+    if type(token) is not bytes or bytes.__len__(token) != _BOOTSTRAP_TOKEN_LEN:
+        return None
+    return token
 
 
 def _stdlib_os_environ_parts():
@@ -255,7 +355,10 @@ def _environ_instance_from_descriptor(environ, environ_type, descriptor):
 
 
 def _read_trusted_startup_pins():
-    """Live-read the process-bound pin seal. Not a mintable module global."""
+    """Live-read a MAC-bound pin. Known string keys are not provenance."""
+    token = _startup_bootstrap_token()
+    if token is None:
+        return False, None, None
     os_storage, environ, environ_type, descriptor, _data = _stdlib_os_environ_parts()
     _ = os_storage
     if environ is None:
@@ -264,11 +367,20 @@ def _read_trusted_startup_pins():
     if instance is None:
         return False, None, None
     payload = _exact_str_dict_value(instance, _PIN_SEAL_ATTR)
-    if payload is _MISSING or type(payload) is not tuple or tuple.__len__(payload) != 2:
+    if payload is _MISSING or type(payload) is not tuple or tuple.__len__(payload) != 3:
         return False, None, None
     pinned_environ = tuple.__getitem__(payload, 0)
     pinned_posix = tuple.__getitem__(payload, 1)
+    mac = tuple.__getitem__(payload, 2)
     if pinned_environ is not environ:
+        return False, None, None
+    expected = _identity_mac(token, _PIN_MAC_KIND, pinned_environ, pinned_posix)
+    if expected is None or type(mac) is not bytes:
+        return False, None, None
+    try:
+        if not hmac.compare_digest(mac, expected):
+            return False, None, None
+    except Exception:
         return False, None, None
     return True, pinned_environ, pinned_posix
 
@@ -276,11 +388,17 @@ def _read_trusted_startup_pins():
 def _trusted_startup_pins():
     """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
 
-    Provenance is a write-once seal on the genuine ``os.environ`` instance
-    dict. Does not import ``hermes_environ_startup`` and does not call
-    capture. A ``types.ModuleType`` injection or mutated module globals
-    is not provenance. Ready is re-checked against the live seal so a
-    mutable Python global cannot mint true on its own.
+    Provenance is a remember()-only bootstrap token plus an HMAC pin on
+    the genuine ``os.environ`` instance dict. Does not import
+    ``hermes_environ_startup`` and does not call capture. Planting the
+    known pin string key, a ``types.ModuleType`` injection, or mutated
+    module globals is not provenance.
+
+    Threat interval: before ``remember_process_origin()`` there is no
+    token, so a process without the install ``.pth`` / worktree
+    sitecustomize cannot mint trust. This is not a claim against
+    arbitrary mutation after a real remember() (recomputing HMAC with
+    the live token is equivalent to invoking bootstrap).
     """
     result = _read_trusted_startup_pins()
     if result[0] is not True:

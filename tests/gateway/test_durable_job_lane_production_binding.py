@@ -2126,6 +2126,36 @@ sys.stdout.write(" after=" + ("1" if ready1 or cap1[0] is not None else "0"))
     assert result.stdout == "before=0 after=0"
 
 
+def test_plant_known_environ_seal_keys_before_import_cannot_mint_witness():
+    """Planting known seal keys before import must not mint startup trust."""
+    script = r"""
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+os.environ.__dict__["__hermes_trusted_environ_pin__"] = (
+    os.environ,
+    os.environ.__dict__["_data"],
+)
+import hermes_environ_startup as h
+assert h.trusted_startup_ready() is False
+import agent.durable_jobs.preflight as p
+assert p._CAPTURED_OS_ENVIRON is None
+assert p._trusted_startup_pins()[0] is False
+sys.stdout.write("plant_before_import=0")
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "plant_before_import=0"
+
+
 _COPIED_DATA_ENTRY_REPORT = """
     import hermes_environ_startup
     from agent.durable_jobs.preflight import (
