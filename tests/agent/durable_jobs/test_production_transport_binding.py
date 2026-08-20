@@ -2624,6 +2624,79 @@ sys.stdout.write(" ambient=" + ("1" if wrote_ambient else "0"))
     assert result.stdout == "dest=1 ambient=0"
 
 
+def test_fake_moduletype_injection_cannot_mint_startup_witness():
+    """Post-startup ModuleType injection must not take pins false→true.
+
+    Exact repro: ``python -S`` child, observe false, inject
+    ``types.ModuleType("hermes_environ_startup")`` with mintable globals,
+    require ``_trusted_startup_pins`` and ``_capture_os_environ_boundary``
+    to stay false. A complete posix pin on the fake module also stays false.
+    Mutating the real module's globals after a failed capture stays false.
+    """
+    script = r"""
+import os
+import sys
+import types
+sys.path.insert(0, sys.argv[1])
+from agent.durable_jobs.preflight import (
+    _capture_os_environ_boundary,
+    _trusted_startup_pins,
+)
+
+def _fmt(ready, captured):
+    return (
+        ("1" if ready else "0")
+        + ("1" if captured[0] is not None else "0")
+    )
+
+ready0, env0, posix0 = _trusted_startup_pins()
+cap0 = _capture_os_environ_boundary()
+sys.stdout.write("initial=" + _fmt(ready0, cap0))
+
+fake = types.ModuleType("hermes_environ_startup")
+fake._TRUSTED_CAPTURE_READY = True
+fake._PINNED_OS_ENVIRON = os.environ
+fake._PINNED_POSIX_ENVIRON = None
+sys.modules["hermes_environ_startup"] = fake
+ready1, env1, posix1 = _trusted_startup_pins()
+cap1 = _capture_os_environ_boundary()
+sys.stdout.write(" exact=" + _fmt(ready1, cap1))
+
+try:
+    posix_map = object.__getattribute__(sys.modules["posix"], "environ")
+except (KeyError, AttributeError):
+    posix_map = None
+fake._PINNED_POSIX_ENVIRON = posix_map
+ready2, env2, posix2 = _trusted_startup_pins()
+cap2 = _capture_os_environ_boundary()
+sys.stdout.write(" complete=" + _fmt(ready2, cap2))
+
+sys.modules.pop("hermes_environ_startup", None)
+import hermes_environ_startup as real
+real._TRUSTED_CAPTURE_READY = True
+real._PINNED_OS_ENVIRON = os.environ
+real._PINNED_POSIX_ENVIRON = posix_map
+ready3, env3, posix3 = _trusted_startup_pins()
+cap3 = _capture_os_environ_boundary()
+sys.stdout.write(" globals=" + _fmt(ready3, cap3))
+sys.stdout.write(" readyfn=" + ("1" if real.trusted_startup_ready() else "0"))
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert (
+        result.stdout
+        == "initial=00 exact=00 complete=00 globals=00 readyfn=0"
+    )
+
+
 _COPIED_DATA_ENTRY_REPORT = """
     import hermes_environ_startup
     from agent.durable_jobs.preflight import (

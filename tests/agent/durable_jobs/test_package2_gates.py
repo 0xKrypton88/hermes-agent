@@ -232,7 +232,7 @@ def test_preflight_complete_sqlite_is_constructible_without_sockets(
 
     report = preflight_durable_jobs(_complete_sqlite(tmp_path))
     assert report.constructible is True
-    assert report.dispatch_allowed is True
+    assert report.dispatch_allowed is False
     assert report.runtime_ready is False
     assert report.secret_refs_present is False
     assert "secret_refs_missing" in report.reasons
@@ -255,6 +255,7 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
 
     missing_both = preflight_durable_jobs(raw)
     assert missing_both.constructible is True
+    assert missing_both.dispatch_allowed is False
     assert missing_both.runtime_ready is False
     assert missing_both.secret_refs_present is False
     assert "secret_refs_missing" in missing_both.reasons
@@ -262,6 +263,7 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
     monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
     missing_slack = preflight_durable_jobs(raw)
     assert missing_slack.constructible is True
+    assert missing_slack.dispatch_allowed is False
     assert missing_slack.runtime_ready is False
     assert missing_slack.secret_refs_present is False
     assert "secret_refs_missing" in missing_slack.reasons
@@ -272,6 +274,7 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     missing_cursor = preflight_durable_jobs(raw)
     assert missing_cursor.constructible is True
+    assert missing_cursor.dispatch_allowed is False
     assert missing_cursor.runtime_ready is False
     assert missing_cursor.secret_refs_present is False
     assert "secret_refs_missing" in missing_cursor.reasons
@@ -285,6 +288,7 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
     assert env_only.constructible is True
     assert env_only.secret_refs_present is True
     assert env_only.runtime_ready is False
+    assert env_only.dispatch_allowed is False
     assert "transport_capability_missing" in env_only.reasons
     dumped = str(env_only)
     assert CURSOR_TOKEN not in dumped
@@ -324,6 +328,7 @@ def test_preflight_runtime_ready_requires_injected_transport_capability(
     assert ready.secret_refs_present is True
     assert ready.transport_capability is True
     assert ready.runtime_ready is True
+    assert ready.dispatch_allowed is True
     assert "secret_refs_missing" not in ready.reasons
     assert "transport_capability_missing" not in ready.reasons
     dumped = str(ready)
@@ -336,6 +341,7 @@ def test_preflight_runtime_ready_requires_injected_transport_capability(
     )
     assert cursor_only.constructible is True
     assert cursor_only.runtime_ready is False
+    assert cursor_only.dispatch_allowed is False
     assert "transport_capability_missing" in cursor_only.reasons
 
 
@@ -369,6 +375,7 @@ def test_preflight_runtime_ready_requires_transport_secret_ref_binding(
     )
     assert mismatched.constructible is True
     assert mismatched.runtime_ready is False
+    assert mismatched.dispatch_allowed is False
     assert "transport_secret_ref_mismatch" in mismatched.reasons
     dumped = str(mismatched)
     assert CURSOR_TOKEN not in dumped
@@ -390,6 +397,7 @@ def test_preflight_runtime_ready_requires_transport_secret_ref_binding(
         ),
     )
     assert still_unbound.runtime_ready is False
+    assert still_unbound.dispatch_allowed is False
     assert "transport_secret_ref_mismatch" in still_unbound.reasons
     dumped = str(still_unbound)
     assert CURSOR_TOKEN not in dumped
@@ -397,6 +405,84 @@ def test_preflight_runtime_ready_requires_transport_secret_ref_binding(
     assert other_cursor not in dumped
     assert other_slack not in dumped
     assert "xoxb-" not in dumped
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_secrets",
+        "missing_transport",
+        "binding_mismatch",
+        "complete_runtime",
+    ),
+)
+def test_preflight_dispatch_allowed_matrix_requires_verified_runtime(
+    tmp_path, monkeypatch, case
+):
+    """dispatch_allowed is true only for a complete verified production runtime."""
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    raw = _complete_sqlite(tmp_path)
+
+    def _idle(**_k):
+        raise AssertionError("preflight/transport must not call the network")
+
+    if case == "missing_secrets":
+        monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        report = preflight_durable_jobs(raw)
+        assert report.constructible is True
+        assert report.secret_refs_present is False
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "secret_refs_missing" in report.reasons
+        return
+
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+
+    if case == "missing_transport":
+        report = preflight_durable_jobs(raw)
+        assert report.constructible is True
+        assert report.secret_refs_present is True
+        assert report.transport_capability is False
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "transport_capability_missing" in report.reasons
+        return
+
+    if case == "binding_mismatch":
+        report = preflight_durable_jobs(
+            raw,
+            cursor_transport=CursorCloudInjectedTransport(
+                request=_idle, secret_ref="ACTUAL_CURSOR_REF_MISSING"
+            ),
+            slack_transport=SlackInjectedTransport(
+                request=_idle, secret_ref="ACTUAL_SLACK_REF_MISSING"
+            ),
+        )
+        assert report.constructible is True
+        assert report.transport_capability is True
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "transport_secret_ref_mismatch" in report.reasons
+        return
+
+    cursor, slack = _idle_injected_transports()
+    report = preflight_durable_jobs(
+        raw, cursor_transport=cursor, slack_transport=slack
+    )
+    assert report.constructible is True
+    assert report.secret_refs_present is True
+    assert report.transport_capability is True
+    assert report.runtime_ready is True
+    assert report.dispatch_allowed is True
+    assert CURSOR_TOKEN not in str(report)
+    assert SLACK_TOKEN not in str(report)
 
 
 def test_preflight_runtime_ready_rejects_metadata_only_duck_transports(
@@ -441,6 +527,7 @@ def test_preflight_runtime_ready_rejects_metadata_only_duck_transports(
     assert report.secret_refs_present is True
     assert report.transport_capability is False
     assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
     assert "transport_capability_missing" in report.reasons
     assert "transport_secret_ref_mismatch" not in report.reasons
     dumped = str(report)
@@ -507,6 +594,7 @@ def test_preflight_runtime_ready_rejects_unbound_subclass_transports(
     assert report.secret_refs_present is True
     assert report.transport_capability is False
     assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
     assert "transport_capability_missing" in report.reasons
     dumped = str(report)
     assert CURSOR_TOKEN not in dumped

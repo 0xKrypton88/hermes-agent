@@ -21,6 +21,10 @@ create a pin; it only reads pins if a prior capture already succeeded.
 
 Identity only: never iterates environment keys and never reads or
 compares secret values.
+
+The process-bound trust root is a write-once seal on the genuine
+``os.environ`` instance dict. Module globals, ``sys.modules`` entries,
+and a later ``types.ModuleType`` injection are not provenance.
 """
 
 from __future__ import annotations
@@ -34,6 +38,9 @@ _ORIGIN_POSIX_ENVIRON = None
 _TRUSTED_CAPTURE_READY = False
 _PINNED_OS_ENVIRON = None
 _PINNED_POSIX_ENVIRON = None
+_MISSING = object()
+_ORIGIN_SEAL_ATTR = "__hermes_trusted_environ_origin__"
+_PIN_SEAL_ATTR = "__hermes_trusted_environ_pin__"
 
 
 def _current_os_environ():
@@ -68,6 +75,64 @@ def _current_posix_environ():
     return mapping
 
 
+def _environ_instance_storage(environ):
+    """Return the genuine ``os._Environ`` instance dict, or None."""
+    if environ is None:
+        return None
+    try:
+        storage = object.__getattribute__(environ, "__dict__")
+    except AttributeError:
+        return None
+    if type(storage) is not dict:
+        return None
+    return storage
+
+
+def _seal_get(storage, name):
+    """Return the ``(environ, posix)`` tuple stored under ``name``, or None.
+
+    Walks ``dict.items`` and matches an exact ``str`` key with ``str.__eq__``.
+    """
+    if type(storage) is not dict or type(name) is not str:
+        return None
+    found = _MISSING
+    try:
+        items = dict.items(storage)
+    except Exception:
+        return None
+    for pair in items:
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
+            return None
+        key = tuple.__getitem__(pair, 0)
+        value = tuple.__getitem__(pair, 1)
+        if type(key) is not str:
+            continue
+        if str.__eq__(key, name):
+            if found is not _MISSING:
+                return None
+            found = value
+    if found is _MISSING:
+        return None
+    if type(found) is not tuple or tuple.__len__(found) != 2:
+        return None
+    return found
+
+
+def _seal_put(storage, name, payload) -> bool:
+    """Write-once seal. Fails if ``name`` is already a key."""
+    if type(storage) is not dict or type(name) is not str:
+        return False
+    if type(payload) is not tuple or tuple.__len__(payload) != 2:
+        return False
+    if _seal_get(storage, name) is not None:
+        return False
+    try:
+        dict.__setitem__(storage, name, payload)
+    except Exception:
+        return False
+    return _seal_get(storage, name) is payload
+
+
 def remember_process_origin() -> bool:
     """Record interpreter-original mapping identities. Does not pin.
 
@@ -76,13 +141,35 @@ def remember_process_origin() -> bool:
     this module does not remember.
     """
     global _ORIGIN_RECORDED, _ORIGIN_OS_ENVIRON, _ORIGIN_POSIX_ENVIRON
-    if _ORIGIN_RECORDED:
-        return _ORIGIN_OS_ENVIRON is not None
     environ = _current_os_environ()
-    _ORIGIN_OS_ENVIRON = environ
-    _ORIGIN_POSIX_ENVIRON = _current_posix_environ()
+    storage = _environ_instance_storage(environ)
+    existing = _seal_get(storage, _ORIGIN_SEAL_ATTR)
+    if existing is not None:
+        _ORIGIN_OS_ENVIRON = existing[0]
+        _ORIGIN_POSIX_ENVIRON = existing[1]
+        _ORIGIN_RECORDED = True
+        return existing[0] is environ
+    if _ORIGIN_RECORDED:
+        return False
+    posix = _current_posix_environ()
     _ORIGIN_RECORDED = True
-    return environ is not None
+    if environ is None or storage is None:
+        return False
+    payload = (environ, posix)
+    if not _seal_put(storage, _ORIGIN_SEAL_ATTR, payload):
+        return False
+    _ORIGIN_OS_ENVIRON = environ
+    _ORIGIN_POSIX_ENVIRON = posix
+    return True
+
+
+def _fail_capture(storage) -> bool:
+    """Lock capture closed. Write-once tombstone so a later plant cannot mint."""
+    global _TRUSTED_CAPTURE_READY
+    _TRUSTED_CAPTURE_READY = True
+    if storage is not None:
+        _seal_put(storage, _PIN_SEAL_ATTR, (None, None))
+    return False
 
 
 def capture_trusted_startup() -> bool:
@@ -95,31 +182,37 @@ def capture_trusted_startup() -> bool:
     module does not capture. Missing origin is not provenance.
     """
     global _TRUSTED_CAPTURE_READY, _PINNED_OS_ENVIRON, _PINNED_POSIX_ENVIRON
-    if _TRUSTED_CAPTURE_READY:
-        return _PINNED_OS_ENVIRON is not None
-    if _ORIGIN_RECORDED is not True or _ORIGIN_OS_ENVIRON is None:
-        _TRUSTED_CAPTURE_READY = True
-        return False
     environ = _current_os_environ()
-    if environ is None or environ is not _ORIGIN_OS_ENVIRON:
+    storage = _environ_instance_storage(environ)
+    existing_pin = _seal_get(storage, _PIN_SEAL_ATTR)
+    if existing_pin is not None:
+        pinned_environ = existing_pin[0]
+        if pinned_environ is None or pinned_environ is not environ:
+            _TRUSTED_CAPTURE_READY = True
+            return False
+        _PINNED_OS_ENVIRON = pinned_environ
+        _PINNED_POSIX_ENVIRON = existing_pin[1]
         _TRUSTED_CAPTURE_READY = True
+        return True
+    if _TRUSTED_CAPTURE_READY:
         return False
+    origin = _seal_get(storage, _ORIGIN_SEAL_ATTR)
+    if origin is None or origin[0] is not environ:
+        return _fail_capture(storage)
+    if environ is None or environ is not origin[0]:
+        return _fail_capture(storage)
     try:
         environ_type = object.__getattribute__(os, "_Environ")
     except AttributeError:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     if type(environ) is not environ_type:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     try:
         data = object.__getattribute__(environ, "_data")
     except AttributeError:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     if type(data) is not dict:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     try:
         platform = object.__getattribute__(sys, "platform")
     except AttributeError:
@@ -130,12 +223,15 @@ def capture_trusted_startup() -> bool:
         except AttributeError:
             pass
         else:
-            _TRUSTED_CAPTURE_READY = True
-            return False
+            return _fail_capture(storage)
+        payload = (environ, None)
+        if not _seal_put(storage, _PIN_SEAL_ATTR, payload):
+            return _fail_capture(storage)
         _PINNED_OS_ENVIRON = environ
+        _PINNED_POSIX_ENVIRON = None
         _TRUSTED_CAPTURE_READY = True
         return True
-    origin_posix = _ORIGIN_POSIX_ENVIRON
+    origin_posix = origin[1]
     live_posix = _current_posix_environ()
     if (
         origin_posix is None
@@ -144,24 +240,22 @@ def capture_trusted_startup() -> bool:
         or live_posix is not origin_posix
         or data is not origin_posix
     ):
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     try:
         environb = object.__getattribute__(os, "environb")
     except AttributeError:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     if type(environb) is not environ_type:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     try:
         sibling = object.__getattribute__(environb, "_data")
     except AttributeError:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
     if sibling is not origin_posix:
-        _TRUSTED_CAPTURE_READY = True
-        return False
+        return _fail_capture(storage)
+    payload = (environ, origin_posix)
+    if not _seal_put(storage, _PIN_SEAL_ATTR, payload):
+        return _fail_capture(storage)
     _PINNED_OS_ENVIRON = environ
     _PINNED_POSIX_ENVIRON = origin_posix
     _TRUSTED_CAPTURE_READY = True
@@ -169,5 +263,10 @@ def capture_trusted_startup() -> bool:
 
 
 def trusted_startup_ready() -> bool:
-    """True when a prior ``capture_trusted_startup()`` pinned ``os.environ``."""
-    return _TRUSTED_CAPTURE_READY is True and _PINNED_OS_ENVIRON is not None
+    """True when a prior ``capture_trusted_startup()`` sealed ``os.environ``."""
+    environ = _current_os_environ()
+    storage = _environ_instance_storage(environ)
+    pin = _seal_get(storage, _PIN_SEAL_ATTR)
+    if pin is None:
+        return False
+    return pin[0] is environ

@@ -199,35 +199,96 @@ def _stdlib_os_module():
     return module
 
 
+_PIN_SEAL_ATTR = "__hermes_trusted_environ_pin__"
+
+
+def _stdlib_os_environ_parts():
+    """Return ``(os_storage, environ, environ_type, descriptor, data)``."""
+    module = _stdlib_os_module()
+    storage = _module_storage(module)
+    if storage is None:
+        return None, None, None, None, None
+    environ_type = _exact_str_dict_value(storage, "_Environ")
+    environ = _exact_str_dict_value(storage, "environ")
+    if environ_type is _MISSING or environ is _MISSING:
+        return None, None, None, None, None
+    if type(environ) is not environ_type:
+        return None, None, None, None, None
+    if not _is_stdlib_os_environ_type(environ_type):
+        return None, None, None, None, None
+    namespace = _type_namespace(environ_type)
+    if namespace is None:
+        return None, None, None, None, None
+    try:
+        descriptor = namespace.get("__dict__")
+    except Exception:
+        return None, None, None, None, None
+    if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None, None, None, None, None
+    data = _environ_data_from_instance(environ, environ_type, descriptor)
+    if data is _MISSING:
+        return None, None, None, None, None
+    return storage, environ, environ_type, descriptor, data
+
+
+def _environ_instance_from_descriptor(environ, environ_type, descriptor):
+    if type(environ) is not environ_type:
+        return None
+    if type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
+        return None
+    try:
+        storage = descriptor.__get__(environ, environ_type)
+    except Exception:
+        return None
+    if type(storage) is not dict:
+        return None
+    return storage
+
+
+def _read_trusted_startup_pins():
+    """Live-read the process-bound pin seal. Not a mintable module global."""
+    os_storage, environ, environ_type, descriptor, _data = _stdlib_os_environ_parts()
+    _ = os_storage
+    if environ is None:
+        return False, None, None
+    instance = _environ_instance_from_descriptor(environ, environ_type, descriptor)
+    if instance is None:
+        return False, None, None
+    payload = _exact_str_dict_value(instance, _PIN_SEAL_ATTR)
+    if payload is _MISSING or type(payload) is not tuple or tuple.__len__(payload) != 2:
+        return False, None, None
+    pinned_environ = tuple.__getitem__(payload, 0)
+    pinned_posix = tuple.__getitem__(payload, 1)
+    if pinned_environ is not environ:
+        return False, None, None
+    return True, pinned_environ, pinned_posix
+
+
+# Sticky fail-closed after the first missing pin. Not the trust root:
+# a True result is always re-checked against the process-bound seal.
+_PIN_DENIED = []
+
+
 def _trusted_startup_pins():
     """Return ``(ready, pinned_os_environ, pinned_posix_environ)``.
 
-    Reads ``hermes_environ_startup`` only if that module is already in
-    ``sys.modules``. Does not import it and does not call capture.
-    A missing, unready, or empty pin is not provenance.
+    Provenance is a write-once seal on the genuine ``os.environ`` instance
+    dict. Does not import ``hermes_environ_startup`` and does not call
+    capture. A ``types.ModuleType`` injection or mutated module globals
+    is not provenance.
+
+    The first missing pin is sticky so a later ``sys.modules`` /
+    module-global mutation cannot take the result from false to true.
+    A cached True is never trusted on its own; ready still requires the
+    live process-bound seal.
     """
-    try:
-        modules = object.__getattribute__(sys, "modules")
-    except AttributeError:
+    if _PIN_DENIED:
         return False, None, None
-    if type(modules) is not dict:
+    result = _read_trusted_startup_pins()
+    if result[0] is not True:
+        _PIN_DENIED.append(True)
         return False, None, None
-    module = _exact_str_dict_value(modules, "hermes_environ_startup")
-    if module is _MISSING:
-        return False, None, None
-    storage = _module_storage(module)
-    if storage is None:
-        return False, None, None
-    ready = _exact_str_dict_value(storage, "_TRUSTED_CAPTURE_READY")
-    if ready is not True:
-        return False, None, None
-    pinned_environ = _exact_str_dict_value(storage, "_PINNED_OS_ENVIRON")
-    if pinned_environ is _MISSING or pinned_environ is None:
-        return False, None, None
-    pinned_posix = _exact_str_dict_value(storage, "_PINNED_POSIX_ENVIRON")
-    if pinned_posix is _MISSING:
-        pinned_posix = None
-    return True, pinned_environ, pinned_posix
+    return result
 
 
 def _module_storage(module: Any):
@@ -326,29 +387,8 @@ def _capture_os_environ_boundary():
     ``_data``, and is never a presence oracle. Provenance is
     ``os.environ is`` the pinned startup singleton.
     """
-    module = _stdlib_os_module()
-    storage = _module_storage(module)
-    if storage is None:
-        return None, None, None, None, None
-    environ_type = _exact_str_dict_value(storage, "_Environ")
-    environ = _exact_str_dict_value(storage, "environ")
-    if environ_type is _MISSING or environ is _MISSING:
-        return None, None, None, None, None
-    if type(environ) is not environ_type:
-        return None, None, None, None, None
-    if not _is_stdlib_os_environ_type(environ_type):
-        return None, None, None, None, None
-    namespace = _type_namespace(environ_type)
-    if namespace is None:
-        return None, None, None, None, None
-    try:
-        descriptor = namespace.get("__dict__")
-    except Exception:
-        return None, None, None, None, None
-    if descriptor is None or type(descriptor) is not _GETSET_DESCRIPTOR_TYPE:
-        return None, None, None, None, None
-    data = _environ_data_from_instance(environ, environ_type, descriptor)
-    if data is _MISSING:
+    storage, environ, environ_type, descriptor, data = _stdlib_os_environ_parts()
+    if environ is None:
         return None, None, None, None, None
     platform = _sys_platform()
     if platform is None:
@@ -678,7 +718,13 @@ def preflight_durable_jobs(
     cursor_transport: Any = None,
     slack_transport: Any = None,
 ) -> DurableJobsPreflight:
-    """Validate active config without external effects."""
+    """Validate active config without external effects.
+
+    ``dispatch_allowed`` is true only when config dispatch gates and a
+    complete verified production runtime (secrets, transport capability,
+    and secret-ref bindings) are all present. Constructible-but-incomplete
+    configs stay closed.
+    """
     try:
         cfg = load_durable_jobs_config(raw)
     except DurableJobsConfigError as exc:
@@ -755,7 +801,7 @@ def preflight_durable_jobs(
     )
     return DurableJobsPreflight(
         constructible=constructible,
-        dispatch_allowed=bool(cfg.dispatch_allowed and constructible),
+        dispatch_allowed=bool(cfg.dispatch_allowed and runtime_ready),
         runtime_ready=runtime_ready,
         reasons=tuple(reasons),
         backend=cfg.resolved_backend,

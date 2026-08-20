@@ -334,6 +334,20 @@ def _child_env_with_worktree_startup(repo: Path) -> dict[str, str]:
     return env
 
 
+def _child_env_without_startup_hooks(repo: Path) -> dict[str, str]:
+    """Hide worktree sitecustomize and PYTHONSTARTUP from a child process."""
+    env = os.environ.copy()
+    repo_s = str(repo)
+    prior = env.get("PYTHONPATH", "")
+    parts = [part for part in prior.split(os.pathsep) if part and part != repo_s]
+    if parts:
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    else:
+        env.pop("PYTHONPATH", None)
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
 def _child_inherits_env_name(name: str) -> bool:
     if type(name) is not str:
         raise AssertionError("name must be an exact str")
@@ -561,6 +575,87 @@ def test_startup_binds_approved_transports_when_request_ports_are_installed(
     assert handle.preflight.dispatch_allowed is False
     assert calls == []
     dumped = f"{handle!r} {handle.preflight!r} {raw!r}"
+    assert CURSOR_TOKEN not in dumped
+    assert SLACK_TOKEN not in dumped
+    assert "xoxb-" not in dumped
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_secrets",
+        "missing_transport",
+        "binding_mismatch",
+        "complete_runtime",
+    ),
+)
+def test_startup_preflight_dispatch_allowed_matrix(tmp_path, monkeypatch, case):
+    """Gateway preflight dispatch_allowed stays closed unless runtime is verified."""
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+    from gateway.durable_job_lane import get_active_durable_job_lane
+
+    if case == "missing_secrets":
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        raw = _complete(tmp_path, dispatch_enabled=True)
+        _write_active_config(tmp_path, raw)
+        runner = _make_runner(tmp_path)
+        runner._maybe_attach_durable_job_lane()
+        assert getattr(runner, "_durable_job_lane", None) is None
+        assert get_active_durable_job_lane() is None
+        report = preflight_durable_jobs(raw)
+        assert report.constructible is True
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "secret_refs_missing" in report.reasons
+        return
+
+    raw, runner = _prepare_startup(tmp_path, monkeypatch, dispatch_enabled=True)
+    calls: list = []
+
+    if case == "missing_transport":
+        runner._maybe_attach_durable_job_lane()
+        assert getattr(runner, "_durable_job_lane", None) is None
+        report = preflight_durable_jobs(raw)
+        assert report.constructible is True
+        assert report.secret_refs_present is True
+        assert report.transport_capability is False
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "transport_capability_missing" in report.reasons
+        return
+
+    if case == "binding_mismatch":
+        report = preflight_durable_jobs(
+            raw,
+            cursor_transport=CursorCloudInjectedTransport(
+                request=_idle_request(calls), secret_ref="ACTUAL_CURSOR_REF_MISSING"
+            ),
+            slack_transport=SlackInjectedTransport(
+                request=_idle_request(calls), secret_ref="ACTUAL_SLACK_REF_MISSING"
+            ),
+        )
+        assert report.constructible is True
+        assert report.runtime_ready is False
+        assert report.dispatch_allowed is False
+        assert "transport_secret_ref_mismatch" in report.reasons
+        assert calls == []
+        return
+
+    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert handle.preflight.runtime_ready is True
+    assert handle.preflight.dispatch_allowed is True
+    assert handle.config.dispatch_allowed is True
+    assert calls == []
+    dumped = f"{handle!r} {handle.preflight!r}"
     assert CURSOR_TOKEN not in dumped
     assert SLACK_TOKEN not in dumped
     assert "xoxb-" not in dumped
@@ -1993,6 +2088,42 @@ finally:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "trusted=0"
+
+
+def test_fake_moduletype_injection_cannot_mint_startup_witness():
+    """Exact ``types.ModuleType`` injection must not mint a startup witness."""
+    script = r"""
+import os
+import sys
+import types
+sys.path.insert(0, sys.argv[1])
+from agent.durable_jobs.preflight import (
+    _capture_os_environ_boundary,
+    _trusted_startup_pins,
+)
+ready0, _, _ = _trusted_startup_pins()
+cap0 = _capture_os_environ_boundary()
+fake = types.ModuleType("hermes_environ_startup")
+fake._TRUSTED_CAPTURE_READY = True
+fake._PINNED_OS_ENVIRON = os.environ
+fake._PINNED_POSIX_ENVIRON = None
+sys.modules["hermes_environ_startup"] = fake
+ready1, _, _ = _trusted_startup_pins()
+cap1 = _capture_os_environ_boundary()
+sys.stdout.write("before=" + ("1" if ready0 or cap0[0] is not None else "0"))
+sys.stdout.write(" after=" + ("1" if ready1 or cap1[0] is not None else "0"))
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "before=0 after=0"
 
 
 _COPIED_DATA_ENTRY_REPORT = """
