@@ -10,6 +10,7 @@ binding ledger — this module does not keep a second message map.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence
@@ -77,7 +78,7 @@ class SlackTransport(Protocol):
 
 
 def _record_get(raw: Any, key: str, default: Any = None) -> Any:
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         return raw.get(key, default)
     if raw is None or isinstance(raw, (str, bytes, int, float, bool)):
         return default
@@ -93,7 +94,7 @@ def _text(raw: Any) -> str:
 def _channel_id(raw: Any) -> str:
     for key in ("channel_id", "channel"):
         value = _record_get(raw, key)
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             found = _text(value.get("id"))
             if found:
                 return found
@@ -106,7 +107,7 @@ def _channel_id(raw: Any) -> str:
 def _workspace_id(raw: Any) -> str:
     for key in ("workspace_id", "team_id", "team"):
         value = _record_get(raw, key)
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             found = _text(value.get("id"))
             if found:
                 return found
@@ -169,11 +170,11 @@ def _lookup_records(raw: Any) -> Sequence[Any]:
         return raw
     if isinstance(raw, SlackPosted):
         return (raw,)
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         messages = raw.get("messages")
         if isinstance(messages, (list, tuple)):
             return messages
-        if isinstance(messages, dict):
+        if isinstance(messages, Mapping):
             matches = messages.get("matches")
             if isinstance(matches, (list, tuple)):
                 return matches
@@ -291,7 +292,7 @@ def normalize_post_result(
         )
 
     kind_raw = None
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         kind_raw = raw.get("kind")
         ok = raw.get("ok")
         if kind_raw is None and ok is False:
@@ -313,7 +314,7 @@ def normalize_post_result(
 
     kind = _kind_from(kind_raw)
     posted = _parse_posted(raw)
-    if posted is None and isinstance(raw, dict):
+    if posted is None and isinstance(raw, Mapping):
         posted = _parse_posted(
             {
                 "message_ts": raw.get("message_ts") or raw.get("ts"),
@@ -336,7 +337,7 @@ def normalize_post_result(
         return SlackPostResult(kind=SlackPostKind.LOST_RESPONSE, posted=posted)
     if kind is SlackPostKind.AMBIGUOUS_RESPONSE:
         candidates = parse_lookup_posts(
-            getattr(raw, "candidates", ()) or (raw.get("candidates") if isinstance(raw, dict) else ()),
+            getattr(raw, "candidates", ()) or (raw.get("candidates") if isinstance(raw, Mapping) else ()),
             expected_client_msg_id=client_msg_id,
         )
         return SlackPostResult(

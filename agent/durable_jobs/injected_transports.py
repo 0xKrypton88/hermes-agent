@@ -10,10 +10,18 @@ import re
 from typing import Any, Callable, Optional, Protocol
 
 from agent.durable_jobs.config import validate_secret_ref_name
+from agent.durable_jobs.cursor_cloud import (
+    cursor_correlation_agent_id,
+    cursor_correlation_name,
+)
 from agent.durable_jobs.cursor_cloud import redact_provider_error
 from agent.durable_jobs.lane import LaneClosedError
 from agent.durable_jobs.redaction import redact_secret_text
-from agent.durable_jobs.request_ports import RequestPortError
+from agent.durable_jobs.request_ports import (
+    CursorCloudInjectedRequestPort,
+    RequestPortError,
+    SlackInjectedRequestPort,
+)
 from agent.durable_jobs.slack_bridge import redact_slack_error
 
 InjectedRequest = Callable[..., Any]
@@ -44,6 +52,18 @@ def _invoke_injected_request(request: InjectedRequest, **kwargs: Any) -> Any:
         raise RuntimeError(redact_transport_error(exc)) from None
 
 
+def _bound_request_identity(request: InjectedRequest, name: str) -> str:
+    """Read bindings without invoking request properties or descriptors."""
+    if type(request) not in (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    ):
+        return ""
+    namespace = object.__getattribute__(request, "__dict__")
+    value = dict.get(namespace, name)
+    return value if type(value) is str else ""
+
+
 class CursorCloudInjectedTransport:
     """Cursor Cloud transport coupling. Request callable is required."""
 
@@ -52,6 +72,8 @@ class CursorCloudInjectedTransport:
         *,
         request: Optional[InjectedRequest] = None,
         secret_ref: str,
+        workspace_id: str = "",
+        repository_identity: str = "",
     ) -> None:
         if request is None:
             raise TypeError(
@@ -60,6 +82,12 @@ class CursorCloudInjectedTransport:
             )
         self._request = request
         self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
+        self._workspace_id = workspace_id or _bound_request_identity(
+            request, "_workspace_id"
+        )
+        self._repository_identity = repository_identity or _bound_request_identity(
+            request, "_repository_identity"
+        )
 
     @property
     def secret_ref(self) -> str:
@@ -84,6 +112,8 @@ class CursorCloudInjectedTransport:
                 "job_id": job_id,
                 "name": name,
                 "agentId": agent_id,
+                "workspace_id": self._workspace_id,
+                "repository_identity": self._repository_identity,
             },
         )
 
@@ -92,15 +122,31 @@ class CursorCloudInjectedTransport:
             self._request,
             operation="lookup",
             secret_ref=self._secret_ref,
-            payload={"idempotency_key": idempotency_key},
+            payload={
+                "idempotency_key": idempotency_key,
+                "workspace_id": self._workspace_id,
+                "repository_identity": self._repository_identity,
+            },
         )
 
-    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+    def status(
+        self, *, run_id: str, idempotency_key: str, agent_id: str = ""
+    ) -> Any:
+        cursor_correlation_name(idempotency_key)
+        derived_agent_id = cursor_correlation_agent_id(idempotency_key)
+        if agent_id and agent_id != derived_agent_id:
+            raise ValueError("Cursor status agent id does not match idempotency key")
         return _invoke_injected_request(
             self._request,
             operation="status",
             secret_ref=self._secret_ref,
-            payload={"run_id": run_id, "agent_id": agent_id},
+            payload={
+                "idempotency_key": idempotency_key,
+                "run_id": run_id,
+                "agent_id": derived_agent_id,
+                "workspace_id": self._workspace_id,
+                "repository_identity": self._repository_identity,
+            },
         )
 
 
@@ -112,6 +158,10 @@ class SlackInjectedTransport:
         *,
         request: Optional[InjectedRequest] = None,
         secret_ref: str,
+        workspace_id: str = "",
+        repository_identity: str = "",
+        channel_id: str = "",
+        root_thread_ts: str = "",
     ) -> None:
         if request is None:
             raise TypeError(
@@ -120,6 +170,16 @@ class SlackInjectedTransport:
             )
         self._request = request
         self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
+        self._workspace_id = workspace_id or _bound_request_identity(
+            request, "_workspace_id"
+        )
+        self._repository_identity = repository_identity or _bound_request_identity(
+            request, "_repository_identity"
+        )
+        self._channel_id = channel_id or _bound_request_identity(request, "_channel_id")
+        self._root_thread_ts = root_thread_ts or _bound_request_identity(
+            request, "_root_thread_ts"
+        )
 
     @property
     def secret_ref(self) -> str:
@@ -148,6 +208,7 @@ class SlackInjectedTransport:
             payload={
                 "client_msg_id": client_msg_id,
                 "workspace_id": workspace_id,
+                "repository_identity": self._repository_identity,
                 "channel_id": channel_id,
                 "root_thread_ts": root_thread_ts,
                 "job_id": job_id,
@@ -159,5 +220,11 @@ class SlackInjectedTransport:
             self._request,
             operation="lookup",
             secret_ref=self._secret_ref,
-            payload={"client_msg_id": client_msg_id},
+            payload={
+                "client_msg_id": client_msg_id,
+                "workspace_id": self._workspace_id,
+                "repository_identity": self._repository_identity,
+                "channel_id": self._channel_id,
+                "root_thread_ts": self._root_thread_ts,
+            },
         )

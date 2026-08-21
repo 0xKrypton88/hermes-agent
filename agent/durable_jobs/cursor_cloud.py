@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Protocol, Sequence
@@ -96,7 +97,9 @@ class CursorCloudTransport(Protocol):
 
     def lookup(self, *, idempotency_key: str) -> Sequence[Any]: ...
 
-    def status(self, *, run_id: str, agent_id: str) -> Any: ...
+    def status(
+        self, *, run_id: str, idempotency_key: str, agent_id: str
+    ) -> Any: ...
 
 
 # v0/v1 Cloud Agents ``name`` max is 100. Ledger keys must fit exactly; never truncate.
@@ -156,7 +159,7 @@ def cursor_correlation_prompt(idempotency_key: str, text: str = "") -> str:
 
 def _record_get(raw: Any, key: str, default: Any = None) -> Any:
     """Read a field from a dict or typed SDK object. Same keys, both shapes."""
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         return raw.get(key, default)
     if raw is None or isinstance(raw, (str, bytes, int, float, bool)):
         return default
@@ -164,7 +167,7 @@ def _record_get(raw: Any, key: str, default: Any = None) -> Any:
 
 
 def _is_mapping_like(raw: Any) -> bool:
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         return True
     if raw is None or isinstance(
         raw, (str, bytes, int, float, bool, list, tuple, CursorRun)
@@ -184,7 +187,7 @@ def _prompt_first_line(raw: Any) -> str:
         source = _record_get(raw, "source")
         if source is not None:
             prompt = _record_get(source, "prompt")
-    if isinstance(prompt, dict):
+    if isinstance(prompt, Mapping):
         prompt = prompt.get("text")
     elif prompt is not None and not isinstance(prompt, str):
         nested = _record_get(prompt, "text")
@@ -251,7 +254,7 @@ def _provider_records(raw: Any) -> Sequence[Any]:
         return ()
     if isinstance(raw, (list, tuple)):
         return raw
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         for envelope in _OFFICIAL_LIST_KEYS:
             inner = raw.get(envelope)
             if isinstance(inner, (list, tuple)):
@@ -322,12 +325,12 @@ def _matches_derived_agent_id(raw: Any, *, expected_key: str) -> bool:
 
 def _is_cursor_agent_id_conflict(raw: Any) -> bool:
     """Official re-POST of the same client agentId returns 409 agent_id_conflict."""
-    if not isinstance(raw, dict):
+    if not isinstance(raw, Mapping):
         return False
     chunks: list[str] = []
     for key in ("error", "code", "message", "error_code", "kind"):
         val = raw.get(key)
-        if isinstance(val, dict):
+        if isinstance(val, Mapping):
             chunks.extend(str(part) for part in val.values() if part is not None)
         elif val is not None:
             chunks.append(str(val))
@@ -444,7 +447,7 @@ def normalize_create_result(raw: Any, *, expected_key: str) -> CursorCreateResul
     run_raw: Any = None
     candidates_raw: Any = ()
     error_raw: Any = None
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         kind_raw = raw.get("kind")
         if not kind_raw:
             official = _accepted_from_official_create(raw, expected_key=expected_key)
@@ -522,17 +525,17 @@ def _fail_closed_create(
 
 
 def _accepted_from_official_create(
-    raw: dict, *, expected_key: str
+    raw: Mapping[str, Any], *, expected_key: str
 ) -> Optional[CursorCreateResult]:
     """Map v0 agent / v1 {agent, run} create bodies. No custom idempotency field."""
-    record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
-    if not isinstance(record, dict):
+    record = raw.get("agent") if isinstance(raw.get("agent"), Mapping) else raw
+    if not isinstance(record, Mapping):
         return None
     if not _looks_like_official_cursor_record(raw) and not _looks_like_official_cursor_record(
         record
     ):
         return None
-    inner = raw.get("run") if isinstance(raw.get("run"), dict) else None
+    inner = raw.get("run") if isinstance(raw.get("run"), Mapping) else None
     if inner is not None:
         merged = dict(record)
         if inner.get("id") and not merged.get("latestRunId"):
@@ -594,16 +597,26 @@ class CursorCloudAdapter:
             return _fail_closed_lookup_error(idempotency_key, exc)
         return parse_lookup_runs(raw, expected_key=idempotency_key)
 
-    def status_run(self, *, run_id: str, agent_id: str = "") -> CursorStatusResult:
+    def status_run(
+        self, *, run_id: str, idempotency_key: str, agent_id: str = ""
+    ) -> CursorStatusResult:
         try:
-            raw = self._transport.status(run_id=run_id, agent_id=agent_id)
+            cursor_correlation_name(idempotency_key)
+            derived_agent_id = cursor_correlation_agent_id(idempotency_key)
+            if agent_id and agent_id != derived_agent_id:
+                raise ValueError("Cursor status agent id does not match idempotency key")
+            raw = self._transport.status(
+                run_id=run_id,
+                agent_id=derived_agent_id,
+                idempotency_key=idempotency_key,
+            )
         except Exception as exc:
             return CursorStatusResult(
                 kind=CursorStatusKind.UNKNOWN,
                 error=redact_provider_error(exc),
             )
         return normalize_status_result(
-            raw, expected_run_id=run_id, expected_agent_id=agent_id or None
+            raw, expected_run_id=run_id, expected_agent_id=derived_agent_id
         )
 
     def reconcile_create(self, ledger: Any, **kwargs: Any) -> Any:
@@ -631,16 +644,10 @@ class CursorCloudAdapter:
         ):
             observation: Optional[CursorStatusResult] = None
             if claim.provider_run_id:
-                status_agent_id = ""
                 claim_key = getattr(claim, "provider_idempotency_key", "") or ""
-                if claim_key:
-                    try:
-                        status_agent_id = cursor_correlation_agent_id(claim_key)
-                    except ValueError:
-                        status_agent_id = ""
                 observation = self.status_run(
                     run_id=claim.provider_run_id,
-                    agent_id=status_agent_id,
+                    idempotency_key=claim_key,
                 )
             ok = _status_observation_confirms_claim(claim, observation)
             return CursorStatusReconcileResult(

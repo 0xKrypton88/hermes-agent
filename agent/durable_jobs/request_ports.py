@@ -11,7 +11,12 @@ Attach/preflight must not invoke it.
 from __future__ import annotations
 
 import inspect
+import math
 import re
+import threading
+import time
+from collections.abc import Iterator, Mapping as ABCMapping
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
 from agent.durable_jobs.config import validate_secret_ref_name
@@ -27,6 +32,9 @@ from agent.durable_jobs.slack_bridge import redact_slack_error
 _XOX_RE = re.compile(r"(?i)xox[abps]-[A-Za-z0-9-]+")
 _CURSOR_METHODS = ("create_agent", "get_agent", "get_run")
 _SLACK_METHODS = ("chat_postMessage", "conversations_replies")
+# Completed claims are permanent authority against duplicate external writes.
+# Bound memory by refusing new unique writes rather than silently evicting one.
+_MAX_PERMANENT_WRITE_CLAIMS = 1024
 
 
 class RequestPortError(Exception):
@@ -66,7 +74,18 @@ def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
         raise TypeError(
             "injected client is required; no HTTP/SDK client is constructed"
         )
-    missing = [name for name in methods if not callable(getattr(client, name, None))]
+    missing = []
+    for name in methods:
+        try:
+            seam = inspect.getattr_static(client, name)
+        except BaseException:
+            missing.append(name)
+            continue
+        # Only concrete Python/builtin functions are approved. Properties,
+        # descriptors, callable objects, and dynamic __getattr__ seams are
+        # rejected without executing any client-controlled hook.
+        if not (inspect.isfunction(seam) or inspect.isbuiltin(seam)):
+            missing.append(name)
     if missing:
         raise TypeError(
             "injected client is missing required seam methods: "
@@ -83,7 +102,7 @@ def _as_payload(payload: Any) -> Mapping[str, Any]:
 
 def _match_bound(payload: Mapping[str, Any], key: str, bound: str) -> None:
     if key not in payload:
-        return
+        raise RequestPortMismatch(f"{key} is required")
     value = payload.get(key)
     if type(value) is not str or value.strip() != bound:
         raise RequestPortMismatch(f"{key} does not match bound identity")
@@ -92,10 +111,21 @@ def _match_bound(payload: Mapping[str, Any], key: str, bound: str) -> None:
 def _check_deadline(
     *,
     timeout_seconds: Any = None,
+    deadline: Optional[float] = None,
     cancel_event: Any = None,
 ) -> None:
-    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-        raise RequestPortTimeout("cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RequestPortTimeout("timeout")
+    if cancel_event is not None:
+        try:
+            cancelled = getattr(cancel_event, "is_set", lambda: False)()
+        except BaseException as exc:
+            raise RequestPortTimeout("invalid cancellation hook") from exc
+        if cancelled:
+            raise RequestPortTimeout("cancelled")
+        # Calling the user-supplied hook is admission work and consumes budget.
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RequestPortTimeout("timeout")
     if timeout_seconds is None:
         return
     try:
@@ -133,14 +163,23 @@ def _client_method(client: Any, method_name: str) -> Any:
     return method
 
 
-def _invoke(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+def _invoke(
+    client: Any,
+    method_name: str,
+    *args: Any,
+    _secret_value: Any = None,
+    **kwargs: Any,
+) -> Any:
     method = _client_method(client, method_name)
     try:
         result = method(*args, **kwargs)
     except (LaneClosedError, RequestPortError):
         raise
     except Exception as exc:
-        raise RequestPortError(_redact(exc)) from None
+        text = _redact(exc)
+        if type(_secret_value) is str and _secret_value:
+            text = text.replace(_secret_value, "[REDACTED]")
+        raise RequestPortError(text) from None
     if inspect.iscoroutine(result):
         result.close()
         raise RequestPortError(
@@ -151,9 +190,9 @@ def _invoke(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
 
 def _resolve_secret(
     resolver: Optional[Callable[[str], Any]], secret_ref: str
-) -> None:
+) -> Any:
     if resolver is None:
-        return
+        return None
     try:
         value = resolver(secret_ref)
     except RequestPortError:
@@ -162,7 +201,7 @@ def _resolve_secret(
         raise RequestPortError(_redact(exc)) from None
     if value is None or (isinstance(value, str) and not value.strip()):
         raise RequestPortError("credential resolver returned empty")
-    del value
+    return value
 
 
 def _cursor_key(payload: Mapping[str, Any]) -> str:
@@ -214,7 +253,7 @@ def _message_client_msg_id(raw: Any) -> str:
 def _filter_slack_lookup(raw: Any, expected: str) -> dict[str, Any]:
     if isinstance(raw, Mapping):
         messages = raw.get("messages")
-        if isinstance(messages, list):
+        if isinstance(messages, (list, tuple)):
             matched = [
                 item for item in messages if _message_client_msg_id(item) == expected
             ]
@@ -224,7 +263,7 @@ def _filter_slack_lookup(raw: Any, expected: str) -> dict[str, Any]:
         if _message_client_msg_id(raw) == expected:
             return dict(raw)
         return {"ok": True, "messages": []}
-    if isinstance(raw, list):
+    if isinstance(raw, (list, tuple)):
         return {
             "ok": True,
             "messages": [item for item in raw if _message_client_msg_id(item) == expected],
@@ -242,6 +281,55 @@ def _receipt_value(raw: Any) -> Any:
     if isinstance(raw, str):
         return _redact(raw)
     return {"type": type(raw).__name__}
+
+
+class _FrozenDict(ABCMapping[str, Any]):
+    """A true immutable mapping snapshot used by results and receipts."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        self._data = MappingProxyType(dict(values))
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+
+def _sanitize_snapshot_key(raw: Any, secret: Optional[str]) -> str:
+    """Redact one copied mapping key, stringifying non-strings once."""
+    text = raw if type(raw) is str else str(raw)
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    return _redact(text)
+
+
+def _sanitize_snapshot(raw: Any, secret_value: Any = None) -> Any:
+    """Recursively copy, redact the resolved value everywhere, and freeze."""
+    secret = secret_value if type(secret_value) is str and secret_value else None
+    if isinstance(raw, Mapping):
+        return _FrozenDict(
+            {
+                _sanitize_snapshot_key(key, secret): _sanitize_snapshot(value, secret)
+                for key, value in raw.items()
+            }
+        )
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return tuple(_sanitize_snapshot(value, secret) for value in raw)
+    if type(raw) is str:
+        text = raw.replace(secret, "[REDACTED]") if secret else raw
+        return _redact(text)
+    if raw is None or isinstance(raw, (int, float, bool)):
+        return raw
+    return _FrozenDict({"type": type(raw).__name__})
 
 
 class _InjectedRequestPortBase:
@@ -263,14 +351,94 @@ class _InjectedRequestPortBase:
         )
         self._credential_resolver = credential_resolver
         self._closed = False
-        self._receipts: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+        self._idle = threading.Condition(self._lock)
+        self._active_calls = 0
+        self._receipts: list[_FrozenDict] = []
+        self._claims: dict[str, dict[str, Any]] = {}
+        capacity = _MAX_PERMANENT_WRITE_CLAIMS
+        if type(capacity) is not int:
+            raise TypeError("permanent write claim capacity must be an integer")
+        if capacity <= 0:
+            raise ValueError("permanent write claim capacity must be positive")
+        self._write_claim_capacity = capacity
 
-    def close(self) -> None:
-        self._closed = True
+    def _reserve_write_claim(self, claim_key: str) -> tuple[dict[str, Any], bool]:
+        """Atomically return an existing claim or reserve one permanent slot."""
+        with self._idle:
+            if self._closed:
+                raise RequestPortClosed("request port is closed")
+            claim = self._claims.get(claim_key)
+            if claim is not None:
+                return claim, False
+            if len(self._claims) >= self._write_claim_capacity:
+                raise RequestPortError("permanent write claim capacity exhausted")
+            claim = {"event": threading.Event()}
+            self._claims[claim_key] = claim
+            return claim, True
+
+    def _release_unstarted_write_claim(
+        self, claim_key: Optional[str], claim: Any, owner: bool
+    ) -> None:
+        """Release only this caller's unresolved claim before worker admission."""
+        if not owner or claim_key is None or claim is None:
+            return
+        with self._idle:
+            if (
+                self._claims.get(claim_key) is claim
+                and not claim.get("worker_admitted", False)
+                and not claim["event"].is_set()
+            ):
+                del self._claims[claim_key]
+                self._idle.notify_all()
+
+    def _admit_public_call(
+        self, *, timeout_seconds: Any, cancel_event: Any
+    ) -> Optional[float]:
+        """Admit one public request and establish its single absolute deadline."""
+        admission_started = time.monotonic()
+        if timeout_seconds is None:
+            deadline = None
+        else:
+            try:
+                seconds = float(timeout_seconds)
+            except BaseException as exc:
+                raise RequestPortTimeout("invalid timeout") from exc
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise RequestPortTimeout("timeout")
+            deadline = admission_started + seconds
+        _check_deadline(deadline=deadline, cancel_event=cancel_event)
+        with self._idle:
+            if self._closed:
+                raise RequestPortClosed("request port is closed")
+            self._active_calls += 1
+        return deadline
+
+    def _release_public_call(self) -> None:
+        with self._idle:
+            self._active_calls -= 1
+            self._idle.notify_all()
+
+    def _ensure_open(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RequestPortClosed("request port is closed")
+
+    def close(self, timeout_seconds: float = 0.25) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        with self._idle:
+            self._closed = True
+            while self._active_calls:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._idle.wait(remaining)
+            return True
 
     @property
     def receipts(self) -> tuple[dict[str, Any], ...]:
-        return tuple(self._receipts)
+        with self._lock:
+            return tuple(self._receipts)
 
     def _record_receipt(
         self,
@@ -282,35 +450,142 @@ class _InjectedRequestPortBase:
         client_invoked: bool,
         response: Any = None,
         error: BaseException | None = None,
+        secret_value: Any = None,
     ) -> None:
         try:
             offered = secret_ref if type(secret_ref) is str else ""
             receipt: dict[str, Any] = {
                 "operation": operation if type(operation) is str else "",
                 "secret_ref": offered,
-                "payload": _receipt_value(payload),
+                "payload": _sanitize_snapshot(payload, secret_value),
                 "outcome": outcome,
                 "client_invoked": bool(client_invoked),
             }
             if error is not None:
-                receipt["error"] = _redact(error)
+                text = _redact(error)
+                if type(secret_value) is str and secret_value:
+                    text = text.replace(secret_value, "[REDACTED]")
+                receipt["error"] = text
             elif response is not None:
-                receipt["response"] = _receipt_value(response)
-            self._receipts.append(receipt)
+                receipt["response"] = _sanitize_snapshot(response, secret_value)
+            with self._lock:
+                self._receipts.append(_sanitize_snapshot(receipt, secret_value))
         except Exception:
             return
 
-    def _prepare(
+    def _run_sync(
+        self,
+        claim_key: str,
+        call: Callable[[], Any],
+        *,
+        idempotent: bool = True,
+        deadline: Optional[float],
+        cancel_event: Any,
+        sanitize_result: Callable[[Any], Any],
+        reserved_claim: Optional[dict[str, Any]] = None,
+        reserved_owner: Optional[bool] = None,
+    ) -> Any:
+        _check_deadline(deadline=deadline, cancel_event=cancel_event)
+        with self._idle:
+            if self._closed:
+                raise RequestPortClosed("request port is closed")
+            if idempotent and reserved_claim is not None:
+                if self._claims.get(claim_key) is not reserved_claim:
+                    raise RequestPortError("write claim reservation was lost")
+                claim = reserved_claim
+                owner = bool(reserved_owner)
+                if owner:
+                    claim["worker_admitted"] = True
+                    self._active_calls += 1
+            else:
+                claim = self._claims.get(claim_key) if idempotent else None
+                if claim is None:
+                    claim = {"event": threading.Event()}
+                    if idempotent:
+                        # Completed write claims remain authoritative: silently
+                        # evicting one would permit duplicate external dispatch.
+                        self._claims[claim_key] = claim
+                    self._active_calls += 1
+                    owner = True
+                else:
+                    owner = False
+
+        if owner:
+            accounting = {"owned": True}
+
+            def worker() -> None:
+                try:
+                    # Claims may outlive the credential resolved by this caller.
+                    # Cache only a credential-independent frozen snapshot.
+                    claim["result"] = sanitize_result(call())
+                except BaseException as exc:
+                    # Preserved verbatim for the waiting caller; never converted here.
+                    claim["exception"] = exc
+                finally:
+                    with self._idle:
+                        if accounting["owned"]:
+                            self._active_calls -= 1
+                            accounting["owned"] = False
+                        claim["event"].set()
+                        self._idle.notify_all()
+
+            try:
+                thread = threading.Thread(
+                    target=worker,
+                    name=f"request-port-{claim_key[:24]}",
+                    daemon=True,
+                )
+                thread.start()
+            except BaseException as exc:
+                with self._idle:
+                    unresolved = not claim["event"].is_set()
+                    if accounting["owned"]:
+                        self._active_calls -= 1
+                        accounting["owned"] = False
+                    if (
+                        unresolved
+                        and idempotent
+                        and self._claims.get(claim_key) is claim
+                    ):
+                        del self._claims[claim_key]
+                    if unresolved:
+                        claim["exception"] = exc
+                        claim["event"].set()
+                    self._idle.notify_all()
+                raise RequestPortError("request worker failed to start") from exc
+
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise RequestPortTimeout("timeout")
+            wait_for = 0.005 if remaining is None else min(0.005, remaining)
+            if claim["event"].wait(wait_for):
+                break
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                raise RequestPortTimeout("cancelled")
+        # Event.wait() can return true only after its requested interval.  A
+        # completion that crossed this caller's deadline is still a timeout.
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise RequestPortTimeout("cancelled")
+        _check_deadline(deadline=deadline, cancel_event=cancel_event)
+        if "exception" in claim:
+            raise claim["exception"]
+        return claim.get("result")
+
+    def _validate_common(
         self,
         *,
         secret_ref: str,
         payload: Any,
         timeout_seconds: Any = None,
+        deadline: Optional[float] = None,
         cancel_event: Any = None,
     ) -> Mapping[str, Any]:
-        if self._closed:
-            raise RequestPortClosed("request port is closed")
-        _check_deadline(timeout_seconds=timeout_seconds, cancel_event=cancel_event)
+        _check_deadline(
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
         try:
             offered = validate_secret_ref_name(secret_ref, field="secret_ref")
         except Exception as exc:
@@ -320,8 +595,20 @@ class _InjectedRequestPortBase:
         body = _as_payload(payload)
         _match_bound(body, "workspace_id", self._workspace_id)
         _match_bound(body, "repository_identity", self._repository_identity)
-        _resolve_secret(self._credential_resolver, offered)
         return body
+
+    def _resolve_credential(
+        self,
+        *,
+        deadline: Optional[float] = None,
+        cancel_event: Any = None,
+    ) -> Any:
+        secret_value = _resolve_secret(self._credential_resolver, self._secret_ref)
+        # The injected resolver can block. Re-check closure and deadline after
+        # it returns and before admitting any provider worker.
+        self._ensure_open()
+        _check_deadline(deadline=deadline, cancel_event=cancel_event)
+        return secret_value
 
     def __repr__(self) -> str:
         return (
@@ -363,44 +650,109 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
         cancel_event: Any = None,
     ) -> Any:
         client_invoked = False
+        secret_value = None
+        admitted = False
+        write_claim_key: Optional[str] = None
+        write_claim: Optional[dict[str, Any]] = None
+        write_claim_owner = False
         try:
-            body = self._prepare(
+            deadline = self._admit_public_call(
+                timeout_seconds=timeout_seconds,
+                cancel_event=cancel_event,
+            )
+            admitted = True
+            body = self._validate_common(
                 secret_ref=secret_ref,
                 payload=payload,
                 timeout_seconds=timeout_seconds,
+                deadline=deadline,
                 cancel_event=cancel_event,
             )
             if operation == "create":
                 key = _cursor_key(body)
                 name, agent_id = _verify_cursor_correlation(body, key)
-                _client_method(self._client, "create_agent")
-                client_invoked = True
-                result = _invoke(
-                    self._client,
-                    "create_agent",
-                    {"name": name, "agentId": agent_id},
+                write_claim_key = f"cursor:create:{key}"
+                write_claim, write_claim_owner = self._reserve_write_claim(
+                    write_claim_key
                 )
+                _client_method(self._client, "create_agent")
             elif operation == "lookup":
                 key = _cursor_key(body)
                 _verify_cursor_correlation(body, key)
+                agent_id = cursor_correlation_agent_id(key)
                 _client_method(self._client, "get_agent")
-                client_invoked = True
-                result = _invoke(
-                    self._client,
-                    "get_agent",
-                    cursor_correlation_agent_id(key),
-                )
             elif operation == "status":
-                agent_id = body.get("agent_id") or body.get("agentId")
+                key = _cursor_key(body)
+                _name, expected_agent_id = _verify_cursor_correlation(body, key)
+                agent_id = body.get("agent_id")
                 run_id = body.get("run_id")
-                if type(agent_id) is not str or not agent_id.strip():
-                    raise RequestPortMismatch("agent_id is required")
+                if type(agent_id) is not str or agent_id != expected_agent_id:
+                    raise RequestPortMismatch(
+                        "Cursor payload agent identity does not match correlation"
+                    )
                 if type(run_id) is not str or not run_id.strip():
                     raise RequestPortMismatch("run_id is required")
                 _client_method(self._client, "get_run")
+            else:
+                raise RequestPortError(f"unsupported cursor operation: {operation}")
+
+            if operation != "create" or write_claim_owner:
+                secret_value = self._resolve_credential(
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
+            if operation == "create":
+                client_invoked = write_claim_owner
+                result = self._run_sync(
+                    write_claim_key,
+                    lambda: _invoke(
+                        self._client,
+                        "create_agent",
+                        {"name": name, "agentId": agent_id},
+                        _secret_value=secret_value,
+                    ),
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    sanitize_result=lambda value: _sanitize_snapshot(
+                        value, secret_value
+                    ),
+                    reserved_claim=write_claim,
+                    reserved_owner=write_claim_owner,
+                )
+            elif operation == "lookup":
                 client_invoked = True
-                result = _invoke(
-                    self._client, "get_run", agent_id.strip(), run_id.strip()
+                result = self._run_sync(
+                    f"cursor:lookup:{key}",
+                    lambda: _invoke(
+                        self._client,
+                        "get_agent",
+                        agent_id,
+                        _secret_value=secret_value,
+                    ),
+                    idempotent=False,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    sanitize_result=lambda value: _sanitize_snapshot(
+                        value, secret_value
+                    ),
+                )
+            elif operation == "status":
+                client_invoked = True
+                result = self._run_sync(
+                    f"cursor:status:{agent_id}:{run_id}",
+                    lambda: _invoke(
+                        self._client,
+                        "get_run",
+                        expected_agent_id,
+                        run_id.strip(),
+                        _secret_value=secret_value,
+                    ),
+                    idempotent=False,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    sanitize_result=lambda value: _sanitize_snapshot(
+                        value, secret_value
+                    ),
                 )
             else:
                 raise RequestPortError(f"unsupported cursor operation: {operation}")
@@ -411,9 +763,10 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                 outcome="ok",
                 client_invoked=True,
                 response=result,
+                secret_value=secret_value,
             )
-            return result
-        except BaseException as exc:
+            return _sanitize_snapshot(result, secret_value)
+        except (LaneClosedError, RequestPortError, Exception) as exc:
             self._record_receipt(
                 operation=operation,
                 secret_ref=secret_ref,
@@ -421,8 +774,15 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                 outcome="error",
                 client_invoked=client_invoked,
                 error=exc,
+                secret_value=secret_value,
             )
             raise
+        finally:
+            self._release_unstarted_write_claim(
+                write_claim_key, write_claim, write_claim_owner
+            )
+            if admitted:
+                self._release_public_call()
 
 
 class SlackInjectedRequestPort(_InjectedRequestPortBase):
@@ -435,15 +795,15 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
         secret_ref: str,
         workspace_id: str,
         channel_id: str,
-        repository_identity: str = "",
-        root_thread_ts: str = "",
+        repository_identity: str,
+        root_thread_ts: str,
         credential_resolver: Optional[Callable[[str], Any]] = None,
     ) -> None:
         super().__init__(
             client=client,
             secret_ref=secret_ref,
             workspace_id=workspace_id,
-            repository_identity=repository_identity or workspace_id,
+            repository_identity=repository_identity,
             methods=_SLACK_METHODS,
             credential_resolver=credential_resolver,
         )
@@ -460,11 +820,22 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
         cancel_event: Any = None,
     ) -> Any:
         client_invoked = False
+        secret_value = None
+        admitted = False
+        write_claim_key: Optional[str] = None
+        write_claim: Optional[dict[str, Any]] = None
+        write_claim_owner = False
         try:
-            body = self._prepare(
+            deadline = self._admit_public_call(
+                timeout_seconds=timeout_seconds,
+                cancel_event=cancel_event,
+            )
+            admitted = True
+            body = self._validate_common(
                 secret_ref=secret_ref,
                 payload=payload,
                 timeout_seconds=timeout_seconds,
+                deadline=deadline,
                 cancel_event=cancel_event,
             )
             _match_bound(body, "channel_id", self._channel_id)
@@ -472,27 +843,64 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
             key = _slack_key(body)
             if operation == "post_root":
                 text = body.get("text")
-                if type(text) is not str or not text:
+                if type(text) is not str or not text.strip():
                     job_id = body.get("job_id")
-                    text = job_id if type(job_id) is str else ""
-                _client_method(self._client, "chat_postMessage")
-                client_invoked = True
-                result = _invoke(
-                    self._client,
-                    "chat_postMessage",
-                    channel=self._channel_id,
-                    thread_ts=self._root_thread_ts,
-                    client_msg_id=key,
-                    text=text,
+                    if type(job_id) is not str or not job_id.strip():
+                        raise RequestPortMismatch("message text or job_id is required")
+                    text = job_id
+                write_claim_key = f"slack:post_root:{key}"
+                write_claim, write_claim_owner = self._reserve_write_claim(
+                    write_claim_key
                 )
+                _client_method(self._client, "chat_postMessage")
             elif operation == "lookup":
                 _client_method(self._client, "conversations_replies")
+            else:
+                raise RequestPortError(f"unsupported slack operation: {operation}")
+
+            if operation != "post_root" or write_claim_owner:
+                secret_value = self._resolve_credential(
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
+            if operation == "post_root":
+                client_invoked = write_claim_owner
+                result = self._run_sync(
+                    write_claim_key,
+                    lambda: _invoke(
+                        self._client,
+                        "chat_postMessage",
+                        channel=self._channel_id,
+                        thread_ts=self._root_thread_ts,
+                        client_msg_id=key,
+                        text=text,
+                        _secret_value=secret_value,
+                    ),
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    sanitize_result=lambda value: _sanitize_snapshot(
+                        value, secret_value
+                    ),
+                    reserved_claim=write_claim,
+                    reserved_owner=write_claim_owner,
+                )
+            elif operation == "lookup":
                 client_invoked = True
-                raw = _invoke(
-                    self._client,
-                    "conversations_replies",
-                    channel=self._channel_id,
-                    ts=self._root_thread_ts,
+                raw = self._run_sync(
+                    f"slack:lookup:{key}",
+                    lambda: _invoke(
+                        self._client,
+                        "conversations_replies",
+                        channel=self._channel_id,
+                        ts=self._root_thread_ts,
+                        _secret_value=secret_value,
+                    ),
+                    idempotent=False,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    sanitize_result=lambda value: _sanitize_snapshot(
+                        value, secret_value
+                    ),
                 )
                 result = _filter_slack_lookup(raw, key)
             else:
@@ -504,9 +912,10 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                 outcome="ok",
                 client_invoked=True,
                 response=result,
+                secret_value=secret_value,
             )
-            return result
-        except BaseException as exc:
+            return _sanitize_snapshot(result, secret_value)
+        except (LaneClosedError, RequestPortError, Exception) as exc:
             self._record_receipt(
                 operation=operation,
                 secret_ref=secret_ref,
@@ -514,8 +923,15 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                 outcome="error",
                 client_invoked=client_invoked,
                 error=exc,
+                secret_value=secret_value,
             )
             raise
+        finally:
+            self._release_unstarted_write_claim(
+                write_claim_key, write_claim, write_claim_owner
+            )
+            if admitted:
+                self._release_public_call()
 
     def __repr__(self) -> str:
         return (

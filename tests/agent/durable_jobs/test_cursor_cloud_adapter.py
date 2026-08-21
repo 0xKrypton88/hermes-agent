@@ -97,9 +97,17 @@ class MemoryCursorTransport:
                 return self.lookups
             return list(self.lookups)
 
-    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+    def status(
+        self, *, run_id: str, agent_id: str = "", idempotency_key: str = ""
+    ) -> Any:
         with self._lock:
-            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
+            self.status_calls.append(
+                {
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "idempotency_key": idempotency_key,
+                }
+            )
             if isinstance(self.status_payload, BaseException):
                 raise self.status_payload
             return self.status_payload
@@ -355,6 +363,7 @@ def test_unknown_provider_state_fails_closed_without_redispatch(tmp_path):
         CursorCloudAdapter,
         CursorCreateKind,
         CursorStatusKind,
+        cursor_correlation_agent_id,
     )
     from agent.durable_jobs.effects import (
         EffectStatus,
@@ -390,9 +399,16 @@ def test_unknown_provider_state_fails_closed_without_redispatch(tmp_path):
     assert third.status is EffectStatus.UNKNOWN
     assert len(transport.create_calls) == 2
 
-    status = adapter.status_run(run_id="run-x")
+    status = adapter.status_run(run_id="run-x", idempotency_key=key)
     assert status.kind is CursorStatusKind.UNKNOWN
     assert status.run is None or status.run.state.value == "unknown"
+    assert transport.status_calls == [
+        {
+            "run_id": "run-x",
+            "agent_id": cursor_correlation_agent_id(key),
+            "idempotency_key": key,
+        }
+    ]
 
 
 def test_provider_errors_are_secret_safe_and_redacted():
@@ -400,6 +416,7 @@ def test_provider_errors_are_secret_safe_and_redacted():
         CursorCloudAdapter,
         CursorCreateKind,
         CursorStatusKind,
+        cursor_correlation_agent_id,
         redact_provider_error,
     )
 
@@ -427,11 +444,19 @@ def test_provider_errors_are_secret_safe_and_redacted():
     assert token not in blob
     assert "p@ssword" not in blob
 
-    status = adapter.status_run(run_id="run-secret")
+    status_key = "cursor:job:create_run"
+    status = adapter.status_run(run_id="run-secret", idempotency_key=status_key)
     assert status.kind in (CursorStatusKind.UNKNOWN, CursorStatusKind.AMBIGUOUS)
     assert status.error is not None
     assert token not in status.error
     assert "p@ssword" not in status.error
+    assert transport.status_calls == [
+        {
+            "run_id": "run-secret",
+            "agent_id": cursor_correlation_agent_id(status_key),
+            "idempotency_key": status_key,
+        }
+    ]
     assert token not in redact_provider_error(f"dsn={secret} token={token}")
     assert "p@ssword" not in redact_provider_error(secret)
 
@@ -473,7 +498,7 @@ def test_status_and_reconcile_use_ledger_not_a_second_store(tmp_path):
     assert bound.status is EffectStatus.ACCEPTED
     assert bound.provider_run_id == "run-status"
 
-    unique = adapter.status_run(run_id="run-status")
+    unique = adapter.status_run(run_id="run-status", idempotency_key=key)
     assert unique.kind is CursorStatusKind.UNIQUE
     assert unique.run is not None
     assert unique.run.run_id == "run-status"
@@ -490,7 +515,7 @@ def test_status_and_reconcile_use_ledger_not_a_second_store(tmp_path):
         {"run_id": "run-status", "idempotency_key": key},
         {"run_id": "run-other", "idempotency_key": key},
     ]
-    ambiguous = adapter.status_run(run_id="run-status")
+    ambiguous = adapter.status_run(run_id="run-status", idempotency_key=key)
     assert ambiguous.kind is CursorStatusKind.AMBIGUOUS
     still = adapter.reconcile_status(
         ledger, job_id=job.job_id, action_id="create_run"
@@ -500,12 +525,79 @@ def test_status_and_reconcile_use_ledger_not_a_second_store(tmp_path):
     assert still.observation.kind is CursorStatusKind.AMBIGUOUS
     assert still.claim.status is EffectStatus.ACCEPTED
     assert still.claim.provider_run_id == "run-status"
+    assert [call["idempotency_key"] for call in transport.status_calls] == [key] * 4
+    assert all(call["run_id"] == "run-status" for call in transport.status_calls)
+    sent_agent = transport.create_calls[0]["agent_id"]
+    assert [call["agent_id"] for call in transport.status_calls] == [sent_agent] * 4
+
+
+def test_status_requires_key_and_derives_matching_agent_before_transport():
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        CursorStatusKind,
+        cursor_correlation_agent_id,
+    )
+    from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
+
+    key = "cursor:job:create_run"
+    expected_agent = cursor_correlation_agent_id(key)
+    raw_calls: list[tuple[str, str, dict]] = []
+
+    def request(operation, secret_ref, payload):
+        raw_calls.append((operation, secret_ref, payload))
+        return {
+            "run_id": "run-status",
+            "idempotency_key": key,
+            "agent_id": expected_agent,
+            "state": "running",
+        }
+
+    transport = CursorCloudInjectedTransport(
+        request=request,
+        secret_ref="CURSOR_API_KEY",
+        workspace_id="workspace-1",
+        repository_identity="repo-1",
+    )
+    adapter = CursorCloudAdapter(transport=transport)
+
+    with pytest.raises(TypeError, match="idempotency_key"):
+        adapter.status_run(run_id="run-status")
+    for kwargs in (
+        {"idempotency_key": "   "},
+        {"idempotency_key": key, "agent_id": "not-the-derived-agent"},
+    ):
+        result = adapter.status_run(run_id="run-status", **kwargs)
+        assert result.kind is CursorStatusKind.UNKNOWN
+    assert raw_calls == []
+
+    result = adapter.status_run(run_id="run-status", idempotency_key=key)
+    assert result.kind is CursorStatusKind.UNIQUE
+    assert result.run is not None
+    assert result.run.agent_id == expected_agent
+    assert len(raw_calls) == 1
+    assert raw_calls[0][2]["idempotency_key"] == key
+    assert raw_calls[0][2]["agent_id"] == expected_agent
+
+    with pytest.raises(ValueError, match="idempotency key"):
+        transport.status(run_id="run-status", idempotency_key="", agent_id="")
+    with pytest.raises(ValueError, match="agent id"):
+        transport.status(
+            run_id="run-status",
+            idempotency_key=key,
+            agent_id="not-the-derived-agent",
+        )
+    assert len(raw_calls) == 1
 
 
 def test_adapter_methods_open_no_network_sockets(monkeypatch):
     import socket
 
-    from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
+    from agent.durable_jobs.cursor_cloud import (
+        CursorCloudAdapter,
+        cursor_correlation_agent_id,
+    )
+
+    key = "cursor:job:create_run"
 
     def _deny(*_args, **_kwargs):
         raise AssertionError("network socket open attempted in ENG-30 adapter")
@@ -529,7 +621,14 @@ def test_adapter_methods_open_no_network_sockets(monkeypatch):
     created = adapter.create_run(idempotency_key="cursor:job:create_run", job_id="job")
     assert created.run is not None
     assert adapter.lookup_runs(idempotency_key="cursor:job:create_run")
-    assert adapter.status_run(run_id="run-offline").run is not None
+    assert adapter.status_run(run_id="run-offline", idempotency_key=key).run is not None
+    assert transport.status_calls == [
+        {
+            "run_id": "run-offline",
+            "agent_id": cursor_correlation_agent_id(key),
+            "idempotency_key": key,
+        }
+    ]
 
 
 def test_explicit_nonempty_idempotency_mismatch_fails_closed_without_adoption(tmp_path):
@@ -605,8 +704,11 @@ def test_typed_status_result_validates_expected_run_identity():
         CursorRunState,
         CursorStatusKind,
         CursorStatusResult,
+        cursor_correlation_agent_id,
         normalize_status_result,
     )
+
+    key = "cursor:job:create_run"
 
     typed = CursorStatusResult(
         kind=CursorStatusKind.UNIQUE,
@@ -622,9 +724,16 @@ def test_typed_status_result_validates_expected_run_identity():
 
     transport = MemoryCursorTransport(status_payload=typed)
     adapter = CursorCloudAdapter(transport=transport)
-    observed = adapter.status_run(run_id="expected-run")
+    observed = adapter.status_run(run_id="expected-run", idempotency_key=key)
     assert observed.kind is CursorStatusKind.UNKNOWN
     assert observed.kind is not CursorStatusKind.UNIQUE
+    assert transport.status_calls == [
+        {
+            "run_id": "expected-run",
+            "agent_id": cursor_correlation_agent_id(key),
+            "idempotency_key": key,
+        }
+    ]
 
     matched = normalize_status_result(
         CursorStatusResult(
@@ -705,6 +814,7 @@ def test_reconcile_status_does_not_report_stale_success_when_provider_is_fail_cl
     assert still.status is EffectStatus.ACCEPTED
     assert still.provider_run_id == "run-status"
     assert ledger.get_mapping(job.job_id).provider_run_id == "run-status"
+    assert [call["idempotency_key"] for call in transport.status_calls] == [key, key]
 
 
 def _official_v0_agent(*, agent_id: str, name: str, status: str) -> dict:
@@ -771,9 +881,17 @@ class OfficialNameMarkerTransport:
             assert all("idempotency_key" not in item for item in envelope["agents"])
             return envelope
 
-    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+    def status(
+        self, *, run_id: str, agent_id: str = "", idempotency_key: str = ""
+    ) -> Any:
         with self._lock:
-            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
+            self.status_calls.append(
+                {
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "idempotency_key": idempotency_key,
+                }
+            )
             for agent in self._agents:
                 if agent.get("id") == run_id:
                     return dict(agent)
@@ -954,9 +1072,17 @@ class OfficialV1GeneratedNameTransport:
             assert all("prompt" not in item for item in envelope["items"])
             return envelope
 
-    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+    def status(
+        self, *, run_id: str, agent_id: str = "", idempotency_key: str = ""
+    ) -> Any:
         with self._lock:
-            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
+            self.status_calls.append(
+                {
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "idempotency_key": idempotency_key,
+                }
+            )
             for item in self._items:
                 latest = item.get("latestRunId")
                 if latest != run_id:
@@ -1234,9 +1360,17 @@ def test_typed_sdk_derived_id_adopts_and_matches_raw_dict(tmp_path):
 class V1DistinctAgentRunTransport(OfficialV1GeneratedNameTransport):
     """v1 create/list plus GET /agents/{agent_id}/runs/{run_id} recording."""
 
-    def status(self, *, run_id: str, agent_id: str = "") -> Any:
+    def status(
+        self, *, run_id: str, agent_id: str = "", idempotency_key: str = ""
+    ) -> Any:
         with self._lock:
-            self.status_calls.append({"run_id": run_id, "agent_id": agent_id})
+            self.status_calls.append(
+                {
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "idempotency_key": idempotency_key,
+                }
+            )
             for item in self._items:
                 latest = item.get("latestRunId")
                 if latest != run_id:
@@ -1321,6 +1455,7 @@ def test_v1_lost_create_persists_run_id_not_agent_id_for_status(tmp_path):
     assert observed.claim.provider_run_id == latest_run
     assert transport.status_calls[-1]["run_id"] == latest_run
     assert transport.status_calls[-1]["agent_id"] == sent_agent
+    assert transport.status_calls[-1]["idempotency_key"] == key
     assert transport.status_calls[-1]["run_id"] != sent_agent
 
 

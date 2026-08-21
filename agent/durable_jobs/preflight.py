@@ -26,6 +26,10 @@ from agent.durable_jobs.injected_transports import (
     SlackInjectedTransport,
 )
 from agent.durable_jobs.redaction import redact_secret_text
+from agent.durable_jobs.request_ports import (
+    CursorCloudInjectedRequestPort,
+    SlackInjectedRequestPort,
+)
 
 
 @dataclass(frozen=True)
@@ -688,23 +692,15 @@ def _process_environ_dict() -> dict | None:
 
 
 def _secret_ref_present(ref: Optional[str]) -> bool:
-    """True when the child-inherited process environment has this *name*.
+    """Never treat an ambient environment name as credential authority.
 
-    Accepts only an exact ``str`` name. Requires an intact captured
-    ``os._Environ`` boundary, then probes native name presence without
-    retrieving, resolving, stringifying, logging, or comparing credential
-    values. Never calls overridable ``os.environ`` mapping APIs or user
-    equality/hash hooks, and never consults ``posix.environ`` /
-    ``nt.environ`` or a replaced ``_data`` cache.
+    Production request ports resolve credential values at the request boundary.
+    Environment presence, including a genuine inherited name, therefore cannot
+    mint readiness or binding authority.  Keep this fail-closed compatibility
+    seam so older callers cannot accidentally revive the legacy behavior.
     """
-    if type(ref) is not str or str.__len__(ref) == 0:
-        return False
-    if _process_environ_dict() is None:
-        return False
-    native = _native_env_name_present(ref)
-    if native is None:
-        return False
-    return native is True
+    _ = ref
+    return False
 
 
 def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
@@ -793,6 +789,46 @@ def _transport_secret_ref(transport: Any) -> Optional[str]:
     return text
 
 
+def _transport_resolves_at_request_boundary(
+    transport: Any, cfg: DurableJobsConfig
+) -> bool:
+    """Verify an exact request port is bound to the transport/config identity."""
+    request = _instance_attr(transport, "_request")
+    binding = cfg.identity_binding
+    if binding is None:
+        return False
+    if type(transport) is CursorCloudInjectedTransport:
+        request_cls = CursorCloudInjectedRequestPort
+        expected = (
+            ("_workspace_id", binding.workspace_id),
+            ("_repository_identity", binding.repository_identity),
+            ("_secret_ref", cfg.cursor_secret_ref),
+        )
+    elif type(transport) is SlackInjectedTransport:
+        request_cls = SlackInjectedRequestPort
+        expected = (
+            ("_workspace_id", binding.workspace_id),
+            ("_repository_identity", binding.repository_identity),
+            ("_secret_ref", cfg.slack_secret_ref),
+            ("_channel_id", _instance_attr(transport, "_channel_id")),
+            ("_root_thread_ts", _instance_attr(transport, "_root_thread_ts")),
+        )
+    else:
+        return False
+    if type(request) is not request_cls:
+        return False
+    for name, wanted in expected:
+        transport_value = _instance_attr(transport, name)
+        request_value = _instance_attr(request, name)
+        if type(wanted) is not str or type(transport_value) is not str:
+            return False
+        if type(request_value) is not str or not str.__eq__(request_value, wanted):
+            return False
+        if not str.__eq__(transport_value, wanted):
+            return False
+    return True
+
+
 def _injected_secret_ref_binding_reason(
     cfg: DurableJobsConfig,
     cursor_transport: Any,
@@ -811,7 +847,7 @@ def _injected_secret_ref_binding_reason(
             or not str.__eq__(declared, expected)
         ):
             return "transport_secret_ref_mismatch"
-        if not _secret_ref_present(declared):
+        if not _transport_resolves_at_request_boundary(cursor_transport, cfg):
             return "secret_refs_missing"
     if cfg.slack_adapter_mode == ADAPTER_MODE_INJECTED:
         declared = _transport_secret_ref(slack_transport)
@@ -822,7 +858,7 @@ def _injected_secret_ref_binding_reason(
             or not str.__eq__(declared, expected)
         ):
             return "transport_secret_ref_mismatch"
-        if not _secret_ref_present(declared):
+        if not _transport_resolves_at_request_boundary(slack_transport, cfg):
             return "secret_refs_missing"
     return None
 
@@ -873,11 +909,11 @@ def preflight_durable_jobs(
     ):
         cursor_ok = (
             cfg.cursor_adapter_mode != ADAPTER_MODE_INJECTED
-            or _secret_ref_present(cfg.cursor_secret_ref)
+            or _transport_resolves_at_request_boundary(cursor_transport, cfg)
         )
         slack_ok = (
             cfg.slack_adapter_mode != ADAPTER_MODE_INJECTED
-            or _secret_ref_present(cfg.slack_secret_ref)
+            or _transport_resolves_at_request_boundary(slack_transport, cfg)
         )
         secret_refs_present = bool(cursor_ok and slack_ok)
     else:
@@ -903,7 +939,7 @@ def preflight_durable_jobs(
         if transport_capability
         else None
     )
-    if constructible and secret_refs_present and not transport_capability:
+    if constructible and not transport_capability:
         reasons.append("transport_capability_missing")
     if constructible and transport_capability and binding_reason:
         if binding_reason not in reasons:

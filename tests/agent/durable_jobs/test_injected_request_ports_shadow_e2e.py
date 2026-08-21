@@ -74,7 +74,10 @@ def _attach_shadow_lane(tmp_path: Path, monkeypatch, cursor_port, slack_port):
 
     bind_runtime_secret_env(monkeypatch)
     raw = _complete(tmp_path)
-    owner = _owner_with_matching_identity()
+    owner = _owner_with_matching_identity(
+        _durable_job_slack_channel_id=CHANNEL,
+        _durable_job_slack_root_thread_ts=THREAD,
+    )
     bound = bind_production_transports(
         raw,
         owner=owner,
@@ -205,6 +208,8 @@ def test_shadow_e2e_timeout_provider_error_retry_and_bounded_shutdown(
                 "idempotency_key": CURSOR_KEY,
                 "name": _cursor_ids()[0],
                 "agentId": _cursor_ids()[1],
+                "workspace_id": WORKSPACE,
+                "repository_identity": REPO,
             },
             timeout_seconds=0,
         )
@@ -218,9 +223,11 @@ def test_shadow_e2e_timeout_provider_error_retry_and_bounded_shutdown(
             operation="create",
             secret_ref=_SECRET_CURSOR,
             payload={
-                "idempotency_key": CURSOR_KEY,
-                "name": _cursor_ids()[0],
-                "agentId": _cursor_ids()[1],
+                "idempotency_key": "cursor-error-key",
+                "name": _cursor_ids("cursor-error-key")[0],
+                "agentId": _cursor_ids("cursor-error-key")[1],
+                "workspace_id": WORKSPACE,
+                "repository_identity": REPO,
             },
         )
     assert CURSOR_SECRET_VALUE not in str(caught.value)
@@ -256,7 +263,11 @@ def test_shadow_e2e_timeout_provider_error_retry_and_bounded_shutdown(
     reused = cursor_port(
         operation="lookup",
         secret_ref=_SECRET_CURSOR,
-        payload={"idempotency_key": CURSOR_KEY},
+        payload={
+            "idempotency_key": CURSOR_KEY,
+            "workspace_id": WORKSPACE,
+            "repository_identity": REPO,
+        },
     )
     assert reused["agentId"] == _cursor_ids()[1]
     cursor_port.close()
@@ -265,7 +276,11 @@ def test_shadow_e2e_timeout_provider_error_retry_and_bounded_shutdown(
         cursor_port(
             operation="lookup",
             secret_ref=_SECRET_CURSOR,
-            payload={"idempotency_key": CURSOR_KEY},
+            payload={
+            "idempotency_key": CURSOR_KEY,
+            "workspace_id": WORKSPACE,
+            "repository_identity": REPO,
+        },
         )
 
 

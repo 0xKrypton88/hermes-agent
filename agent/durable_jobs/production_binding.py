@@ -28,10 +28,13 @@ from agent.durable_jobs.config import (
     DurableJobsConfigError,
     load_durable_jobs_config,
 )
-from agent.durable_jobs.preflight import _secret_ref_present
 from agent.durable_jobs.injected_transports import (
     CursorCloudInjectedTransport,
     SlackInjectedTransport,
+)
+from agent.durable_jobs.request_ports import (
+    CursorCloudInjectedRequestPort,
+    SlackInjectedRequestPort,
 )
 
 OWNER_CURSOR_REQUEST_ATTR = "_durable_job_cursor_request"
@@ -196,22 +199,52 @@ def _instance_attr(transport: Any, name: str) -> Any:
     return _owner_attr(transport, name)
 
 
-def _is_request_port(value: Any) -> bool:
-    if value is None or not callable(value):
+def _is_request_port(value: Any, expected_cls: type) -> bool:
+    """Accept only an approved request-bound capability for its provider."""
+    return type(value) is expected_cls and callable(value)
+
+
+def _request_binding_matches(
+    request: Any,
+    expected_cls: type,
+    expected: tuple[tuple[str, str], ...],
+) -> bool:
+    """Compare exact request-port bindings through builtin instance storage."""
+    if not _is_request_port(request, expected_cls):
         return False
-    if type(value) in (CursorCloudInjectedTransport, SlackInjectedTransport):
+    pairs = _exact_str_item_pairs(_concrete_instance_storage(request))
+    if pairs is None:
         return False
+    for name, wanted in expected:
+        actual = _exact_str_pair_value(pairs, name)
+        if type(actual) is not str or type(wanted) is not str:
+            return False
+        if not str.__eq__(actual, wanted):
+            return False
     return True
 
 
-def _approved_transport(transport: Any, expected_cls: type, expected_ref: Optional[str]) -> bool:
-    if expected_ref is None or type(transport) is not expected_cls:
+def _approved_transport(
+    transport: Any,
+    expected_cls: type,
+    expected_request_cls: type,
+    expected: tuple[tuple[str, str], ...] | str,
+) -> bool:
+    # Keep the legacy internal secret-ref-only probe compatible. Production
+    # binding always supplies the full identity tuple below, so this does not
+    # relax its workspace/repository/channel/thread checks.
+    if type(expected) is str:
+        expected = (("_secret_ref", expected),)
+    elif type(expected) is not tuple:
+        return False
+    if type(transport) is not expected_cls:
         return False
     request = _instance_attr(transport, "_request")
-    secret_ref = _instance_attr(transport, "_secret_ref")
-    if type(expected_ref) is not str or type(secret_ref) is not str:
-        return False
-    return callable(request) and str.__eq__(secret_ref, expected_ref)
+    for name, wanted in expected:
+        actual = _instance_attr(transport, name)
+        if type(actual) is not str or not str.__eq__(actual, wanted):
+            return False
+    return _request_binding_matches(request, expected_request_cls, expected)
 
 
 def _runtime_identity(owner: Any) -> Optional[tuple[str, str]]:
@@ -309,11 +342,6 @@ def _wrap_injected_clients(
         return None
     if type(cfg.cursor_secret_ref) is not str or type(cfg.slack_secret_ref) is not str:
         return None
-    from agent.durable_jobs.request_ports import (
-        CursorCloudInjectedRequestPort,
-        SlackInjectedRequestPort,
-    )
-
     try:
         return (
             CursorCloudInjectedRequestPort(
@@ -373,10 +401,29 @@ def bind_production_transports(
     if (
         type(cfg.cursor_secret_ref) is not str
         or type(cfg.slack_secret_ref) is not str
-        or not _secret_ref_present(cfg.cursor_secret_ref)
-        or not _secret_ref_present(cfg.slack_secret_ref)
+        or not cfg.cursor_secret_ref.strip()
+        or not cfg.slack_secret_ref.strip()
     ):
         return {}
+    binding = cfg.identity_binding
+    if binding is None:
+        return {}
+    channel_id = _exact_owner_str(owner, OWNER_SLACK_CHANNEL_ATTR, slack_channel_id)
+    thread_ts = _exact_owner_str(owner, OWNER_SLACK_THREAD_ATTR, slack_root_thread_ts)
+    if channel_id is None or thread_ts is None:
+        return {}
+    cursor_expected = (
+        ("_workspace_id", binding.workspace_id),
+        ("_repository_identity", binding.repository_identity),
+        ("_secret_ref", cfg.cursor_secret_ref),
+    )
+    slack_expected = (
+        ("_workspace_id", binding.workspace_id),
+        ("_repository_identity", binding.repository_identity),
+        ("_secret_ref", cfg.slack_secret_ref),
+        ("_channel_id", channel_id),
+        ("_root_thread_ts", thread_ts),
+    )
 
     if cursor_transport is None:
         cursor_transport = _owner_attr(owner, OWNER_CURSOR_TRANSPORT_ATTR)
@@ -396,12 +443,14 @@ def bind_production_transports(
             and _approved_transport(
                 cursor_transport,
                 CursorCloudInjectedTransport,
-                cfg.cursor_secret_ref,
+                CursorCloudInjectedRequestPort,
+                cursor_expected,
             )
             and _approved_transport(
                 slack_transport,
                 SlackInjectedTransport,
-                cfg.slack_secret_ref,
+                SlackInjectedRequestPort,
+                slack_expected,
             )
         ):
             return {}
@@ -411,8 +460,12 @@ def bind_production_transports(
         }
 
     if not (
-        _is_request_port(cursor_request)
-        and _is_request_port(slack_request)
+        _request_binding_matches(
+            cursor_request, CursorCloudInjectedRequestPort, cursor_expected
+        )
+        and _request_binding_matches(
+            slack_request, SlackInjectedRequestPort, slack_expected
+        )
         and cfg.cursor_secret_ref
         and cfg.slack_secret_ref
     ):
@@ -421,8 +474,8 @@ def bind_production_transports(
             owner,
             cursor_client=cursor_client,
             slack_client=slack_client,
-            slack_channel_id=slack_channel_id,
-            slack_root_thread_ts=slack_root_thread_ts,
+            slack_channel_id=channel_id,
+            slack_root_thread_ts=thread_ts,
             credential_resolver=credential_resolver,
         )
         if wrapped is None:
@@ -432,10 +485,18 @@ def bind_production_transports(
     try:
         return {
             "cursor_transport": CursorCloudInjectedTransport(
-                request=cursor_request, secret_ref=cfg.cursor_secret_ref
+                request=cursor_request,
+                secret_ref=cfg.cursor_secret_ref,
+                workspace_id=binding.workspace_id,
+                repository_identity=binding.repository_identity,
             ),
             "slack_transport": SlackInjectedTransport(
-                request=slack_request, secret_ref=cfg.slack_secret_ref
+                request=slack_request,
+                secret_ref=cfg.slack_secret_ref,
+                workspace_id=binding.workspace_id,
+                repository_identity=binding.repository_identity,
+                channel_id=channel_id,
+                root_thread_ts=thread_ts,
             ),
         }
     except (TypeError, ValueError, DurableJobsConfigError):

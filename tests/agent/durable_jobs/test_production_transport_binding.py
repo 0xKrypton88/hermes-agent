@@ -69,6 +69,46 @@ def _idle_request(calls: list):
     return request
 
 
+def _approved_request_ports(calls: list):
+    from agent.durable_jobs.request_ports import (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    )
+
+    def _idle(*_a, **_k):
+        calls.append("provider-called")
+        raise AssertionError("attach/preflight must not call the provider")
+
+    class _CursorClient:
+        create_agent = _idle
+        get_agent = _idle
+        get_run = _idle
+
+    class _SlackClient:
+        chat_postMessage = _idle
+        conversations_replies = _idle
+
+    resolve = lambda _ref: "explicit-test-credential"
+    return (
+        CursorCloudInjectedRequestPort(
+            client=_CursorClient(),
+            secret_ref="CURSOR_API_KEY",
+            workspace_id=CONFIG_WORKSPACE,
+            repository_identity=CONFIG_REPO,
+            credential_resolver=resolve,
+        ),
+        SlackInjectedRequestPort(
+            client=_SlackClient(),
+            secret_ref="SLACK_BOT_TOKEN",
+            workspace_id=CONFIG_WORKSPACE,
+            repository_identity=CONFIG_REPO,
+            channel_id="C1",
+            root_thread_ts="1.000000",
+            credential_resolver=resolve,
+        ),
+    )
+
+
 def _require_binding():
     try:
         from agent.durable_jobs.production_binding import bind_production_transports
@@ -101,6 +141,8 @@ def _matching_identity(**overrides) -> dict:
 def _owner_with_matching_identity():
     owner = type("Owner", (), {})()
     owner.__dict__["_durable_job_runtime_identity"] = _matching_identity()
+    owner.__dict__["_durable_job_slack_channel_id"] = "C1"
+    owner.__dict__["_durable_job_slack_root_thread_ts"] = "1.000000"
     return owner
 
 
@@ -423,15 +465,10 @@ def _child_inherits_env_name(name: str) -> bool:
 
 
 def _environ_instance_storage():
-    from agent.durable_jobs.preflight import (
-        _CAPTURED_OS_ENVIRON,
-        _CAPTURED_OS_ENVIRON_DICT,
-        _CAPTURED_OS_ENVIRON_TYPE,
-    )
-
-    return _CAPTURED_OS_ENVIRON_DICT.__get__(
-        _CAPTURED_OS_ENVIRON, _CAPTURED_OS_ENVIRON_TYPE
-    )
+    storage = object.__getattribute__(os.environ, "__dict__")
+    if type(storage) is not dict:
+        raise AssertionError("expected genuine os.environ instance storage")
+    return storage
 
 
 def _replace_environ_data(replacement):
@@ -442,9 +479,7 @@ def _replace_environ_data(replacement):
 
 
 def _insert_backing_only_name(name: str):
-    from agent.durable_jobs.preflight import _process_environ_dict
-
-    data = _process_environ_dict()
+    data = dict.__getitem__(_environ_instance_storage(), "_data")
     if type(data) is not dict:
         raise AssertionError("expected intact environ backing dict")
     encoded = str.encode(name, "ascii")
@@ -723,12 +758,13 @@ def test_correct_bound_request_ports_return_approved_transports(
     monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     raw = _complete(tmp_path)
     bound = bind_production_transports(
         raw,
         owner=_owner_with_matching_identity(),
-        cursor_request=_idle_request(calls),
-        slack_request=_idle_request(calls),
+        cursor_request=cursor_request,
+        slack_request=slack_request,
     )
     assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
     assert type(bound.get("slack_transport")) is SlackInjectedTransport
@@ -740,6 +776,68 @@ def test_correct_bound_request_ports_return_approved_transports(
     assert calls == []
     _assert_no_secrets(bound)
     _assert_no_secrets(report)
+
+
+@pytest.mark.parametrize(
+    ("port_name", "attribute", "mismatched"),
+    (
+        ("cursor", "_workspace_id", "T-FOREIGN"),
+        ("cursor", "_repository_identity", "foreign/repository"),
+        ("cursor", "_secret_ref", "FOREIGN_CURSOR_REF"),
+        ("slack", "_workspace_id", "T-FOREIGN"),
+        ("slack", "_repository_identity", "foreign/repository"),
+        ("slack", "_secret_ref", "FOREIGN_SLACK_REF"),
+        ("slack", "_channel_id", "C-FOREIGN"),
+        ("slack", "_root_thread_ts", "9.999999"),
+    ),
+)
+def test_mismatched_exact_request_port_identity_fails_binding_and_preflight(
+    tmp_path, monkeypatch, port_name, attribute, mismatched
+):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    bind_production_transports = _require_binding()
+    monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
+    calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
+    cursor_transport = CursorCloudInjectedTransport(
+        request=cursor_request,
+        secret_ref="CURSOR_API_KEY",
+        workspace_id=CONFIG_WORKSPACE,
+        repository_identity=CONFIG_REPO,
+    )
+    slack_transport = SlackInjectedTransport(
+        request=slack_request,
+        secret_ref="SLACK_BOT_TOKEN",
+        workspace_id=CONFIG_WORKSPACE,
+        repository_identity=CONFIG_REPO,
+        channel_id="C1",
+        root_thread_ts="1.000000",
+    )
+    request = cursor_request if port_name == "cursor" else slack_request
+    object.__setattr__(request, attribute, mismatched)
+    raw = _complete(tmp_path)
+
+    assert bind_production_transports(
+        raw,
+        owner=_owner_with_matching_identity(),
+        cursor_request=cursor_request,
+        slack_request=slack_request,
+    ) == {}
+
+    report = preflight_durable_jobs(
+        raw,
+        cursor_transport=cursor_transport,
+        slack_transport=slack_transport,
+    )
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert calls == []
 
 
 def test_bind_and_preflight_open_no_sockets_or_provider_calls(
@@ -755,11 +853,12 @@ def test_bind_and_preflight_open_no_sockets_or_provider_calls(
     monkeypatch.setattr(socket.socket, "connect", _deny)
     monkeypatch.setattr(socket.socket, "connect_ex", _deny)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     bound = bind_production_transports(
         _complete(tmp_path),
         owner=_owner_with_matching_identity(),
-        cursor_request=_idle_request(calls),
-        slack_request=_idle_request(calls),
+        cursor_request=cursor_request,
+        slack_request=slack_request,
     )
     assert bound
     assert calls == []
@@ -977,14 +1076,16 @@ def test_concrete_instance_storage_is_used_without_executing_class_descriptors(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     probes: list = []
     calls: list = []
-    request = _idle_request(calls)
+    cursor_request, slack_request = _approved_request_ports(calls)
 
     class Owner:
         _durable_job_runtime_identity = _SeamDescriptor(
             probes, "identity", _matching_identity(workspace_id="T-TRAP")
         )
-        _durable_job_cursor_request = _SeamDescriptor(probes, "cursor", request)
-        _durable_job_slack_request = _SeamDescriptor(probes, "slack", request)
+        _durable_job_cursor_request = _SeamDescriptor(
+            probes, "cursor", cursor_request
+        )
+        _durable_job_slack_request = _SeamDescriptor(probes, "slack", slack_request)
         _durable_job_cursor_transport = _SeamDescriptor(
             probes, "cursor_transport", None
         )
@@ -995,8 +1096,10 @@ def test_concrete_instance_storage_is_used_without_executing_class_descriptors(
     owner = Owner()
     storage = object.__getattribute__(owner, "__dict__")
     storage["_durable_job_runtime_identity"] = _matching_identity()
-    storage["_durable_job_cursor_request"] = request
-    storage["_durable_job_slack_request"] = request
+    storage["_durable_job_cursor_request"] = cursor_request
+    storage["_durable_job_slack_request"] = slack_request
+    storage["_durable_job_slack_channel_id"] = "C1"
+    storage["_durable_job_slack_root_thread_ts"] = "1.000000"
     raw = _complete(tmp_path)
     bound = bind_production_transports(raw, owner=owner)
     assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
@@ -1021,14 +1124,15 @@ def test_preflight_reports_secret_ref_presence_without_reading_values(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     _install_secret_value_traps(monkeypatch)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     raw = _complete(tmp_path)
     report = preflight_durable_jobs(
         raw,
         cursor_transport=CursorCloudInjectedTransport(
-            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+            request=cursor_request, secret_ref="CURSOR_API_KEY"
         ),
         slack_transport=SlackInjectedTransport(
-            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+            request=slack_request, secret_ref="SLACK_BOT_TOKEN"
         ),
     )
     assert report.secret_refs_present is True
@@ -1067,12 +1171,13 @@ def test_bind_and_preflight_do_not_read_secret_values(tmp_path, monkeypatch):
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     _install_secret_value_traps(monkeypatch)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     raw = _complete(tmp_path)
     bound = bind_production_transports(
         raw,
         owner=_owner_with_matching_identity(),
-        cursor_request=_idle_request(calls),
-        slack_request=_idle_request(calls),
+        cursor_request=cursor_request,
+        slack_request=slack_request,
     )
     report = preflight_durable_jobs(raw, **bound)
     assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
@@ -1097,7 +1202,7 @@ def test_owner_metaclass_hooks_are_not_executed_during_bind(tmp_path, monkeypatc
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     probes: list = []
     calls: list = []
-    request = _idle_request(calls)
+    cursor_request, slack_request = _approved_request_ports(calls)
     armed = {"on": False}
 
     class RecordingMeta(type):
@@ -1113,8 +1218,10 @@ def test_owner_metaclass_hooks_are_not_executed_during_bind(tmp_path, monkeypatc
     owner = Owner()
     storage = object.__getattribute__(owner, "__dict__")
     storage["_durable_job_runtime_identity"] = _matching_identity()
-    storage["_durable_job_cursor_request"] = request
-    storage["_durable_job_slack_request"] = request
+    storage["_durable_job_cursor_request"] = cursor_request
+    storage["_durable_job_slack_request"] = slack_request
+    storage["_durable_job_slack_channel_id"] = "C1"
+    storage["_durable_job_slack_root_thread_ts"] = "1.000000"
     raw = _complete(tmp_path)
     armed["on"] = True
     bound = bind_production_transports(raw, owner=owner)
@@ -1184,13 +1291,14 @@ def test_preflight_presence_survives_adversarial_environ_proxy(tmp_path, monkeyp
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     _install_preflight_os_environ(monkeypatch, _AdversarialEnviron())
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     report = preflight_durable_jobs(
         _complete(tmp_path),
         cursor_transport=CursorCloudInjectedTransport(
-            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+            request=cursor_request, secret_ref="CURSOR_API_KEY"
         ),
         slack_transport=SlackInjectedTransport(
-            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+            request=slack_request, secret_ref="SLACK_BOT_TOKEN"
         ),
     )
     assert report.secret_refs_present is True
@@ -1213,13 +1321,14 @@ def test_preflight_presence_does_not_use_overridable_environ_mapping_apis(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     _install_overridable_environ_traps(monkeypatch)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     report = preflight_durable_jobs(
         _complete(tmp_path),
         cursor_transport=CursorCloudInjectedTransport(
-            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+            request=cursor_request, secret_ref="CURSOR_API_KEY"
         ),
         slack_transport=SlackInjectedTransport(
-            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+            request=slack_request, secret_ref="SLACK_BOT_TOKEN"
         ),
     )
     assert report.secret_refs_present is True
@@ -1266,7 +1375,7 @@ def test_preflight_absence_ignores_lying_environ_mapping(tmp_path, monkeypatch):
     _assert_no_secrets(report)
 
 
-def test_secret_ref_presence_follows_live_os_environ_not_stale_os_module_dict(
+def test_live_os_environ_name_does_not_mint_secret_ref_authority(
     monkeypatch,
 ):
     from agent.durable_jobs.preflight import _secret_ref_present
@@ -1275,7 +1384,7 @@ def test_secret_ref_presence_follows_live_os_environ_not_stale_os_module_dict(
     stale = {}
     replaced = _replace_os_module_environ(stale)
     try:
-        assert _secret_ref_present("CURSOR_API_KEY") is True
+        assert _secret_ref_present("CURSOR_API_KEY") is False
     finally:
         _restore_os_module_environ(replaced)
 
@@ -1309,13 +1418,14 @@ def test_preflight_presence_follows_live_os_environ_not_stale_os_module_dict(
     replaced = _replace_os_module_environ(stale)
     try:
         calls: list = []
+        cursor_request, slack_request = _approved_request_ports(calls)
         report = preflight_durable_jobs(
             _complete(tmp_path),
             cursor_transport=CursorCloudInjectedTransport(
-                request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
+                request=cursor_request, secret_ref="CURSOR_API_KEY"
             ),
             slack_transport=SlackInjectedTransport(
-                request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
+                request=slack_request, secret_ref="SLACK_BOT_TOKEN"
             ),
         )
         assert report.secret_refs_present is True
@@ -1371,12 +1481,13 @@ def test_bind_and_preflight_do_not_use_overridable_environ_mapping_apis(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     _install_overridable_environ_traps(monkeypatch)
     calls: list = []
+    cursor_request, slack_request = _approved_request_ports(calls)
     raw = _complete(tmp_path)
     bound = bind_production_transports(
         raw,
         owner=_owner_with_matching_identity(),
-        cursor_request=_idle_request(calls),
-        slack_request=_idle_request(calls),
+        cursor_request=cursor_request,
+        slack_request=slack_request,
     )
     report = preflight_durable_jobs(raw, **bound)
     assert type(bound.get("cursor_transport")) is CursorCloudInjectedTransport
@@ -1509,7 +1620,7 @@ def test_replaced_environ_data_dict_is_rejected(monkeypatch):
         assert _secret_ref_present(real_name) is False
     finally:
         dict.__setitem__(storage, "_data", original)
-    assert _secret_ref_present(real_name) is True
+    assert _secret_ref_present(real_name) is False
     assert _secret_ref_present(fake_name) is False
 
 
@@ -1549,7 +1660,7 @@ def test_secret_ref_presence_does_not_eq_hostile_environ_data_key(monkeypatch):
     live_name = "HERMES_ENG50_V6_HOSTILE_LIVE"
     monkeypatch.delenv(hostile_name, raising=False)
     monkeypatch.setenv(live_name, "x")
-    data = _process_environ_dict()
+    data = dict.__getitem__(_environ_instance_storage(), "_data")
     assert type(data) is dict
     probes: list = []
     hostile = _ArmedCollidingKey(hostile_name, probes, "env_key")
@@ -1557,14 +1668,14 @@ def test_secret_ref_presence_does_not_eq_hostile_environ_data_key(monkeypatch):
     try:
         hostile.arm()
         assert _secret_ref_present(hostile_name) is False
-        assert _secret_ref_present(live_name) is True
+        assert _secret_ref_present(live_name) is False
         assert probes == []
     finally:
         hostile._armed = False
         dict.__delitem__(data, hostile)
 
 
-def test_secret_ref_presence_follows_child_inherited_env_not_backing_cache():
+def test_child_inherited_env_name_does_not_mint_secret_ref_authority():
     from agent.durable_jobs.preflight import _secret_ref_present
 
     putenv_name = "HERMES_ENG50_V6_PUTENV_ONLY"
@@ -1572,7 +1683,7 @@ def test_secret_ref_presence_follows_child_inherited_env_not_backing_cache():
     os.putenv(putenv_name, "1")
     try:
         assert _child_inherits_env_name(putenv_name) is True
-        assert _secret_ref_present(putenv_name) is True
+        assert _secret_ref_present(putenv_name) is False
     finally:
         os.unsetenv(putenv_name)
     assert _secret_ref_present(putenv_name) is False
@@ -1589,10 +1700,12 @@ def test_secret_ref_presence_follows_child_inherited_env_not_backing_cache():
 def test_approved_transport_rejects_str_subclass_secret_ref_without_hooks():
     from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
     from agent.durable_jobs.production_binding import _approved_transport
+    from agent.durable_jobs.request_ports import CursorCloudInjectedRequestPort
 
     probes: list = []
+    cursor_request, _ = _approved_request_ports([])
     transport = CursorCloudInjectedTransport(
-        request=_idle_request([]), secret_ref="CURSOR_API_KEY"
+        request=cursor_request, secret_ref="CURSOR_API_KEY"
     )
     storage = object.__getattribute__(transport, "__dict__")
     dict.__setitem__(
@@ -1600,7 +1713,10 @@ def test_approved_transport_rejects_str_subclass_secret_ref_without_hooks():
     )
     assert (
         _approved_transport(
-            transport, CursorCloudInjectedTransport, "CURSOR_API_KEY"
+            transport,
+            CursorCloudInjectedTransport,
+            CursorCloudInjectedRequestPort,
+            "CURSOR_API_KEY",
         )
         is False
     )
@@ -1774,10 +1890,12 @@ def test_preflight_ignores_transport_request_data_descriptor():
 def test_approved_transport_ignores_transport_secret_ref_data_descriptor():
     from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
     from agent.durable_jobs.production_binding import _approved_transport
+    from agent.durable_jobs.request_ports import CursorCloudInjectedRequestPort
 
     probes: list = []
+    cursor_request, _ = _approved_request_ports([])
     transport = CursorCloudInjectedTransport(
-        request=_idle_request([]), secret_ref="CURSOR_API_KEY"
+        request=cursor_request, secret_ref="CURSOR_API_KEY"
     )
     _drop_instance_name(transport, "_secret_ref")
     type.__setattr__(
@@ -1788,7 +1906,10 @@ def test_approved_transport_ignores_transport_secret_ref_data_descriptor():
     try:
         assert (
             _approved_transport(
-                transport, CursorCloudInjectedTransport, "CURSOR_API_KEY"
+                transport,
+                CursorCloudInjectedTransport,
+                CursorCloudInjectedRequestPort,
+                "CURSOR_API_KEY",
             )
             is False
         )
@@ -1857,17 +1978,24 @@ def test_preflight_transport_colliding_instance_dict_key_hooks_are_not_executed(
 def test_approved_transport_transport_colliding_key_hooks_are_not_executed():
     from agent.durable_jobs.injected_transports import CursorCloudInjectedTransport
     from agent.durable_jobs.production_binding import _approved_transport
+    from agent.durable_jobs.request_ports import CursorCloudInjectedRequestPort
 
     probes: list = []
+    cursor_request, _ = _approved_request_ports([])
     transport = CursorCloudInjectedTransport(
-        request=_idle_request([]), secret_ref="CURSOR_API_KEY"
+        request=cursor_request, secret_ref="CURSOR_API_KEY"
     )
     storage = _drop_instance_name(transport, "_secret_ref")
     key = _ArmedCollidingKey("_secret_ref", probes, "transport_key")
     dict.__setitem__(storage, key, "CURSOR_API_KEY")
     key.arm()
     assert (
-        _approved_transport(transport, CursorCloudInjectedTransport, "CURSOR_API_KEY")
+        _approved_transport(
+            transport,
+            CursorCloudInjectedTransport,
+            CursorCloudInjectedRequestPort,
+            "CURSOR_API_KEY",
+        )
         is False
     )
     assert probes == []

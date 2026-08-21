@@ -286,9 +286,10 @@ def test_preflight_runtime_ready_requires_both_injected_secret_refs(
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     env_only = preflight_durable_jobs(raw)
     assert env_only.constructible is True
-    assert env_only.secret_refs_present is True
+    assert env_only.secret_refs_present is False
     assert env_only.runtime_ready is False
     assert env_only.dispatch_allowed is False
+    assert "secret_refs_missing" in env_only.reasons
     assert "transport_capability_missing" in env_only.reasons
     dumped = str(env_only)
     assert CURSOR_TOKEN not in dumped
@@ -302,13 +303,46 @@ def _idle_injected_transports():
         CursorCloudInjectedTransport,
         SlackInjectedTransport,
     )
+    from agent.durable_jobs.request_ports import (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    )
 
-    def _idle(**_k):
+    def _idle(*_a, **_k):
         raise AssertionError("preflight/transport must not call the network")
 
+    class _CursorClient:
+        create_agent = _idle
+        get_agent = _idle
+        get_run = _idle
+
+    class _SlackClient:
+        chat_postMessage = _idle
+        conversations_replies = _idle
+
+    resolve = lambda _ref: "explicit-test-credential"
+    cursor_request = CursorCloudInjectedRequestPort(
+        client=_CursorClient(),
+        secret_ref="CURSOR_API_KEY",
+        workspace_id="T1",
+        repository_identity="github.com/example/repo",
+        credential_resolver=resolve,
+    )
+    slack_request = SlackInjectedRequestPort(
+        client=_SlackClient(),
+        secret_ref="SLACK_BOT_TOKEN",
+        workspace_id="T1",
+        repository_identity="github.com/example/repo",
+        channel_id="C1",
+        root_thread_ts="1.000000",
+        credential_resolver=resolve,
+    )
+
     return (
-        CursorCloudInjectedTransport(request=_idle, secret_ref="CURSOR_API_KEY"),
-        SlackInjectedTransport(request=_idle, secret_ref="SLACK_BOT_TOKEN"),
+        CursorCloudInjectedTransport(
+            request=cursor_request, secret_ref="CURSOR_API_KEY"
+        ),
+        SlackInjectedTransport(request=slack_request, secret_ref="SLACK_BOT_TOKEN"),
     )
 
 
@@ -448,7 +482,7 @@ def test_preflight_dispatch_allowed_matrix_requires_verified_runtime(
     if case == "missing_transport":
         report = preflight_durable_jobs(raw)
         assert report.constructible is True
-        assert report.secret_refs_present is True
+        assert report.secret_refs_present is False
         assert report.transport_capability is False
         assert report.runtime_ready is False
         assert report.dispatch_allowed is False
@@ -524,7 +558,7 @@ def test_preflight_runtime_ready_rejects_metadata_only_duck_transports(
         slack_transport=MetadataOnlySlackTransport(),
     )
     assert report.constructible is True
-    assert report.secret_refs_present is True
+    assert report.secret_refs_present is False
     assert report.transport_capability is False
     assert report.runtime_ready is False
     assert report.dispatch_allowed is False
@@ -591,7 +625,7 @@ def test_preflight_runtime_ready_rejects_unbound_subclass_transports(
         raw, cursor_transport=cursor, slack_transport=slack
     )
     assert report.constructible is True
-    assert report.secret_refs_present is True
+    assert report.secret_refs_present is False
     assert report.transport_capability is False
     assert report.runtime_ready is False
     assert report.dispatch_allowed is False

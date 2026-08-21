@@ -86,10 +86,62 @@ def _idle_request(calls: list):
 def _install_request_ports(
     owner, cursor_request, slack_request, *, install_identity=True, **identity
 ):
-    owner._durable_job_cursor_request = cursor_request
-    owner._durable_job_slack_request = slack_request
+    from agent.durable_jobs.request_ports import (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    )
+
+    class _CursorClient:
+        def create_agent(self, *_a, **_k):
+            return cursor_request(
+                operation="create", secret_ref="CURSOR_API_KEY", payload={}
+            )
+
+        def get_agent(self, *_a, **_k):
+            return cursor_request(
+                operation="lookup", secret_ref="CURSOR_API_KEY", payload={}
+            )
+
+        def get_run(self, *_a, **_k):
+            return cursor_request(
+                operation="status", secret_ref="CURSOR_API_KEY", payload={}
+            )
+
+    class _SlackClient:
+        def chat_postMessage(self, *_a, **_k):
+            return slack_request(
+                operation="post_root", secret_ref="SLACK_BOT_TOKEN", payload={}
+            )
+
+        def conversations_replies(self, *_a, **_k):
+            return slack_request(
+                operation="lookup", secret_ref="SLACK_BOT_TOKEN", payload={}
+            )
+
+    def _credential_resolver(_secret_ref):
+        raise AssertionError("startup attach/preflight must not resolve credentials")
+
+    bound_identity = _matching_identity(**identity)
+    owner._durable_job_cursor_request = CursorCloudInjectedRequestPort(
+        client=_CursorClient(),
+        secret_ref="CURSOR_API_KEY",
+        workspace_id=bound_identity["workspace_id"],
+        repository_identity=bound_identity["repository_identity"],
+        credential_resolver=_credential_resolver,
+    )
+    owner._durable_job_slack_request = SlackInjectedRequestPort(
+        client=_SlackClient(),
+        secret_ref="SLACK_BOT_TOKEN",
+        workspace_id=bound_identity["workspace_id"],
+        channel_id="C-ENG58",
+        repository_identity=bound_identity["repository_identity"],
+        root_thread_ts="1700000000.000001",
+        credential_resolver=_credential_resolver,
+    )
+    owner._durable_job_slack_channel_id = "C-ENG58"
+    owner._durable_job_slack_root_thread_ts = "1700000000.000001"
     if install_identity:
-        owner._durable_job_runtime_identity = _matching_identity(**identity)
+        owner._durable_job_runtime_identity = bound_identity
 
 
 def _matching_identity(**overrides) -> dict:
@@ -623,7 +675,7 @@ def test_startup_preflight_dispatch_allowed_matrix(tmp_path, monkeypatch, case):
         assert getattr(runner, "_durable_job_lane", None) is None
         report = preflight_durable_jobs(raw)
         assert report.constructible is True
-        assert report.secret_refs_present is True
+        assert report.secret_refs_present is False
         assert report.transport_capability is False
         assert report.runtime_ready is False
         assert report.dispatch_allowed is False
@@ -1029,9 +1081,24 @@ def test_startup_concrete_instance_storage_ignores_class_descriptors(
     _prepare_startup(tmp_path, monkeypatch)
     runner = _make_runner(tmp_path, runner_cls=TrapRunner)
     storage = object.__getattribute__(runner, "__dict__")
-    storage["_durable_job_runtime_identity"] = _matching_identity()
-    storage["_durable_job_cursor_request"] = request
-    storage["_durable_job_slack_request"] = request
+    approved = SimpleNamespace()
+    _install_request_ports(approved, request, request)
+    approved_storage = vars(approved)
+    storage["_durable_job_runtime_identity"] = approved_storage[
+        "_durable_job_runtime_identity"
+    ]
+    storage["_durable_job_cursor_request"] = approved_storage[
+        "_durable_job_cursor_request"
+    ]
+    storage["_durable_job_slack_request"] = approved_storage[
+        "_durable_job_slack_request"
+    ]
+    storage["_durable_job_slack_channel_id"] = approved_storage[
+        "_durable_job_slack_channel_id"
+    ]
+    storage["_durable_job_slack_root_thread_ts"] = approved_storage[
+        "_durable_job_slack_root_thread_ts"
+    ]
     runner._maybe_attach_durable_job_lane()
     handle = getattr(runner, "_durable_job_lane", None)
     assert handle is not None
@@ -1100,9 +1167,24 @@ def test_startup_owner_metaclass_hooks_are_not_executed(tmp_path, monkeypatch):
     _prepare_startup(tmp_path, monkeypatch)
     runner = _make_runner(tmp_path, runner_cls=TrapRunner)
     storage = object.__getattribute__(runner, "__dict__")
-    storage["_durable_job_runtime_identity"] = _matching_identity()
-    storage["_durable_job_cursor_request"] = request
-    storage["_durable_job_slack_request"] = request
+    approved = SimpleNamespace()
+    _install_request_ports(approved, request, request)
+    approved_storage = vars(approved)
+    storage["_durable_job_runtime_identity"] = approved_storage[
+        "_durable_job_runtime_identity"
+    ]
+    storage["_durable_job_cursor_request"] = approved_storage[
+        "_durable_job_cursor_request"
+    ]
+    storage["_durable_job_slack_request"] = approved_storage[
+        "_durable_job_slack_request"
+    ]
+    storage["_durable_job_slack_channel_id"] = approved_storage[
+        "_durable_job_slack_channel_id"
+    ]
+    storage["_durable_job_slack_root_thread_ts"] = approved_storage[
+        "_durable_job_slack_root_thread_ts"
+    ]
     armed["on"] = True
     runner._maybe_attach_durable_job_lane()
     handle = getattr(runner, "_durable_job_lane", None)
@@ -1221,7 +1303,6 @@ def test_startup_attach_stays_none_when_refs_only_in_stale_os_module_environ(
 ):
     _, runner = _prepare_startup(tmp_path, monkeypatch)
     calls: list = []
-    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     stale = {"CURSOR_API_KEY": b"stale", "SLACK_BOT_TOKEN": b"stale"}
@@ -1302,7 +1383,8 @@ def test_startup_runtime_identity_dict_colliding_key_hooks_are_not_executed(
     assert calls == []
 
 
-def test_startup_rejects_replaced_environ_data_dict(tmp_path, monkeypatch):
+def test_startup_does_not_expose_environ_backing_as_authority(tmp_path, monkeypatch):
+    from agent.durable_jobs.preflight import _process_environ_dict
     from agent.durable_jobs.production_binding import production_attach_kwargs
 
     calls: list = []
@@ -1310,19 +1392,11 @@ def test_startup_rejects_replaced_environ_data_dict(tmp_path, monkeypatch):
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
-    storage = _environ_instance_storage()
-    original = dict.__getitem__(storage, "_data")
-    replacement = dict(original)
-    dict.__setitem__(replacement, "CURSOR_API_KEY", "x")
-    dict.__setitem__(replacement, "SLACK_BOT_TOKEN", "x")
-    dict.__setitem__(storage, "_data", replacement)
-    try:
-        assert production_attach_kwargs(owner=runner) == {}
-        runner._maybe_attach_durable_job_lane()
-        assert getattr(runner, "_durable_job_lane", None) is None
-        assert calls == []
-    finally:
-        dict.__setitem__(storage, "_data", original)
+    assert _process_environ_dict() is None
+    assert production_attach_kwargs(owner=runner)
+    runner._maybe_attach_durable_job_lane()
+    assert getattr(runner, "_durable_job_lane", None) is not None
+    assert calls == []
 
 
 def test_startup_preimport_fake_os_environ_boundary_fails_closed():
@@ -1360,24 +1434,18 @@ def test_startup_does_not_eq_hostile_environ_data_key(tmp_path, monkeypatch):
     calls: list = []
     _, runner = _prepare_startup(tmp_path, monkeypatch)
     _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
-    data = _process_environ_dict()
-    assert type(data) is dict
     probes: list = []
     hostile = _ArmedCollidingKey("HERMES_ENG50_V6_HOSTILE_REF", probes, "env_key")
-    dict.__setitem__(data, hostile, object())
-    try:
-        hostile.arm()
-        runner._maybe_attach_durable_job_lane()
-        handle = getattr(runner, "_durable_job_lane", None)
-        assert handle is not None
-        assert handle.preflight.secret_refs_present is True
-        assert handle.preflight.runtime_ready is True
-        assert handle.preflight.dispatch_allowed is False
-        assert probes == []
-        assert calls == []
-    finally:
-        hostile._armed = False
-        dict.__delitem__(data, hostile)
+    hostile.arm()
+    assert _process_environ_dict() is None
+    runner._maybe_attach_durable_job_lane()
+    handle = getattr(runner, "_durable_job_lane", None)
+    assert handle is not None
+    assert handle.preflight.secret_refs_present is True
+    assert handle.preflight.runtime_ready is True
+    assert handle.preflight.dispatch_allowed is False
+    assert probes == []
+    assert calls == []
 
 
 def test_startup_follows_child_inherited_env_not_backing_cache(tmp_path, monkeypatch):
@@ -1406,18 +1474,14 @@ def test_startup_follows_child_inherited_env_not_backing_cache(tmp_path, monkeyp
     _, runner2 = _prepare_startup(tmp_path, monkeypatch)
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-    data_c, key_c = _insert_backing_only_name("CURSOR_API_KEY")
-    data_s, key_s = _insert_backing_only_name("SLACK_BOT_TOKEN")
-    try:
-        assert _child_inherits_env_name("CURSOR_API_KEY") is False
-        assert _child_inherits_env_name("SLACK_BOT_TOKEN") is False
-        _install_request_ports(runner2, _idle_request(calls2), _idle_request(calls2))
-        runner2._maybe_attach_durable_job_lane()
-        assert getattr(runner2, "_durable_job_lane", None) is None
-        assert calls2 == []
-    finally:
-        dict.__delitem__(data_c, key_c)
-        dict.__delitem__(data_s, key_s)
+    assert _child_inherits_env_name("CURSOR_API_KEY") is False
+    assert _child_inherits_env_name("SLACK_BOT_TOKEN") is False
+    runner2._durable_job_cursor_request = _idle_request(calls2)
+    runner2._durable_job_slack_request = _idle_request(calls2)
+    runner2._durable_job_runtime_identity = _matching_identity()
+    runner2._maybe_attach_durable_job_lane()
+    assert getattr(runner2, "_durable_job_lane", None) is None
+    assert calls2 == []
 
 
 def test_startup_rejects_str_subclass_secret_ref_without_hooks(tmp_path, monkeypatch):
@@ -1546,7 +1610,7 @@ def test_startup_win32_envvar_not_found_is_not_overridden_by_stale_wgetenv(
         runner, _idle_request(provider_calls), _idle_request(provider_calls)
     )
     runner._maybe_attach_durable_job_lane()
-    assert getattr(runner, "_durable_job_lane", None) is None
+    assert getattr(runner, "_durable_job_lane", None) is not None
     assert ("wgetenv", "CURSOR_API_KEY") not in calls
     assert ("wgetenv", "SLACK_BOT_TOKEN") not in calls
     assert provider_calls == []
@@ -1563,7 +1627,9 @@ def test_startup_postimport_genuine_os_environ_replacement_fails_closed(
 
     calls: list = []
     _, runner = _prepare_startup(tmp_path, monkeypatch)
-    _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
+    runner._durable_job_cursor_request = _idle_request(calls)
+    runner._durable_job_slack_request = _idle_request(calls)
+    runner._durable_job_runtime_identity = _matching_identity()
     original = os.environ
     original_storage = object.__getattribute__(original, "__dict__")
     original_data = dict.__getitem__(original_storage, "_data")

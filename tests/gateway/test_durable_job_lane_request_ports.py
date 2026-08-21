@@ -90,6 +90,8 @@ def _install_injected_ports(runner, ports, cursor_client, slack_client):
         repository_identity=REPO,
         root_thread_ts=THREAD,
     )
+    runner._durable_job_slack_channel_id = CHANNEL
+    runner._durable_job_slack_root_thread_ts = THREAD
     runner._durable_job_runtime_identity = _matching_identity()
 
 
@@ -242,7 +244,11 @@ def test_gateway_detach_does_not_close_injected_ports(tmp_path, monkeypatch):
     looked = port(
         operation="lookup",
         secret_ref=_SECRET_CURSOR,
-        payload={"idempotency_key": "cursor-idem-1"},
+        payload={
+            "idempotency_key": "cursor-idem-1",
+            "workspace_id": WORKSPACE,
+            "repository_identity": REPO,
+        },
     )
     assert looked.get("error", {}).get("code") == "not_found"
     port.close()
@@ -250,5 +256,9 @@ def test_gateway_detach_does_not_close_injected_ports(tmp_path, monkeypatch):
         port(
             operation="lookup",
             secret_ref=_SECRET_CURSOR,
-            payload={"idempotency_key": "cursor-idem-1"},
+            payload={
+            "idempotency_key": "cursor-idem-1",
+            "workspace_id": WORKSPACE,
+            "repository_identity": REPO,
+        },
         )
