@@ -209,8 +209,27 @@ def _called_during_initial_site_bootstrap() -> bool:
     """
     try:
         flags = sys.flags
+        flags_type = type(flags)
+        flags_module = type.__getattribute__(flags_type, "__module__")
+        flags_name = type.__getattribute__(flags_type, "__name__")
+        flags_base = type.__getattribute__(flags_type, "__base__")
+        flags_type_bits = type.__getattribute__(flags_type, "__flags__")
         no_site = flags.no_site
     except (AttributeError, TypeError):
+        return False
+    # CPython exposes startup flags as a non-heap ``sys.flags`` structseq.
+    # A Python proxy or forged tuple subclass is heap allocated and therefore
+    # cannot override ``no_site`` while retaining this native provenance.
+    if (
+        type(flags_type) is not type
+        or type(flags_module) is not str
+        or not str.__eq__(flags_module, "sys")
+        or type(flags_name) is not str
+        or not str.__eq__(flags_name, "flags")
+        or flags_base is not tuple
+        or type(flags_type_bits) is not int
+        or flags_type_bits & (1 << 9)
+    ):
         return False
     # ``python -S`` remains a no-site process even if user code later calls
     # ``site.main()`` (including from ``atexit``).  Such a replay must never

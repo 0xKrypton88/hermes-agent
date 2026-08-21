@@ -2829,6 +2829,56 @@ atexit.register(site.main)
     assert result.stdout == "captured=0 ready=0"
 
 
+def test_python_s_spoofed_flags_site_main_replay_cannot_mint_startup_witness():
+    """Replacing ``sys.flags`` cannot turn a late ``site.main`` into startup."""
+    script = r"""
+import atexit
+import pathlib
+import sys
+repo = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(repo))
+import site
+
+class FlagsProxy:
+    def __init__(self, original):
+        self._original = original
+
+    @property
+    def no_site(self):
+        return 0
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+sys.flags = FlagsProxy(sys.flags)
+
+def report():
+    import hermes_environ_startup as startup
+    candidate = pathlib.Path(startup.__file__).resolve().is_relative_to(repo)
+    captured = startup.capture_trusted_startup()
+    ready = startup.trusted_startup_ready()
+    sys.stdout.write(
+        "candidate=" + ("1" if candidate else "0")
+        + " captured=" + ("1" if captured else "0")
+        + " ready=" + ("1" if ready else "0")
+    )
+
+atexit.register(report)
+atexit.register(site.main)
+"""
+    repo = _repo_root()
+    with _hide_ambient_environ_startup_pths():
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", script, str(repo)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_child_env_without_startup_hooks(repo),
+        )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "candidate=1 captured=0 ready=0"
+
+
 def test_plant_known_environ_seal_keys_before_import_cannot_mint_witness():
     """Planting known os.environ.__dict__ seal keys before import is not trust.
 
