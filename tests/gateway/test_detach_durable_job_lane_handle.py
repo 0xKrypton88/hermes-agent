@@ -78,13 +78,14 @@ def test_detach_handle_does_not_clear_newer_concurrent_attach(tmp_path, monkeypa
 
     released = threading.Event()
     attach_finished = threading.Event()
+    allow_shutdown = threading.Event()
     original_shutdown = first.shutdown
     errors: list[BaseException] = []
 
     def gated_shutdown() -> None:
         released.set()
-        if not attach_finished.wait(timeout=5.0):
-            raise TimeoutError("valid attach did not finish during detach window")
+        if not allow_shutdown.wait(timeout=5.0):
+            raise TimeoutError("test never released prior shutdown")
         original_shutdown()
 
     first.shutdown = gated_shutdown
@@ -113,6 +114,10 @@ def test_detach_handle_does_not_clear_newer_concurrent_attach(tmp_path, monkeypa
     ]
     for worker in workers:
         worker.start()
+    assert released.wait(timeout=2.0)
+    assert not attach_finished.wait(timeout=0.2)
+    assert runner._durable_job_lane is None
+    allow_shutdown.set()
     for worker in workers:
         worker.join(timeout=6.0)
         assert not worker.is_alive(), "detach/attach deadlocked"
