@@ -565,3 +565,75 @@ async def test_linear_unsigned_timestamp_must_match_signed_payload(hermes_home):
 
     assert response.status == 401
     assert _count_receipts(hermes_home / "webhook_receipts.db") == 0
+
+
+def test_receipt_store_migrates_legacy_duplicate_payloads(hermes_home):
+    """A pre-index database is repaired before payload uniqueness is enforced."""
+    from gateway.webhook_receipts import WebhookReceiptStore
+
+    db_path = hermes_home / "webhook_receipts.db"
+    rows = [
+        (
+            "legacy-oldest",
+            PROVIDER,
+            "legacy-delivery-1",
+            ISSUE_ID,
+            ISSUE_IDENTIFIER,
+            GO_STATE_ID,
+            f"linear:issue:{ISSUE_ID}:state:{GO_STATE_ID}",
+            "same-signed-payload-hash",
+            "2026-08-20T10:00:00+00:00",
+        ),
+        (
+            "legacy-newer",
+            PROVIDER,
+            "legacy-delivery-2",
+            ISSUE_ID,
+            ISSUE_IDENTIFIER,
+            GO_STATE_ID,
+            f"linear:issue:{ISSUE_ID}:state:{GO_STATE_ID}",
+            "same-signed-payload-hash",
+            "2026-08-20T10:01:00+00:00",
+        ),
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE webhook_receipts (
+                 receipt_id TEXT PRIMARY KEY,
+                 provider TEXT NOT NULL,
+                 delivery_id TEXT NOT NULL,
+                 issue_id TEXT NOT NULL,
+                 issue_identifier TEXT NOT NULL,
+                 state_id TEXT NOT NULL,
+                 job_key TEXT NOT NULL,
+                 payload_hash TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 UNIQUE(provider, delivery_id)
+               )"""
+        )
+        conn.executemany(
+            "INSERT INTO webhook_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    result = WebhookReceiptStore(db_path=db_path).record_linear_issue_go(
+        delivery_id="legacy-delivery-3",
+        issue_id=ISSUE_ID,
+        issue_identifier=ISSUE_IDENTIFIER,
+        state_id=GO_STATE_ID,
+        job_key=f"linear:issue:{ISSUE_ID}:state:{GO_STATE_ID}",
+        payload_hash="same-signed-payload-hash",
+    )
+
+    assert result.status == "duplicate"
+    assert result.receipt.receipt_id == "legacy-oldest"
+    with sqlite3.connect(db_path) as conn:
+        remaining = conn.execute(
+            "SELECT receipt_id FROM webhook_receipts ORDER BY created_at, receipt_id"
+        ).fetchall()
+        payload_index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_webhook_receipts_provider_payload'"
+        ).fetchone()
+    assert remaining == [("legacy-oldest",)]
+    assert payload_index == (1,)

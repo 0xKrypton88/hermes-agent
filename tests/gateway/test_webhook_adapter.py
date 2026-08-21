@@ -156,13 +156,25 @@ class TestValidateSignature:
             assert adapter._validate_signature(req, body, secret) is False
 
     def test_linear_signature_valid_accepts(self):
-        """Linear signs the raw body (hex HMAC-SHA256) in linear-signature."""
+        """Linear signs the raw body and binds its timestamp to the payload."""
         adapter = _make_adapter()
-        body = b'{"type": "Issue", "data": {"id": "abc"}}'
+        timestamp = str(int(time.time() * 1000))
+        body = json.dumps(
+            {
+                "type": "Issue",
+                "data": {"id": "abc"},
+                "webhookTimestamp": int(timestamp),
+            }
+        ).encode()
         secret = "linear-webhook-key"
         sig = _generic_signature(body, secret)  # same math as linear-signature
 
-        req = _mock_request(headers={"linear-signature": sig})
+        req = _mock_request(
+            headers={
+                "linear-signature": sig,
+                "linear-timestamp": timestamp,
+            }
+        )
 
         assert adapter._validate_signature(req, body, secret) is True
 

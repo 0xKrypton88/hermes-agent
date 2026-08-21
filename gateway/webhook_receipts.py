@@ -186,10 +186,37 @@ class WebhookReceiptStore:
             "CREATE INDEX IF NOT EXISTS idx_webhook_receipts_job_created "
             "ON webhook_receipts(job_key, created_at DESC)"
         )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_receipts_provider_payload "
-            "ON webhook_receipts(provider, payload_hash)"
-        )
+        payload_index_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_webhook_receipts_provider_payload'"
+        ).fetchone()
+        if payload_index_exists is None:
+            # Earlier ENG-83 revisions allowed the same signed Linear payload to
+            # be stored under multiple delivery IDs. Preserve the oldest
+            # canonical receipt and remove only payload-equivalent duplicates
+            # before adding the uniqueness invariant. This idempotent migration
+            # runs in the same transaction as index creation and is skipped on
+            # steady-state writes once the index exists.
+            conn.execute(
+                """DELETE FROM webhook_receipts AS duplicate
+                   WHERE EXISTS (
+                     SELECT 1
+                       FROM webhook_receipts AS keeper
+                      WHERE keeper.provider = duplicate.provider
+                        AND keeper.payload_hash = duplicate.payload_hash
+                        AND (
+                          keeper.created_at < duplicate.created_at
+                          OR (
+                            keeper.created_at = duplicate.created_at
+                            AND keeper.receipt_id < duplicate.receipt_id
+                          )
+                        )
+                   )"""
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_webhook_receipts_provider_payload "
+                "ON webhook_receipts(provider, payload_hash)"
+            )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
