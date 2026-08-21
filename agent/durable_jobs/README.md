@@ -104,9 +104,16 @@ Hermes `state.db`.
   ``dict.__contains__`` only — never ``os.environ`` mapping APIs and
   never credential values. Config flags and secret-ref *names* cannot
   mint a client.
-  This repository has no Cursor Cloud or Slack `InjectedRequestPort`
-  implementation; missing ports or identity fail closed rather than
-  inventing HTTP/SDK behavior
+  ENG-58 adds explicit `CursorCloudInjectedRequestPort` /
+  `SlackInjectedRequestPort` adapters that wrap an already-injected
+  client seam (`create_agent`/`get_agent`/`get_run`,
+  `chat_postMessage`/`conversations_replies`). They are not
+  auto-activated from config flags: attach still requires the ports
+  (or already-injected clients plus bound Slack channel/thread identity
+  in instance `__dict__` storage) together with matching runtime
+  identity. Missing or mismatched ports fail closed rather than
+  inventing HTTP/SDK behavior. Isolated shadow/E2E uses deterministic
+  fakes only.
 - Preflight validates config/backend/schema/path/adapter modes/bindings/
   secret-ref names/runtime readiness with no sockets and no `psycopg`
   import on the SQLite path

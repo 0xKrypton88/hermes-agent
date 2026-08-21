@@ -11,7 +11,9 @@ from typing import Any, Callable, Optional, Protocol
 
 from agent.durable_jobs.config import validate_secret_ref_name
 from agent.durable_jobs.cursor_cloud import redact_provider_error
+from agent.durable_jobs.lane import LaneClosedError
 from agent.durable_jobs.redaction import redact_secret_text
+from agent.durable_jobs.request_ports import RequestPortError
 from agent.durable_jobs.slack_bridge import redact_slack_error
 
 InjectedRequest = Callable[..., Any]
@@ -31,6 +33,15 @@ def redact_transport_error(exc: BaseException | str) -> str:
     text = redact_provider_error(text)
     text = redact_secret_text(text)
     return _XOX_RE.sub("[REDACTED]", text)
+
+
+def _invoke_injected_request(request: InjectedRequest, **kwargs: Any) -> Any:
+    try:
+        return request(**kwargs)
+    except (LaneClosedError, RequestPortError):
+        raise
+    except Exception as exc:
+        raise RuntimeError(redact_transport_error(exc)) from None
 
 
 class CursorCloudInjectedTransport:
@@ -64,39 +75,33 @@ class CursorCloudInjectedTransport:
     def create(
         self, *, idempotency_key: str, job_id: str, name: str, agent_id: str
     ) -> Any:
-        try:
-            return self._request(
-                operation="create",
-                secret_ref=self._secret_ref,
-                payload={
-                    "idempotency_key": idempotency_key,
-                    "job_id": job_id,
-                    "name": name,
-                    "agentId": agent_id,
-                },
-            )
-        except Exception as exc:
-            raise RuntimeError(redact_transport_error(exc)) from None
+        return _invoke_injected_request(
+            self._request,
+            operation="create",
+            secret_ref=self._secret_ref,
+            payload={
+                "idempotency_key": idempotency_key,
+                "job_id": job_id,
+                "name": name,
+                "agentId": agent_id,
+            },
+        )
 
     def lookup(self, *, idempotency_key: str) -> Any:
-        try:
-            return self._request(
-                operation="lookup",
-                secret_ref=self._secret_ref,
-                payload={"idempotency_key": idempotency_key},
-            )
-        except Exception as exc:
-            raise RuntimeError(redact_transport_error(exc)) from None
+        return _invoke_injected_request(
+            self._request,
+            operation="lookup",
+            secret_ref=self._secret_ref,
+            payload={"idempotency_key": idempotency_key},
+        )
 
     def status(self, *, run_id: str, agent_id: str = "") -> Any:
-        try:
-            return self._request(
-                operation="status",
-                secret_ref=self._secret_ref,
-                payload={"run_id": run_id, "agent_id": agent_id},
-            )
-        except Exception as exc:
-            raise RuntimeError(redact_transport_error(exc)) from None
+        return _invoke_injected_request(
+            self._request,
+            operation="status",
+            secret_ref=self._secret_ref,
+            payload={"run_id": run_id, "agent_id": agent_id},
+        )
 
 
 class SlackInjectedTransport:
@@ -136,27 +141,23 @@ class SlackInjectedTransport:
         root_thread_ts: str,
         job_id: str,
     ) -> Any:
-        try:
-            return self._request(
-                operation="post_root",
-                secret_ref=self._secret_ref,
-                payload={
-                    "client_msg_id": client_msg_id,
-                    "workspace_id": workspace_id,
-                    "channel_id": channel_id,
-                    "root_thread_ts": root_thread_ts,
-                    "job_id": job_id,
-                },
-            )
-        except Exception as exc:
-            raise RuntimeError(redact_transport_error(exc)) from None
+        return _invoke_injected_request(
+            self._request,
+            operation="post_root",
+            secret_ref=self._secret_ref,
+            payload={
+                "client_msg_id": client_msg_id,
+                "workspace_id": workspace_id,
+                "channel_id": channel_id,
+                "root_thread_ts": root_thread_ts,
+                "job_id": job_id,
+            },
+        )
 
     def lookup_by_client_msg_id(self, client_msg_id: str) -> Any:
-        try:
-            return self._request(
-                operation="lookup",
-                secret_ref=self._secret_ref,
-                payload={"client_msg_id": client_msg_id},
-            )
-        except Exception as exc:
-            raise RuntimeError(redact_transport_error(exc)) from None
+        return _invoke_injected_request(
+            self._request,
+            operation="lookup",
+            secret_ref=self._secret_ref,
+            payload={"client_msg_id": client_msg_id},
+        )
