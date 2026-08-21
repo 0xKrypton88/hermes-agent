@@ -1699,9 +1699,14 @@ def restart() -> None:
                 "start a duplicate. Investigate stray PIDs before retrying."
             )
 
-    # Give Windows a moment to release the listening port.
+    # Give Windows a moment to release the listening port, then relaunch
+    # directly. Do not call start() here: start() prompts to install login
+    # persistence when no Scheduled Task / Startup entry exists. A manually
+    # started gateway has neither, so a non-interactive restart would hang on
+    # that prompt after already taking the live gateway offline.
     time.sleep(1.0)
-    start()
+    pid = _spawn_detached()
+    _report_gateway_start(f"direct spawn (PID {pid})")
 
     if not _wait_for_gateway_ready(timeout_s=15.0):
         raise RuntimeError(

@@ -213,6 +213,21 @@ class TestSlackAdapterPluginActionWiring:
         assert "hermes_approve_once" in action_ids
 
 
+    def test_durable_job_actions_reuse_existing_slack_action_ingress(self):
+        """Package 2 couples durable Go/Hold/Cancel onto the built-in action path."""
+        from gateway.durable_job_lane import DURABLE_SLACK_ACTION_IDS
+
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        result, registered = _connect_with_recording_app(
+            adapter, plugin_handlers=[],
+        )
+        assert result is True
+        action_ids = [aid for aid, _cb in registered]
+        for action_id in DURABLE_SLACK_ACTION_IDS:
+            assert action_id in action_ids
+
+
     def test_plugin_loader_failure_does_not_break_connect(self):
         """If get_plugin_manager() blows up, connect() must still succeed.
 
@@ -263,3 +278,209 @@ class TestSlackAdapterPluginActionWiring:
         # Built-ins still wired even when plugin loader failed.
         action_ids = [aid for aid, _cb in registered_actions]
         assert "hermes_approve_once" in action_ids
+
+
+def _durable_complete(tmp_path: Path, **overrides) -> dict:
+    section = {
+        "enabled": True,
+        "dispatch_enabled": False,
+        "backend": "sqlite",
+        "sqlite_path": str(tmp_path / "jobs.sqlite"),
+        "checkpoint_sqlite_path": str(tmp_path / "checkpoints.sqlite"),
+        "cursor_adapter_mode": "injected",
+        "slack_adapter_mode": "injected",
+        "cursor_secret_ref": "CURSOR_API_KEY",
+        "slack_secret_ref": "SLACK_BOT_TOKEN",
+        "policy_version": "eng29-matrix-v1",
+        "identity_binding": {
+            "workspace_id": "T1",
+            "repository_identity": "github.com/example/repo",
+        },
+    }
+    section.update(overrides)
+    return {"durable_jobs": section}
+
+
+def _seed_durable_job(handle, *, repository_identity: str = "github.com/example/repo"):
+    from agent.durable_jobs.decisions import DecisionLedger
+    from agent.durable_jobs.slack_contract import SlackBindingLedger
+
+    store = handle.lane._require_sqlite_path()
+    job = store.create_job(
+        origin_platform="slack",
+        origin_chat_id="C123",
+        origin_root_thread_id="111.222",
+        objective="slack-ingress",
+        repository_identity=repository_identity,
+        idempotency_key="idem-slack-ingress",
+    )
+    SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
+        job_id=job.job_id,
+        workspace_id="T1",
+        channel_id="C123",
+        root_thread_ts="111.222",
+        candidate_id="cand-1",
+        candidate_version="v1",
+    )
+    DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
+        job_id=job.job_id,
+        policy_version="pol-1",
+        allowed_actors=("U-alice",),
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    return job, store
+
+
+def _inbound_count(sqlite_path: Path) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        (n,) = conn.execute("SELECT COUNT(*) FROM job_inbound_actions").fetchone()
+        return int(n)
+    finally:
+        conn.close()
+
+
+def _decision_count(sqlite_path: Path) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        (n,) = conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()
+        return int(n)
+    finally:
+        conn.close()
+
+
+class TestDurableJobSlackActionIngress:
+    """Production Slack action ingress: persist before ACK, fail-closed retry."""
+
+    def test_ack_happens_only_after_durable_persist(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
+
+        detach_durable_job_lane()
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
+        assert handle is not None
+        job, store = _seed_durable_job(handle)
+        inbound_at_ack: list[int] = []
+
+        async def ack():
+            inbound_at_ack.append(_inbound_count(store.sqlite_path))
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        body = {
+            "team": {"id": "T1"},
+            "user": {"id": "U-alice"},
+            "channel": {"id": "C123"},
+            "message": {"thread_ts": "111.222", "ts": "111.222"},
+        }
+        action = {
+            "action_id": "hermes_durable_go",
+            "value": __import__("json").dumps(
+                {
+                    "job_id": job.job_id,
+                    "decision_idempotency_key": "dec-slack-ack",
+                    "policy_version": "pol-1",
+                    "candidate_id": "cand-1",
+                    "candidate_version": "v1",
+                }
+            ),
+        }
+        try:
+            asyncio.run(adapter._handle_durable_job_action(ack, body, action))
+            assert inbound_at_ack == [1]
+            assert _inbound_count(store.sqlite_path) == 1
+        finally:
+            detach_durable_job_lane()
+
+    def test_retryable_failure_does_not_ack(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
+
+        detach_durable_job_lane()
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
+        assert handle is not None
+        job, store = _seed_durable_job(handle)
+        handle.shutdown()
+        acked: list[str] = []
+
+        async def ack():
+            acked.append("ack")
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        body = {
+            "team": {"id": "T1"},
+            "user": {"id": "U-alice"},
+            "channel": {"id": "C123"},
+            "message": {"thread_ts": "111.222", "ts": "111.222"},
+        }
+        action = {
+            "action_id": "hermes_durable_go",
+            "value": __import__("json").dumps(
+                {
+                    "job_id": job.job_id,
+                    "decision_idempotency_key": "dec-slack-retry",
+                    "policy_version": "pol-1",
+                    "candidate_id": "cand-1",
+                    "candidate_version": "v1",
+                }
+            ),
+        }
+        try:
+            asyncio.run(adapter._handle_durable_job_action(ack, body, action))
+            assert acked == []
+            assert _inbound_count(store.sqlite_path) == 0
+        finally:
+            detach_durable_job_lane()
+
+    def test_cross_repo_decision_does_not_persist_or_success_ack(self, tmp_path, monkeypatch):
+        from gateway.durable_job_lane import detach_durable_job_lane
+        from tests.agent.durable_jobs.package2_support import attach_runtime_ready_lane
+
+        detach_durable_job_lane()
+        handle = attach_runtime_ready_lane(
+            raw_config=_durable_complete(tmp_path), monkeypatch=monkeypatch
+        )
+        assert handle is not None
+        job, store = _seed_durable_job(
+            handle, repository_identity="github.com/evil/other"
+        )
+        inbound_at_ack: list[int] = []
+        decisions_at_ack: list[int] = []
+
+        async def ack():
+            inbound_at_ack.append(_inbound_count(store.sqlite_path))
+            decisions_at_ack.append(_decision_count(store.sqlite_path))
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        body = {
+            "team": {"id": "T1"},
+            "user": {"id": "U-alice"},
+            "channel": {"id": "C123"},
+            "message": {"thread_ts": "111.222", "ts": "111.222"},
+        }
+        action = {
+            "action_id": "hermes_durable_go",
+            "value": __import__("json").dumps(
+                {
+                    "job_id": job.job_id,
+                    "decision_idempotency_key": "dec-slack-cross-repo",
+                    "policy_version": "pol-1",
+                    "candidate_id": "cand-1",
+                    "candidate_version": "v1",
+                }
+            ),
+        }
+        try:
+            asyncio.run(adapter._handle_durable_job_action(ack, body, action))
+            assert inbound_at_ack == [0]
+            assert decisions_at_ack == [0]
+            assert _inbound_count(store.sqlite_path) == 0
+        finally:
+            detach_durable_job_lane()

@@ -35,6 +35,13 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Remember and pin the genuine process environ before durable preflight imports.
+# Both calls are explicit: importing the module alone does not establish trust.
+import hermes_environ_startup as _hermes_environ_startup  # noqa: E402
+
+_hermes_environ_startup.remember_process_origin()
+_hermes_environ_startup.capture_trusted_startup()
+
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves

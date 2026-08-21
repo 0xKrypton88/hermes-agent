@@ -6911,6 +6911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
+        self._durable_job_lane = None
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -12386,6 +12387,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 
+    def _maybe_attach_durable_job_lane(self) -> None:
+        """Construct the lane only when validated runtime capability is bound."""
+        try:
+            from agent.durable_jobs.production_binding import production_attach_kwargs
+            from gateway.durable_job_lane import LaneClosedError, attach_to_gateway_runner
+
+            attach_to_gateway_runner(self, **production_attach_kwargs(owner=self))
+        except LaneClosedError:
+            raise
+        except Exception:
+            logger.warning(
+                "Durable Job Lane construction failed; gateway continues without it",
+                exc_info=True,
+            )
+
+    def _maybe_detach_durable_job_lane(self) -> None:
+        """Idempotently detach a lifecycle-owned durable-job lane."""
+        try:
+            from gateway.durable_job_lane import LaneClosedError, detach_from_gateway_runner
+
+            detach_from_gateway_runner(self)
+        except LaneClosedError:
+            raise
+        except Exception:
+            logger.debug("Durable Job Lane detach failed", exc_info=True)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -12524,6 +12551,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Gateway health OTLP export: enabled")
         except Exception:
             logger.debug("gateway health OTLP export startup failed", exc_info=True)
+
+        # Package 2: default-off and fail-closed. This does not construct
+        # provider clients or read credentials unless all binding gates pass.
+        self._maybe_attach_durable_job_lane()
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
@@ -14516,7 +14547,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         # getattr-guard: shutdown-path tests build bare runners via
-        # object.__new__ that lack the liveness-guard machinery.
+        # object.__new__ that lack the durable-lane machinery.
+        _detach_lane = getattr(self, "_maybe_detach_durable_job_lane", None)
+        if callable(_detach_lane):
+            try:
+                from agent.durable_jobs.lane import LaneClosedError as _LaneClosedError
+
+                _detach_lane()
+            except _LaneClosedError:
+                raise
+            except Exception:
+                logger.debug("Durable Job Lane detach failed", exc_info=True)
+        # Bare runners can also lack loop-liveness guards.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
@@ -30235,6 +30277,16 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+def _capture_trusted_environ_startup() -> None:
+    """Pin process-environ identity only from a remembered startup origin."""
+    try:
+        import hermes_environ_startup
+
+        hermes_environ_startup.capture_trusted_startup()
+    except ModuleNotFoundError:
+        pass
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30257,6 +30309,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
 
     apply_nofile_soft_limit()
+
+    _capture_trusted_environ_startup()
 
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
@@ -30938,6 +30992,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
+    _capture_trusted_environ_startup()
     # Advertise the agent harness to child processes (AI_AGENT is the
     # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid

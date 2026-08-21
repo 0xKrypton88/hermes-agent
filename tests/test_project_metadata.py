@@ -289,3 +289,45 @@ def test_huggingface_hub_lazy_pin_inside_transformers_window():
         "range (>=1.5.0,<2). The lazy refresh would downgrade the shared "
         "package and break Hindsight local embeddings (#60783)."
     )
+
+
+def test_langgraph_durable_postgres_extra_not_in_core_or_all():
+    """ENG-25: PostgreSQL durable-jobs extra is opt-in, exact-pinned, not core/[all]."""
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+
+    extras = project["optional-dependencies"]
+    core = project["dependencies"]
+    assert "langgraph-durable-postgres" in extras, (
+        "opt-in [langgraph-durable-postgres] extra is required for ENG-25"
+    )
+    postgres_extra = extras["langgraph-durable-postgres"]
+    assert postgres_extra, "postgres extra must not be empty"
+
+    joined = " ".join(postgres_extra)
+    assert "langgraph-checkpoint-postgres==" in joined
+    assert "psycopg" in joined
+    for spec in postgres_extra:
+        requirement = spec.split(";", 1)[0].strip()
+        if requirement.startswith("hermes-agent["):
+            continue
+        assert "==" in requirement, f"postgres extra must exact-pin {spec!r}"
+
+    core_names = " ".join(core).lower()
+    assert "langgraph-checkpoint-postgres" not in core_names
+    assert "psycopg" not in core_names
+
+    all_extra = extras["all"]
+    assert not any("langgraph-durable-postgres" in spec for spec in all_extra)
+    assert not any("langgraph-durable" in spec for spec in all_extra)
+
+    # SQLite/dev extra remains available and must not pull the postgres extra.
+    dev_extra = extras["dev"]
+    assert any("langgraph-durable" in spec for spec in dev_extra)
+    assert not any("langgraph-durable-postgres" in spec for spec in dev_extra)
+
+    sqlite_extra = extras["langgraph-durable"]
+    sqlite_joined = " ".join(sqlite_extra)
+    assert "langgraph-checkpoint-sqlite==" in sqlite_joined
+    assert "langgraph-checkpoint-postgres" not in sqlite_joined

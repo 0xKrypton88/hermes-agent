@@ -2771,6 +2771,11 @@ def _run_single_child(
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
+        # Do not start the child execution budget until the worker is actually
+        # scheduled. Under CI load, a short configured timeout could otherwise
+        # expire before child.run_conversation has even started, violating the
+        # timeout-cleanup contract for the relay turn the child owns.
+        _worker_started = threading.Event()
 
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
@@ -2785,6 +2790,7 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            _worker_started.set()
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
@@ -2800,6 +2806,11 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
+            # The configured limit bounds child execution, not executor thread
+            # scheduling. Waiting here is normally immediate and prevents a
+            # queueing race from reporting a timeout before the child can own
+            # and clean up its relay turn.
+            _worker_started.wait()
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for

@@ -20,6 +20,26 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Durable Job Lane remains default-off and fail-closed.
+    "durable_jobs": {
+        "enabled": False,
+        "dispatch_enabled": False,
+        "backend": None,
+        "sqlite_path": None,
+        "checkpoint_sqlite_path": None,
+        "postgres_dsn": None,
+        "postgres_schema": None,
+        "checkpoint_postgres_dsn": None,
+        "checkpoint_postgres_schema": None,
+        "postgres_storage_id": None,
+        "checkpoint_postgres_storage_id": None,
+        "cursor_adapter_mode": None,
+        "slack_adapter_mode": None,
+        "cursor_secret_ref": None,
+        "slack_secret_ref": None,
+        "policy_version": None,
+        "identity_binding": None,
+    },
     # Soft file-descriptor limit for long-running Hermes server processes.
     # Clamped to the OS hard limit; 0/false/null disables the adjustment.
     "runtime": {

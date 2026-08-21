@@ -352,6 +352,47 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 
 
 
+def test_restart_relaunches_directly_without_start_install_prompt(monkeypatch):
+    """Restart must recover a manually started, non-installed gateway."""
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_absent",
+        lambda timeout_s: calls.append(("absent", timeout_s)) or True,
+    )
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: calls.append("spawn") or 4321)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_report_gateway_start",
+        lambda via: calls.append(("report", via)),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_ready",
+        lambda timeout_s: calls.append(("ready", timeout_s)) or [4321],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "start",
+        lambda: pytest.fail("restart must not enter start()'s install prompt path"),
+    )
+
+    gateway_windows.restart()
+
+    assert calls == [
+        "stop",
+        ("absent", 30.0),
+        ("sleep", 1.0),
+        "spawn",
+        ("report", "direct spawn (PID 4321)"),
+        ("ready", 15.0),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # stop() drain semantics — issue #33778
 #

@@ -30,6 +30,11 @@ except ModuleNotFoundError:
     # new code but ``uv pip install -e .`` didn't finish.  Missing bootstrap
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
+try:
+    import hermes_environ_startup
+    hermes_environ_startup.capture_trusted_startup()
+except ModuleNotFoundError:
+    pass
 
 import asyncio
 import base64
