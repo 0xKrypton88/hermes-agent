@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future
 
 import pytest
 
@@ -122,6 +123,78 @@ def test_dispatch_returns_immediately_without_blocking():
     assert ad.active_count() == 1
     assert elapsed < 4.0, f"dispatch blocked {elapsed:.2f}s (gate is 5s)"
     gate.set()
+
+
+class _NeverStartsExecutor:
+    def __init__(self):
+        self.submitted: list[Future] = []
+
+    def submit(self, *args, **kwargs):
+        future = Future()
+        self.submitted.append(future)
+        return future
+
+
+def _assert_worker_start_timeout(delegation_id: str) -> None:
+    evt = _drain_for(delegation_id, timeout=1.0)
+    assert evt is not None
+    assert evt["status"] == "error"
+    assert evt["exit_reason"] == "worker_start_timeout"
+    assert evt["timeout_phase"] == "worker_start"
+    assert ad.active_count() == 0
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == delegation_id
+    )
+    assert record["status"] == "error"
+    with ad._connect() as conn:
+        durable = conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()
+    assert durable == ("error",)
+
+
+def test_single_dispatch_terminalizes_if_executor_accepts_but_never_starts(monkeypatch):
+    executor = _NeverStartsExecutor()
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+    monkeypatch.setattr(ad, "_WORKER_START_TIMEOUT_SECONDS", 0.05)
+
+    res = ad.dispatch_async_delegation(
+        goal="never starts",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=lambda: {"status": "completed", "summary": "must not run"},
+        max_async_children=1,
+    )
+
+    assert res["status"] == "dispatched"
+    _assert_worker_start_timeout(res["delegation_id"])
+    assert executor.submitted[0].cancelled()
+
+
+def test_batch_dispatch_terminalizes_if_executor_accepts_but_never_starts(monkeypatch):
+    executor = _NeverStartsExecutor()
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+    monkeypatch.setattr(ad, "_WORKER_START_TIMEOUT_SECONDS", 0.05)
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one", "two"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=lambda: {"results": [{"status": "completed"}]},
+        max_async_children=1,
+    )
+
+    assert res["status"] == "dispatched"
+    _assert_worker_start_timeout(res["delegation_id"])
+    assert executor.submitted[0].cancelled()
 
 
 def test_async_executor_workers_are_daemon_threads():

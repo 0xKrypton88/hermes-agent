@@ -1108,6 +1108,10 @@ _MIN_SUMMARY_CHARS = 2000
 # detection lives in the heartbeat staleness monitor below. Users can opt back
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+# Executor acceptance is not proof that a worker callable has started. Bound
+# the queue/start handoff separately from the optional child execution timeout
+# so an executor that accepts but never schedules work cannot hang its parent.
+WORKER_START_TIMEOUT_SECONDS = 30.0
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no observable progress is either:
 #   - idle between turns (no current_tool, frozen last_activity_ts) — wedged
@@ -2805,12 +2809,17 @@ def _run_single_child(
             _child_context.run,
             _run_with_thread_capture,
         )
+        worker_start_timed_out = False
         try:
-            # The configured limit bounds child execution, not executor thread
-            # scheduling. Waiting here is normally immediate and prevents a
-            # queueing race from reporting a timeout before the child can own
-            # and clean up its relay turn.
-            _worker_started.wait()
+            # Executor acceptance does not guarantee scheduling. Bound this
+            # separate queue/start phase so an accepted Future that never runs
+            # cannot hang the parent before the child execution budget begins.
+            if not _worker_started.wait(timeout=WORKER_START_TIMEOUT_SECONDS):
+                worker_start_timed_out = True
+                _child_future.cancel()
+                raise FuturesTimeoutError(
+                    "Subagent worker did not start within the scheduling deadline"
+                )
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
@@ -2828,6 +2837,9 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            effective_timeout = (
+                WORKER_START_TIMEOUT_SECONDS if worker_start_timed_out else child_timeout
+            )
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2852,7 +2864,7 @@ def _run_single_child(
                     task_index=task_index,
                     # is_timeout implies a cap was configured (result(timeout=None)
                     # never raises FuturesTimeoutError); guard for the type checker.
-                    timeout_seconds=float(child_timeout or 0.0),
+                    timeout_seconds=float(effective_timeout or 0.0),
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
                     goal=goal,
@@ -2881,7 +2893,14 @@ def _run_single_child(
                     pass
 
             if is_timeout:
-                if child_api_calls == 0:
+                if worker_start_timed_out:
+                    _err = (
+                        "Subagent worker did not start within "
+                        f"{WORKER_START_TIMEOUT_SECONDS}s after executor acceptance."
+                    )
+                    if diagnostic_path:
+                        _err += f" Diagnostic: {diagnostic_path}"
+                elif child_api_calls == 0:
                     _err = (
                         f"Subagent timed out after {child_timeout}s without "
                         f"making any API call — the child never reached its "
@@ -2910,10 +2929,11 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
-                "timeout_seconds": child_timeout if is_timeout else None,
+                "timeout_seconds": effective_timeout if is_timeout else None,
                 "timed_out_after_seconds": duration if is_timeout else None,
                 "timeout_phase": (
-                    "before_first_llm_call" if is_timeout and child_api_calls == 0
+                    "worker_start" if is_timeout and worker_start_timed_out
+                    else "before_first_llm_call" if is_timeout and child_api_calls == 0
                     else "after_llm_calls" if is_timeout
                     else None
                 ),

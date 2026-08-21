@@ -89,6 +89,11 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+# A dispatch is non-blocking, but executor acceptance does not prove a daemon
+# worker ever began executing. A short watchdog terminalizes accepted-but-
+# unscheduled work and frees capacity instead of leaving a durable "running"
+# row forever.
+_WORKER_START_TIMEOUT_SECONDS = 30.0
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -750,6 +755,88 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _worker_started(delegation_id: str) -> bool:
+    """Claim permission to run and disarm the scheduling watchdog."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") != "running":
+            return False
+        record["_worker_started"] = True
+        timer = record.pop("_worker_start_timer", None)
+    if timer is not None:
+        timer.cancel()
+    return True
+
+
+def _arm_worker_start_watchdog(delegation_id: str, future: Any) -> None:
+    """Fail an accepted dispatch if its executor callable never begins."""
+    timer = threading.Timer(
+        _WORKER_START_TIMEOUT_SECONDS,
+        _finalize_worker_start_timeout,
+        args=(delegation_id,),
+    )
+    timer.name = f"async-delegate-start-{delegation_id}"
+    timer.daemon = True
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if (
+            record is None
+            or record.get("status") != "running"
+            or record.get("_worker_started")
+        ):
+            return
+        record["_worker_future"] = future
+        record["_worker_start_timer"] = timer
+    timer.start()
+
+
+def _finalize_worker_start_timeout(delegation_id: str) -> None:
+    claimed = _begin_finalization(delegation_id)
+    if claimed is None:
+        return
+    event_record, _interrupt_fn = claimed
+    future = event_record.get("_worker_future")
+    if future is not None:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+    duration = round(
+        (event_record.get("completed_at") or time.time())
+        - (event_record.get("dispatched_at") or time.time()),
+        2,
+    )
+    error = (
+        "Async delegation worker did not start within "
+        f"{_WORKER_START_TIMEOUT_SECONDS}s after executor acceptance."
+    )
+    result = {
+        "status": "error",
+        "summary": None,
+        "error": error,
+        "api_calls": 0,
+        "duration_seconds": duration,
+        "exit_reason": "worker_start_timeout",
+        "timeout_seconds": _WORKER_START_TIMEOUT_SECONDS,
+        "timed_out_after_seconds": duration,
+        "timeout_phase": "worker_start",
+    }
+    if event_record.get("is_batch"):
+        _push_batch_completion_event(
+            event_record,
+            {
+                "results": [],
+                "error": error,
+                "total_duration_seconds": duration,
+                **result,
+            },
+            "error",
+        )
+    else:
+        _push_completion_event(event_record, result, "error")
+    _finish_finalization(delegation_id, "error")
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -857,6 +944,8 @@ def dispatch_async_delegation(
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
+        if not _worker_started(delegation_id):
+            return
         result: Dict[str, Any] = {}
         status = "error"
         try:
@@ -878,7 +967,8 @@ def dispatch_async_delegation(
     try:
         # Propagate the dispatching profile so the detached child resolves
         # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        _arm_worker_start_watchdog(delegation_id, future)
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -924,8 +1014,11 @@ def _begin_finalization(
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
+        timer = record.pop("_worker_start_timer", None)
         event_record = dict(record)
 
+    if timer is not None:
+        timer.cancel()
     return event_record, interrupt_fn
 
 
@@ -998,6 +1091,13 @@ def _push_completion_event(
         "stall_threshold_seconds",
         "stall_phase",
         "stall_grace_seconds",
+    ):
+        if _k in result:
+            evt[_k] = result[_k]
+    for _k in (
+        "timeout_seconds",
+        "timed_out_after_seconds",
+        "timeout_phase",
     ):
         if _k in result:
             evt[_k] = result[_k]
@@ -1100,6 +1200,8 @@ def dispatch_async_delegation_batch(
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
+        if not _worker_started(delegation_id):
+            return
         combined: Dict[str, Any] = {}
         status = "error"
         try:
@@ -1126,7 +1228,8 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        _arm_worker_start_watchdog(delegation_id, future)
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -1197,6 +1300,7 @@ def _push_batch_completion_event(
         # operational record of each child's run.
         "live_transcripts": combined.get("live_transcripts"),
         "error": combined.get("error"),
+        "exit_reason": combined.get("exit_reason"),
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
@@ -1212,6 +1316,13 @@ def _push_batch_completion_event(
         "stall_threshold_seconds",
         "stall_phase",
         "stall_grace_seconds",
+    ):
+        if _k in combined:
+            evt[_k] = combined[_k]
+    for _k in (
+        "timeout_seconds",
+        "timed_out_after_seconds",
+        "timeout_phase",
     ):
         if _k in combined:
             evt[_k] = combined[_k]
@@ -1600,4 +1711,14 @@ def _reset_for_tests() -> None:
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
     with _records_lock:
+        for record in _records.values():
+            timer = record.get("_worker_start_timer")
+            if timer is not None:
+                timer.cancel()
+            future = record.get("_worker_future")
+            if future is not None:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
         _records.clear()

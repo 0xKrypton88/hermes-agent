@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -238,3 +239,48 @@ class TestRunSingleChildTimeoutDump:
         assert result["timeout_seconds"] is None
         assert result["timed_out_after_seconds"] is None
         assert result["timeout_phase"] is None
+
+    def test_worker_queue_start_wait_is_bounded(self, hermes_home, monkeypatch):
+        """An accepted Future that never starts must not hang the parent forever."""
+        from tools import daemon_pool, delegate_tool
+
+        pending = Future()
+        shutdown_calls: list[bool] = []
+
+        class NeverStartsExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, *args, **kwargs):
+                return pending
+
+            def shutdown(self, wait=True, **kwargs):
+                shutdown_calls.append(wait)
+
+        monkeypatch.setattr(
+            daemon_pool, "DaemonThreadPoolExecutor", NeverStartsExecutor
+        )
+        monkeypatch.setattr(delegate_tool, "WORKER_START_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: None)
+
+        child = _StubChild(api_call_count=0, hang_seconds=0.0)
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+
+        started = time.monotonic()
+        result = delegate_tool._run_single_child(
+            task_index=0,
+            goal="never scheduled",
+            child=child,
+            parent_agent=parent,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert result["status"] == "timeout"
+        assert result["timeout_phase"] == "worker_start"
+        assert result["timeout_seconds"] == 0.01
+        assert "worker" in result["error"].lower()
+        assert pending.cancelled()
+        assert shutdown_calls == [False]
