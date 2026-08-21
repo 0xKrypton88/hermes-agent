@@ -452,6 +452,7 @@ py-modules = [
   "hermes_state_search",
   "hermes_time",
   "hermes_logging",
+  "hermes_environ_startup",
   "utils",
   "mcp_serve",
 ]

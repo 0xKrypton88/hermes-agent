@@ -125,9 +125,12 @@ async def _post_signed(
     include_svix: bool = True,
     bad_signature: bool = False,
     auth_without_svix: bool = False,
+    timestamp: str | None = None,
 ):
+    timestamp = timestamp or str(int(time.time() * 1000))
+    payload = dict(payload)
+    payload["webhookTimestamp"] = int(timestamp)
     body = json.dumps(payload).encode("utf-8")
-    timestamp = str(int(time.time()))
     headers = {"Content-Type": "application/json"}
     if include_svix:
         sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
@@ -158,8 +161,10 @@ async def _post_linear_signed(
     timestamp: str | None = None,
 ):
     """Send the actual Linear webhook header contract."""
+    timestamp = timestamp or str(int(time.time() * 1000))
+    payload = dict(payload)
+    payload["webhookTimestamp"] = int(timestamp)
     body = json.dumps(payload).encode("utf-8")
-    timestamp = timestamp or str(int(time.time()))
     signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return await cli.post(
         "/webhooks/linear-go",
@@ -230,6 +235,7 @@ async def test_duplicate_svix_id_after_store_reconstruction_is_idempotent(
 ):
     delivery_id = "msg_linear_dup_42"
     payload = _linear_issue_update_payload()
+    timestamp = str(int(time.time() * 1000))
     db_path = hermes_home / "webhook_receipts.db"
 
     adapter1 = _make_adapter(hermes_home)
@@ -237,7 +243,10 @@ async def test_duplicate_svix_id_after_store_reconstruction_is_idempotent(
     app1 = _create_app(adapter1)
     async with TestClient(TestServer(app1)) as cli:
         resp1 = await _post_signed(
-            cli, payload=payload, delivery_id=delivery_id
+            cli,
+            payload=payload,
+            delivery_id=delivery_id,
+            timestamp=timestamp,
         )
         assert resp1.status == 202
         first = await resp1.json()
@@ -250,7 +259,10 @@ async def test_duplicate_svix_id_after_store_reconstruction_is_idempotent(
     app2 = _create_app(adapter2)
     async with TestClient(TestServer(app2)) as cli:
         resp2 = await _post_signed(
-            cli, payload=payload, delivery_id=delivery_id
+            cli,
+            payload=payload,
+            delivery_id=delivery_id,
+            timestamp=timestamp,
         )
         assert resp2.status == 200
         second = await resp2.json()
@@ -432,7 +444,7 @@ async def test_actual_linear_headers_are_required_and_timestamp_is_fresh(hermes_
             cli,
             payload=_linear_issue_update_payload(issue_id="issue-stale"),
             delivery_id="linear-stale-1",
-            timestamp=str(int(time.time()) - 301),
+            timestamp=str(int((time.time() - 301) * 1000)),
         )
         assert stale.status == 401
 
@@ -486,4 +498,70 @@ async def test_same_delivery_id_with_different_payload_is_conflict(hermes_home):
         )
     assert first.status == 202
     assert second.status == 409
+
+
+@pytest.mark.asyncio
+async def test_linear_replay_cannot_bypass_receipt_with_new_headers(hermes_home):
+    """Unsigned delivery/timestamp headers cannot mint another receipt."""
+    adapter = _make_adapter(hermes_home)
+    adapter.handle_message = AsyncMock()
+    app = _create_app(adapter)
+    payload = _linear_issue_update_payload()
+    timestamp = str(int(time.time() * 1000))
+    payload["webhookTimestamp"] = int(timestamp)
+    body = json.dumps(payload).encode("utf-8")
+    signature = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(
+            "/webhooks/linear-go",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Linear-Delivery": "linear-replay-original",
+                "Linear-Signature": signature,
+                "Linear-Timestamp": timestamp,
+            },
+        )
+        replay = await cli.post(
+            "/webhooks/linear-go",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Linear-Delivery": "linear-replay-attacker-changed",
+                "Linear-Signature": signature,
+                "Linear-Timestamp": timestamp,
+            },
+        )
+        replay_body = await replay.json()
+
+    assert first.status == 202
+    assert replay.status == 200
+    assert replay_body["status"] == "duplicate"
     assert _count_receipts(hermes_home / "webhook_receipts.db") == 1
+
+
+@pytest.mark.asyncio
+async def test_linear_unsigned_timestamp_must_match_signed_payload(hermes_home):
+    adapter = _make_adapter(hermes_home)
+    app = _create_app(adapter)
+    payload = _linear_issue_update_payload()
+    signed_timestamp = str(int(time.time() * 1000))
+    payload["webhookTimestamp"] = int(signed_timestamp)
+    body = json.dumps(payload).encode("utf-8")
+    signature = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/webhooks/linear-go",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Linear-Delivery": "linear-timestamp-mismatch",
+                "Linear-Signature": signature,
+                "Linear-Timestamp": str(int(signed_timestamp) + 1),
+            },
+        )
+
+    assert response.status == 401
+    assert _count_receipts(hermes_home / "webhook_receipts.db") == 0

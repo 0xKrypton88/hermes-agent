@@ -9,6 +9,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_startup_pth_target_is_packaged_as_top_level_module():
+    """The installed .pth must never import a module omitted from the distribution."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    modules = set(data["tool"]["setuptools"]["py-modules"])
+    assert "hermes_environ_startup" in modules
+
+
 def _distribution_name(requirement: str) -> str:
     """Extract the PEP 508 distribution name from a requirement string.
 

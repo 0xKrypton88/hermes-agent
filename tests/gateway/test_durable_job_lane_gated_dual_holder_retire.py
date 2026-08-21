@@ -220,3 +220,51 @@ def test_gated_dual_holder_retire_stress_twenty_five(tmp_path, monkeypatch):
         assert (a, b) == ("LaneClosedError", "LaneClosedError"), (
             f"gated dual-holder stress iteration {i}: A={a!r} B={b!r}"
         )
+
+
+def test_replacement_attach_waits_until_previous_shutdown_is_complete(tmp_path, monkeypatch):
+    """A new owner lane must not publish while the prior handle is still shutting down."""
+    from gateway.durable_job_lane import (
+        attach_to_gateway_runner,
+        detach_from_gateway_runner,
+    )
+
+    owner = SimpleNamespace(_durable_job_lane=None)
+    old, _job, _store = _seed_owned(
+        tmp_path, monkeypatch, owner, idempotency_key="idem-replacement-fence"
+    )
+    transports = runtime_ready_transport_kwargs(monkeypatch)
+    shutdown_entered = threading.Event()
+    allow_shutdown = threading.Event()
+    replacement_done = threading.Event()
+    original_shutdown = old.shutdown
+
+    def gated_shutdown():
+        shutdown_entered.set()
+        assert allow_shutdown.wait(timeout=5.0)
+        original_shutdown()
+
+    old.shutdown = gated_shutdown
+    retire = threading.Thread(target=lambda: detach_from_gateway_runner(owner))
+    retire.start()
+    assert shutdown_entered.wait(timeout=2.0)
+
+    result = {}
+
+    def replace():
+        result["handle"] = attach_to_gateway_runner(
+            owner, raw_config=_complete(tmp_path), **transports
+        )
+        replacement_done.set()
+
+    replacement = threading.Thread(target=replace)
+    replacement.start()
+    assert not replacement_done.wait(timeout=0.2)
+    assert owner._durable_job_lane is None
+
+    allow_shutdown.set()
+    retire.join(timeout=5.0)
+    replacement.join(timeout=5.0)
+    assert not retire.is_alive() and not replacement.is_alive()
+    assert result["handle"] is owner._durable_job_lane
+    assert result["handle"] is not old

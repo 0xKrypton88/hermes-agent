@@ -280,15 +280,14 @@ def _thread_holds_mutation_lease(handle: "DurableJobLaneHandle") -> bool:
 
 
 def _shutdown_retired(key: int, handle: "DurableJobLaneHandle") -> None:
-    """Close *handle* outside all registry locks, then drop idle retirement."""
+    """Close *handle* outside all registry locks."""
     try:
         handle.shutdown()
     except LaneClosedError:
         raise
     except Exception:
         logger.debug("durable job lane retire failed", exc_info=True)
-    finally:
-        _clear_retiring_if_idle(key, handle)
+
 
 
 def _drive_or_join_retirement(
@@ -310,6 +309,7 @@ def _drive_or_join_retirement(
         finally:
             if state is not None:
                 state.done.set()
+            _clear_retiring_if_idle(key, handle)
         return
     if _thread_holds_mutation_lease(handle):
         raise LaneClosedError(
@@ -428,6 +428,20 @@ def attach_durable_job_lane(
 
     key = _owner_key(owner)
     oplock = _owner_oplock(key)
+    while True:
+        with _LOCK:
+            retiring = _RETIRING.get(key)
+        if retiring is None:
+            break
+        if _thread_holds_mutation_lease(retiring.handle):
+            raise LaneClosedError(
+                "durable job lane is retiring; active holder must fail closed"
+            )
+        if not retiring.done.wait(timeout=30.0):
+            logger.error(
+                "durable job lane replacement timed out waiting for prior shutdown"
+            )
+            return None
     with oplock:
         with _LOCK:
             if key in _LANES:
@@ -461,10 +475,14 @@ def attach_durable_job_lane(
             _LANES[key] = handle
             if owner is not None:
                 _LANE_OWNERS[key] = owner
-            previous = _RETIRING.pop(key, None)
-        if previous is not None:
-            previous.done.set()
-            _unbind_idle_cleanup(previous.handle)
+            if key in _RETIRING:
+                del _LANES[key]
+                if owner is not None:
+                    _LANE_OWNERS.pop(key, None)
+                logger.error(
+                    "durable job lane replacement raced an in-flight retirement"
+                )
+                return None
         _bind_handle_owner(handle, owner)
         _publish_runner_field(owner, handle)
         logger.info(

@@ -186,6 +186,10 @@ class WebhookReceiptStore:
             "CREATE INDEX IF NOT EXISTS idx_webhook_receipts_job_created "
             "ON webhook_receipts(job_key, created_at DESC)"
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_receipts_provider_payload "
+            "ON webhook_receipts(provider, payload_hash)"
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -263,8 +267,19 @@ class WebhookReceiptStore:
                     (PROVIDER_LINEAR, delivery_id),
                 ).fetchone()
                 if row is None:
-                    raise
+                    row = conn.execute(
+                        """SELECT * FROM webhook_receipts
+                           WHERE provider=? AND payload_hash=?""",
+                        (PROVIDER_LINEAR, payload_hash),
+                    ).fetchone()
+                    if row is None:
+                        raise
                 existing = self._row_to_record(row)
+                if existing.payload_hash == payload_hash:
+                    return ReceiptInsertResult(
+                        status="duplicate",
+                        receipt=existing,
+                    )
                 if (
                     existing.issue_id != issue_id
                     or existing.issue_identifier != issue_identifier

@@ -1250,21 +1250,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 signature_header=svix_signature,
             )
 
-        # Linear: linear-signature = <hex HMAC-SHA256 of the raw body, keyed
-        # by the webhook signing key>. Linear's documented scheme signs the
-        # body only (no timestamp binding), so this mirrors it exactly;
-        # without this branch every Linear delivery to a secret-configured
-        # route was rejected as unrecognized (#87348).
+        # Linear signs the raw body only. Replay freshness therefore MUST use
+        # webhookTimestamp from that signed JSON body. Linear-Timestamp is an
+        # intake-contract header here, but is unsigned, so it is accepted only
+        # when its documented millisecond value exactly matches the signed
+        # payload field.
         linear_sig = _header("linear-signature")
         if linear_sig:
             linear_timestamp = _header("linear-timestamp")
             try:
-                timestamp_value = float(linear_timestamp)
-            except (TypeError, ValueError):
+                header_timestamp_ms = int(linear_timestamp)
+                payload = json.loads(body)
+                payload_timestamp_ms = int(payload["webhookTimestamp"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return False
-            if timestamp_value > 10_000_000_000:
-                timestamp_value /= 1000.0
-            if abs(time.time() - timestamp_value) > 300:
+            if header_timestamp_ms != payload_timestamp_ms:
+                return False
+            if abs(time.time() - (payload_timestamp_ms / 1000.0)) > 300:
                 return False
             expected_linear = hmac.new(
                 secret.encode(), body, hashlib.sha256
