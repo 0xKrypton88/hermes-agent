@@ -197,6 +197,59 @@ def test_batch_dispatch_terminalizes_if_executor_accepts_but_never_starts(monkey
     assert executor.submitted[0].cancelled()
 
 
+def test_worker_start_wins_against_already_running_timeout_callback(monkeypatch):
+    executor = _NeverStartsExecutor()
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: executor)
+    monkeypatch.setattr(ad, "_WORKER_START_TIMEOUT_SECONDS", 60.0)
+
+    res = ad.dispatch_async_delegation(
+        goal="start races timeout",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=lambda: {"status": "completed", "summary": "done"},
+        max_async_children=1,
+    )
+    delegation_id = res["delegation_id"]
+    callback_entered = threading.Event()
+    allow_callback_claim = threading.Event()
+    original_begin_finalization = ad._begin_finalization
+
+    def gated_begin_finalization(candidate_id, **kwargs):
+        callback_entered.set()
+        assert allow_callback_claim.wait(timeout=2.0)
+        return original_begin_finalization(candidate_id, **kwargs)
+
+    monkeypatch.setattr(ad, "_begin_finalization", gated_begin_finalization)
+    callback = threading.Thread(
+        target=ad._finalize_worker_start_timeout,
+        args=(delegation_id,),
+    )
+    callback.start()
+    assert callback_entered.wait(timeout=2.0)
+
+    assert ad._worker_started(delegation_id) is True
+    allow_callback_claim.set()
+    callback.join(timeout=2.0)
+
+    assert not callback.is_alive()
+    assert _drain_for(delegation_id, timeout=0.1) is None
+    record = ad._records[delegation_id]
+    assert record["status"] == "running"
+    assert record["_worker_started"] is True
+
+    ad._finalize(
+        delegation_id,
+        {"status": "completed", "summary": "done"},
+        "completed",
+    )
+    event = _drain_for(delegation_id)
+    assert event is not None
+    assert event["status"] == "completed"
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 

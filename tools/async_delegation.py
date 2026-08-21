@@ -791,7 +791,10 @@ def _arm_worker_start_watchdog(delegation_id: str, future: Any) -> None:
 
 
 def _finalize_worker_start_timeout(delegation_id: str) -> None:
-    claimed = _begin_finalization(delegation_id)
+    claimed = _begin_finalization(
+        delegation_id,
+        require_worker_not_started=True,
+    )
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
@@ -1000,11 +1003,17 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
 
 def _begin_finalization(
     delegation_id: str,
+    *,
+    require_worker_not_started: bool = False,
 ) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
         record = _records.get(delegation_id)
-        if record is None or record.get("status") not in ("running", "stalling"):
+        if (
+            record is None
+            or record.get("status") not in ("running", "stalling")
+            or (require_worker_not_started and record.get("_worker_started"))
+        ):
             return
         # Stay active until durable persistence and queue publication finish;
         # otherwise process shutdown can kill this daemon worker in the narrow
