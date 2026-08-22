@@ -40,11 +40,12 @@ it cannot deadlock with coordinator/SQLite.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import Iterator, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
 from agent.durable_jobs.coordinator import (
@@ -342,6 +343,111 @@ class DurableLaneService:
             raise LaneClosedError("durable lane is closed")
         self._before_mutation_lease()
         return store
+
+    def resume_session_handoff(
+        self,
+        *,
+        job_id: str,
+        parent_session_id: str,
+        handoff: Any,
+        waypoint: Any,
+        pressure: Any,
+        linear: Any,
+        slack: Any,
+        sessions: Any,
+        handoff_config: Any,
+        manual_resume: bool = False,
+    ) -> Any:
+        """Run inactive ENG-122 handoff work under this lane's write lease."""
+        from agent.durable_jobs.session_handoff import (
+            HandoffIdentityMismatch,
+            SessionHandoffCoordinator,
+            SessionHandoffLedger,
+        )
+
+        if not handoff_config.enabled or handoff_config.shadow:
+            raise PilotDisabledError(
+                "session handoff effects require enabled=True and shadow=False"
+            )
+        store = self._acquire_authorized_mutation(job_id)
+        job = store.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if str(handoff.repository).strip() != str(job.repository_identity).strip():
+            raise HandoffIdentityMismatch(
+                "handoff repository does not match the durable job"
+            )
+        if not job.frozen_baseline_sha or handoff.exact_sha != job.frozen_baseline_sha:
+            raise HandoffIdentityMismatch(
+                "handoff requires a matching non-empty durable job baseline SHA"
+            )
+        with self._mutation_lease():
+            return SessionHandoffCoordinator(
+                ledger=SessionHandoffLedger(store.sqlite_path),
+                linear=linear,
+                slack=slack,
+                sessions=sessions,
+            ).resume(
+                job_id=job_id,
+                parent_session_id=parent_session_id,
+                handoff=handoff,
+                waypoint=waypoint,
+                pressure=pressure,
+                manual_resume=manual_resume,
+            )
+
+    def reconcile_session_handoff_effect(
+        self,
+        *,
+        job_id: str,
+        handoff_id: str,
+        effect_name: str,
+        outcome: str,
+        receipt: Optional[str] = None,
+        expected_owner_token: str,
+        expected_generation: int,
+        dead_owner_verified: bool,
+        handoff_config: Any,
+    ) -> Any:
+        """Resolve a verified ambiguous handoff effect under the lane write lease."""
+        from agent.durable_jobs.session_handoff import (
+            HandoffIdentityMismatch,
+            SessionHandoffLedger,
+        )
+
+        if handoff_config.enabled is not True or handoff_config.shadow is not False:
+            raise PilotDisabledError(
+                "session handoff reconciliation requires enabled=True and shadow=False"
+            )
+        store = self._acquire_authorized_mutation(job_id)
+        job = store.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        ledger = SessionHandoffLedger(store.sqlite_path)
+        state = ledger.get(job_id, handoff_id)
+        if state is None:
+            raise KeyError(handoff_id)
+        canonical = json.loads(ledger.canonical(job_id, handoff_id))
+        if (
+            str(canonical.get("repository", "")).strip()
+            != str(job.repository_identity).strip()
+            or not job.frozen_baseline_sha
+            or canonical.get("exact_sha") != job.frozen_baseline_sha
+        ):
+            raise HandoffIdentityMismatch(
+                "reconciliation requires current durable job repository and frozen SHA identity"
+            )
+        with self._mutation_lease():
+            return ledger.reconcile_effect(
+                job_id=job_id,
+                handoff_id=handoff_id,
+                effect_name=effect_name,
+                outcome=outcome,
+                receipt=receipt,
+                expected_owner_token=expected_owner_token,
+                expected_generation=expected_generation,
+                dead_owner_verified=dead_owner_verified,
+            )
 
     def bind_slack(
         self,

@@ -62,6 +62,17 @@ _KV_UNQUOTED_PASSWORD_RE = re.compile(
     r"(password\s*=\s*)([^\s'\"]+)",
     re.IGNORECASE,
 )
+_TOKEN_SHAPED_SECRET_RE = re.compile(
+    r"(?:"
+    r"gh[opusr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"sk-[A-Za-z0-9_-]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def redact_secret_text(text: str) -> str:
@@ -71,6 +82,7 @@ def redact_secret_text(text: str) -> str:
     redacted = _URI_PASSWORD_RE.sub(r"\1[REDACTED]\3", text)
     redacted = _KV_QUOTED_PASSWORD_RE.sub(r"\1\2[REDACTED]\2", redacted)
     redacted = _KV_UNQUOTED_PASSWORD_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _TOKEN_SHAPED_SECRET_RE.sub(REDACTED, redacted)
     return redacted
 
 
