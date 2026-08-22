@@ -7,6 +7,7 @@ this path and hard-disabled.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -16,6 +17,7 @@ import re
 import socket
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
@@ -199,9 +201,14 @@ _MUTATION_AUTHORITY_ISSUER = object()
 
 
 class _HandoffMutationAuthority:
-    """Process-local capability valid only for its lane lease and database."""
+    """Exact-lease ticket bound to one thread, database, and durable job."""
 
-    __slots__ = ("_job_id", "_lease_witness", "_sqlite_path")
+    __slots__ = (
+        "_job_id",
+        "_lease_witness",
+        "_sqlite_path",
+        "_ticket",
+    )
 
     def __init__(
         self, issuer: object, lease_witness: Any, sqlite_path: Any, job_id: str
@@ -210,49 +217,26 @@ class _HandoffMutationAuthority:
             raise HandoffMutationUnauthorized(
                 "handoff mutation authority must be issued by the durable lane"
             )
-        self._lease_witness = lease_witness
+        self._lease_witness = None
+        self._ticket = lease_witness
         self._sqlite_path = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
         self._job_id = str(job_id)
 
     def valid_for(self, sqlite_path: Any, job_id: Optional[str] = None) -> bool:
         try:
+            requested_job = self._job_id if job_id is None else str(job_id)
+            from agent.durable_jobs.lane import _validate_handoff_mutation_ticket
+
             return (
-                bool(self._lease_witness())
-                and self._sqlite_path
+                self._sqlite_path
                 == os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
-                and (job_id is None or self._job_id == str(job_id))
+                and self._job_id == requested_job
+                and _validate_handoff_mutation_ticket(
+                    self._ticket, sqlite_path, requested_job
+                )
             )
         except (AttributeError, TypeError):
             return False
-
-
-def _issue_handoff_mutation_authority(
-    lease_witness: Any, sqlite_path: Any, job_id: str
-) -> _HandoffMutationAuthority:
-    from agent.durable_jobs.lane import DurableLaneService
-
-    if (
-        not DurableLaneService._is_authentic_instance(
-            getattr(lease_witness, "__self__", None)
-        )
-        or getattr(lease_witness, "__func__", None)
-        is not DurableLaneService._has_active_mutation_lease
-        or not lease_witness()
-    ):
-        raise HandoffMutationUnauthorized(
-            "handoff mutation authority requires an active durable-lane lease"
-        )
-    lane = lease_witness.__self__
-    store = lane._acquire_authorized_mutation(job_id)
-    if os.path.normcase(
-        os.path.abspath(os.fspath(store.sqlite_path))
-    ) != os.path.normcase(os.path.abspath(os.fspath(sqlite_path))):
-        raise HandoffMutationUnauthorized(
-            "handoff mutation authority database does not match the authorized job store"
-        )
-    return _HandoffMutationAuthority(
-        _MUTATION_AUTHORITY_ISSUER, lease_witness, sqlite_path, job_id
-    )
 
 
 class _EffectOwnerGuard:
@@ -460,7 +444,7 @@ class SessionHandoffLedger:
         mutation_authority: _HandoffMutationAuthority | None = None,
     ) -> None:
         if mutation_authority is not None and (
-            not isinstance(mutation_authority, _HandoffMutationAuthority)
+            type(mutation_authority) is not _HandoffMutationAuthority
             or not mutation_authority.valid_for(sqlite_path)
         ):
             raise HandoffMutationUnauthorized("invalid handoff mutation authority")
@@ -539,9 +523,9 @@ class SessionHandoffLedger:
 
     def _require_mutation_authority(self, job_id: str) -> None:
         authority = self._mutation_authority
-        if not isinstance(
-            authority, _HandoffMutationAuthority
-        ) or not authority.valid_for(self.sqlite_path, job_id):
+        if type(authority) is not _HandoffMutationAuthority or not authority.valid_for(
+            self.sqlite_path, job_id
+        ):
             raise HandoffMutationUnauthorized(
                 "handoff ledger mutations require an active lane-issued authority"
             )

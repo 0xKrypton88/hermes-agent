@@ -10,15 +10,17 @@ authorized lane method's local scope, so it cannot be imported and called
 around activation, identity, or mutation-lease checks. A normally constructed
 ledger is read-only: every durable mutation helper also requires an opaque,
 identity-checked mutation authority bound to the exact SQLite database, the
-authorized durable job, and a live `DurableLaneService` mutation-lease witness.
-Issuance re-runs the lane's enabled/identity/owner authorization for that job;
-the authority is issued only for the lane-local coordinator or authorized
-reconciliation path while that lease is held, and every mutation revalidates
-the witness, job, and database. Replacing the stored value, constructing the
-slotted class via `object.__new__`, calling the issuer without the lane gates,
-reusing it after lease release, or using it for another job/database fails
-closed before SQL. Plain-ledger construction never initializes or migrates
-schema. Renaming helpers private is not treated as authorization. This prevents
+authorized durable job, and an exact live ticket in closure-owned lane state.
+Only the two legitimate lane entrypoints can reach ticket issuance; the builder
+and decorator bindings are deleted after class construction, while the
+importable validator is read-only. Issuance re-runs enabled/identity/owner
+authorization and nests the exact ticket inside a live mutation lease. Every
+mutation revalidates ticket, thread, job, and database. Replacing the stored
+value, constructing or subclassing the slotted authority, importing a direct
+issuer, reusing a ticket after lease release, or crossing job/database/thread
+boundaries fails closed before SQL. Plain-ledger construction never initializes
+or migrates schema. Renaming helpers private is not treated as authorization.
+This prevents
 a caller that merely constructs a ledger from forging completed effects without
 invoking adapters. Shadow mode refuses the coordinator call rather than invoking
 injected ports.

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import weakref
@@ -75,6 +76,75 @@ from agent.durable_jobs.store import DurableJobStore
 
 logger = logging.getLogger(__name__)
 _AUTHENTIC_LANE_INSTANCES: weakref.WeakSet[DurableLaneService] = weakref.WeakSet()
+
+
+def _build_handoff_operation_gate():
+    """Lexically seal handoff mutation tickets inside real lane operations."""
+    active: dict[object, tuple[weakref.ReferenceType[Any], int, str, str]] = {}
+    registry_lock = threading.Lock()
+
+    def validate(ticket: object, sqlite_path: Any, job_id: str) -> bool:
+        normalized = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
+        with registry_lock:
+            record = active.get(ticket)
+        if record is None:
+            return False
+        lane_ref, owner_thread, expected_path, expected_job = record
+        return (
+            lane_ref() is not None
+            and owner_thread == threading.get_ident()
+            and expected_path == normalized
+            and expected_job == str(job_id)
+        )
+
+    def operation_gate(operation: Any) -> Any:
+        def guarded_operation(lane: Any, *args: Any, **kwargs: Any) -> Any:
+            @contextmanager
+            def issue(sqlite_path: Any, job_id: str) -> Iterator[Any]:
+                from agent.durable_jobs.session_handoff import (
+                    HandoffMutationUnauthorized,
+                    _HandoffMutationAuthority,
+                    _MUTATION_AUTHORITY_ISSUER,
+                )
+
+                store = lane._acquire_authorized_mutation(job_id)
+                normalized = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
+                authorized_path = os.path.normcase(
+                    os.path.abspath(os.fspath(store.sqlite_path))
+                )
+                if normalized != authorized_path:
+                    raise HandoffMutationUnauthorized(
+                        "handoff mutation authority database does not match the authorized job store"
+                    )
+                with lane._mutation_lease():
+                    ticket = object()
+                    with registry_lock:
+                        active[ticket] = (
+                            weakref.ref(lane),
+                            threading.get_ident(),
+                            normalized,
+                            str(job_id),
+                        )
+                    try:
+                        yield _HandoffMutationAuthority(
+                            _MUTATION_AUTHORITY_ISSUER, ticket, sqlite_path, job_id
+                        )
+                    finally:
+                        with registry_lock:
+                            active.pop(ticket, None)
+
+            kwargs["_issue_handoff_mutation_authority"] = issue
+            return operation(lane, *args, **kwargs)
+
+        guarded_operation.__name__ = operation.__name__
+        guarded_operation.__doc__ = operation.__doc__
+        guarded_operation.__module__ = operation.__module__
+        return guarded_operation
+
+    return operation_gate, validate
+
+
+_handoff_operation, _validate_handoff_mutation_ticket = _build_handoff_operation_gate()
 
 
 class LaneClosedError(RuntimeError):
@@ -353,6 +423,7 @@ class DurableLaneService:
         self._before_mutation_lease()
         return store
 
+    @_handoff_operation
     def resume_session_handoff(
         self,
         *,
@@ -366,6 +437,7 @@ class DurableLaneService:
         sessions: Any,
         handoff_config: Any,
         manual_resume: bool = False,
+        _issue_handoff_mutation_authority: Any,
     ) -> Any:
         """Run inactive ENG-122 handoff work under this lane's write lease."""
         from agent.durable_jobs.session_handoff import (
@@ -383,7 +455,6 @@ class DurableLaneService:
             SessionHandoffLedger,
             UnsafeHandoffWaypoint,
             _EffectOwnerGuard,
-            _issue_handoff_mutation_authority,
             _MANUAL_RESUME,
             _STAGE_INDEX,
         )
@@ -610,10 +681,9 @@ class DurableLaneService:
             raise HandoffIdentityMismatch(
                 "handoff requires a matching non-empty durable job baseline SHA"
             )
-        with self._mutation_lease():
-            mutation_authority = _issue_handoff_mutation_authority(
-                self._has_active_mutation_lease, store.sqlite_path, job_id
-            )
+        with _issue_handoff_mutation_authority(
+            store.sqlite_path, job_id
+        ) as mutation_authority:
             return _SessionHandoffCoordinator(
                 ledger=SessionHandoffLedger(
                     store.sqlite_path, mutation_authority=mutation_authority
@@ -630,6 +700,7 @@ class DurableLaneService:
                 manual_resume=manual_resume,
             )
 
+    @_handoff_operation
     def reconcile_session_handoff_effect(
         self,
         *,
@@ -642,28 +713,28 @@ class DurableLaneService:
         expected_generation: int,
         dead_owner_verified: bool,
         handoff_config: Any,
+        _issue_handoff_mutation_authority: Any,
     ) -> Any:
         """Resolve a verified ambiguous handoff effect under the lane write lease."""
         from agent.durable_jobs.session_handoff import (
             HandoffIdentityMismatch,
             SessionHandoffLedger,
-            _issue_handoff_mutation_authority,
         )
 
         if handoff_config.enabled is not True or handoff_config.shadow is not False:
             raise PilotDisabledError(
                 "session handoff reconciliation requires enabled=True and shadow=False"
             )
-        with self._mutation_lease():
-            store = self._acquire_authorized_mutation(job_id)
+        store = self._acquire_authorized_mutation(job_id)
+        with _issue_handoff_mutation_authority(
+            store.sqlite_path, job_id
+        ) as mutation_authority:
             job = store.get_job(job_id)
             if job is None:
                 raise KeyError(job_id)
             ledger = SessionHandoffLedger(
                 store.sqlite_path,
-                mutation_authority=_issue_handoff_mutation_authority(
-                    self._has_active_mutation_lease, store.sqlite_path, job_id
-                ),
+                mutation_authority=mutation_authority,
             )
             state = ledger.get(job_id, handoff_id)
             if state is None:
@@ -910,3 +981,8 @@ class DurableLaneService:
             return InboundActionResult(ok=False, ack_status="pending", retryable=True)
         except sqlite3.OperationalError:
             return InboundActionResult(ok=False, ack_status="pending", retryable=True)
+
+
+# Ticket issuance remains reachable only through the two decorated operations.
+del _handoff_operation
+del _build_handoff_operation_gate

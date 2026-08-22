@@ -162,13 +162,17 @@ def _enabled_handoff_config():
     return replace(SessionHandoffConfig.default(), enabled=True, shadow=False)
 
 
-_TEST_MUTATION_LEASES = []
-
-
 def _authorized_ledger(ledger_type, sqlite_path):
+    """White-box ledger for storage tests; production issuance stays sealed."""
+    import pytest
+
     from agent.durable_jobs.config import DurableJobsConfig, DurableJobsIdentityBinding
     from agent.durable_jobs.lane import DurableLaneService
-    from agent.durable_jobs.session_handoff import _issue_handoff_mutation_authority
+    from agent.durable_jobs.session_handoff import (
+        HandoffPressure,
+        SemanticWaypoint,
+        UnsafeHandoffWaypoint,
+    )
     from agent.durable_jobs.store import DurableJobStore
 
     store = DurableJobStore(sqlite_path)
@@ -203,16 +207,24 @@ def _authorized_ledger(ledger_type, sqlite_path):
         candidate_id="eng-122",
         candidate_version="d13dee",
     )
-    lease = lane._mutation_lease()
-    lease.__enter__()
-    ledger = ledger_type(
-        sqlite_path,
-        mutation_authority=_issue_handoff_mutation_authority(
-            lane._has_active_mutation_lease, sqlite_path, job.job_id
-        ),
-    )
-    _TEST_MUTATION_LEASES.append((lane, lease))
-    return ledger
+    with pytest.raises(UnsafeHandoffWaypoint):
+        lane.resume_session_handoff(
+            job_id=job.job_id,
+            parent_session_id="parent-setup",
+            handoff=_handoff(),
+            waypoint=SemanticWaypoint(verified=False),
+            pressure=HandoffPressure(armed=True, hard=False, ratio=0.5),
+            linear=object(),
+            slack=object(),
+            sessions=object(),
+            handoff_config=_enabled_handoff_config(),
+        )
+
+    class _StorageTestLedger(ledger_type):
+        def _require_mutation_authority(self, job_id):
+            return None
+
+    return _StorageTestLedger(sqlite_path)
 
 
 def _complete_ledger_effect(ledger, job_id, handoff_id, effect_name, receipt=None):
@@ -1057,30 +1069,49 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
     )
     effect_marker = tmp_path / "external-child-effect.txt"
 
-    crash_script = (
-        "import os; from pathlib import Path; "
-        "from agent.durable_jobs.config import "
-        "DurableJobsConfig, DurableJobsIdentityBinding; "
-        "from agent.durable_jobs.lane import DurableLaneService; "
-        "from agent.durable_jobs.store import DurableJobStore; "
-        "from agent.durable_jobs.session_handoff import "
-        "SessionHandoffLedger, _issue_handoff_mutation_authority; "
-        f"path=Path({str(ledger_path)!r}); "
-        "lane=DurableLaneService(DurableJobsConfig(enabled=True, "
-        "dispatch_enabled=False, backend='sqlite', sqlite_path=path, "
-        "checkpoint_sqlite_path=path.with_suffix('.checkpoints.sqlite'), "
-        "identity_binding=DurableJobsIdentityBinding(workspace_id='T1', "
-        "repository_identity='github.com/nous/hermes')), "
-        "store=DurableJobStore(path)); "
-        "lease=lane._mutation_lease(); lease.__enter__(); "
-        f"ledger=SessionHandoffLedger({str(ledger_path)!r}, "
-        "mutation_authority=_issue_handoff_mutation_authority("
-        f"lane._has_active_mutation_lease, {str(ledger_path)!r}, {job.job_id!r})); "
-        f"claim=ledger._claim_effect({job.job_id!r}, {handoff.handoff_id!r}, "
-        "'CHILD_CREATE', owner_token='crashed-process-owner'); "
-        f"assert claim.acquired; Path({str(effect_marker)!r}).write_text("
-        "'child-external-1', encoding='utf-8'); os._exit(91)"
-    )
+    crash_script = f"""
+import os
+from dataclasses import replace
+from pathlib import Path
+from agent.durable_jobs.config import DurableJobsConfig, DurableJobsIdentityBinding
+from agent.durable_jobs.lane import DurableLaneService
+from agent.durable_jobs.session_handoff import HandoffPressure, SemanticWaypoint, SessionHandoff, SessionHandoffConfig
+from agent.durable_jobs.store import DurableJobStore
+
+path = Path({str(ledger_path)!r})
+store = DurableJobStore(path)
+lane = DurableLaneService(
+    DurableJobsConfig(
+        enabled=True,
+        dispatch_enabled=False,
+        backend="sqlite",
+        sqlite_path=path,
+        checkpoint_sqlite_path=path.with_suffix(".checkpoints.sqlite"),
+        identity_binding=DurableJobsIdentityBinding(
+            workspace_id="T1",
+            repository_identity="github.com/nous/hermes",
+        ),
+    ),
+    store=store,
+)
+
+class CrashingSessions:
+    def find_or_create_child(self, **kwargs):
+        Path({str(effect_marker)!r}).write_text("child-external-1", encoding="utf-8")
+        os._exit(91)
+
+lane.resume_session_handoff(
+    job_id={job.job_id!r},
+    parent_session_id="parent-1",
+    handoff=SessionHandoff(**{handoff.__dict__!r}),
+    waypoint=SemanticWaypoint(verified=True),
+    pressure=HandoffPressure(armed=True, hard=False, ratio=0.5),
+    linear=object(),
+    slack=object(),
+    sessions=CrashingSessions(),
+    handoff_config=replace(SessionHandoffConfig.default(), enabled=True, shadow=False),
+)
+"""
     crashed = subprocess.run([sys.executable, "-c", crash_script], check=False)
     assert crashed.returncode == 91
     assert effect_marker.read_text(encoding="utf-8") == "child-external-1"
@@ -1109,7 +1140,7 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
         effect_name="CHILD_CREATE",
         outcome="APPLIED",
         receipt="child-external-1",
-        expected_owner_token="crashed-process-owner",
+        expected_owner_token=claim.owner_token,
         expected_generation=claim.generation,
         dead_owner_verified=True,
         handoff_config=_enabled_handoff_config(),
@@ -1437,7 +1468,6 @@ def test_plain_ledger_cannot_forge_completion_through_private_mutators(tmp_path)
         HandoffMutationUnauthorized,
         SessionHandoffLedger,
         _HandoffMutationAuthority,
-        _issue_handoff_mutation_authority,
     )
 
     with pytest.raises(
@@ -1445,11 +1475,6 @@ def test_plain_ledger_cannot_forge_completion_through_private_mutators(tmp_path)
     ):
         SessionHandoffLedger(
             tmp_path / "forged-authority.sqlite", mutation_authority=object()
-        )
-
-    with pytest.raises(HandoffMutationUnauthorized, match="active durable-lane lease"):
-        _issue_handoff_mutation_authority(
-            lambda: True, tmp_path / "jobs.sqlite", "job-1"
         )
 
     with pytest.raises(
@@ -1474,37 +1499,49 @@ def test_plain_ledger_cannot_forge_completion_through_private_mutators(tmp_path)
         ledger._stage("job-1", "parent-1", _handoff())
 
 
-def test_mutation_authority_is_database_bound_and_expires_with_lane_lease(tmp_path):
+def test_mutation_authority_issuance_is_lexically_sealed(tmp_path):
+    import agent.durable_jobs.lane as lane_module
+    import agent.durable_jobs.session_handoff as handoff_module
+
+    assert not hasattr(handoff_module, "_handoff_mutation_authority")
+    assert not hasattr(handoff_module, "_issue_handoff_mutation_authority")
+    assert not hasattr(lane_module, "_handoff_operation")
+    assert not hasattr(lane_module, "_build_handoff_operation_gate")
+    assert not lane_module._validate_handoff_mutation_ticket(
+        object(), tmp_path / "jobs.sqlite", "job-1"
+    )
+
+
+def test_mutation_authority_rejects_constructed_and_subclassed_capabilities(tmp_path):
     import pytest
 
     from agent.durable_jobs.session_handoff import (
         HandoffMutationUnauthorized,
         SessionHandoffLedger,
-        _issue_handoff_mutation_authority,
+        _HandoffMutationAuthority,
+        _MUTATION_AUTHORITY_ISSUER,
     )
 
-    lane, job = _lane(tmp_path)
     ledger_path = tmp_path / "jobs.sqlite"
+    _authorized_ledger(SessionHandoffLedger, ledger_path)
 
-    with lane._mutation_lease():
-        authority = _issue_handoff_mutation_authority(
-            lane._has_active_mutation_lease, ledger_path, job.job_id
-        )
-        ledger = SessionHandoffLedger(ledger_path, mutation_authority=authority)
-        with pytest.raises(
-            HandoffMutationUnauthorized, match="invalid handoff mutation authority"
-        ):
-            SessionHandoffLedger(
-                tmp_path / "other.sqlite", mutation_authority=authority
-            )
-        with pytest.raises(
-            HandoffMutationUnauthorized, match="active lane-issued authority"
-        ):
-            ledger._stage("different-job", "parent-1", _handoff())
-        ledger._stage(job.job_id, "parent-1", _handoff())
+    forged = _HandoffMutationAuthority(
+        _MUTATION_AUTHORITY_ISSUER, object(), ledger_path, "job-1"
+    )
+    with pytest.raises(
+        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
+    ):
+        SessionHandoffLedger(ledger_path, mutation_authority=forged)
 
-    with pytest.raises(HandoffMutationUnauthorized):
-        ledger._stage(job.job_id, "parent-1", _handoff())
+    class ForgedAuthority(_HandoffMutationAuthority):
+        def valid_for(self, sqlite_path, job_id=None):
+            return True
+
+    manufactured = object.__new__(ForgedAuthority)
+    with pytest.raises(
+        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
+    ):
+        SessionHandoffLedger(ledger_path, mutation_authority=manufactured)
 
 
 def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
