@@ -1284,6 +1284,40 @@ def test_provider_supplied_frozen_snapshot_is_resanitized():
     assert result["nested"] == "[REDACTED]"
 
 
+def test_hostile_response_json_descriptor_is_not_executed():
+    ports = _load_ports()
+    secret = "resolved-credential-response-json-descriptor"
+    descriptor_effects = []
+
+    class HostileJsonResponse:
+        @property
+        def json(self):
+            descriptor_effects.append("json")
+            raise RuntimeError(secret)
+
+    class HostileResponseCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            self.calls.append(("create_agent", payload))
+            return HostileJsonResponse()
+
+    client = HostileResponseCursor()
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda _name: secret,
+    )
+    result = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("hostile-response-json"),
+    )
+
+    assert result["type"] == "HostileJsonResponse"
+    assert descriptor_effects == []
+    assert secret not in repr((result, port.receipts))
+    assert [call[0] for call in client.calls] == ["create_agent"]
+
+
 def test_slack_repeated_post_claim_invokes_provider_once():
     ports = _load_ports()
     client = FakeSlackClient()

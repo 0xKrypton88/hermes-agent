@@ -143,9 +143,17 @@ def _check_deadline(
 
 
 def _unwrap_response(result: Any) -> Any:
-    json_fn = getattr(result, "json", None)
-    if not callable(json_fn) or isinstance(result, (dict, list, tuple, str, bytes)):
+    if isinstance(result, (dict, list, tuple, str, bytes)):
         return result
+    try:
+        json_seam = inspect.getattr_static(type(result), "json")
+    except (AttributeError, TypeError):
+        return result
+    # Provider-controlled properties, descriptors, dynamic instance attributes,
+    # and callable objects must not execute during response inspection.
+    if not inspect.isfunction(json_seam):
+        return result
+    json_fn = json_seam.__get__(result, type(result))
     try:
         unwrapped = json_fn()
     except Exception:
