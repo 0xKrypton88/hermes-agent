@@ -44,6 +44,7 @@ import json
 import logging
 import sqlite3
 import threading
+import weakref
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Sequence
 
@@ -73,6 +74,7 @@ from agent.durable_jobs.slack_contract import (
 from agent.durable_jobs.store import DurableJobStore
 
 logger = logging.getLogger(__name__)
+_AUTHENTIC_LANE_INSTANCES: weakref.WeakSet[DurableLaneService] = weakref.WeakSet()
 
 
 class LaneClosedError(RuntimeError):
@@ -100,6 +102,11 @@ class DurableLaneService:
         self._close_claimed_leases = 0
         self._lifecycle = threading.Lock()
         self._close_idle = threading.Condition(self._lifecycle)
+        _AUTHENTIC_LANE_INSTANCES.add(self)
+
+    @staticmethod
+    def _is_authentic_instance(candidate: object) -> bool:
+        return candidate in _AUTHENTIC_LANE_INSTANCES
 
     def close(self) -> None:
         """Idempotent shutdown. Waits for leases not already inside close().
@@ -156,6 +163,10 @@ class DurableLaneService:
         from this module. Must not run while ``_lifecycle`` is held.
         """
         return None
+
+    def _has_active_mutation_lease(self) -> bool:
+        with self._lifecycle:
+            return self._active_leases > 0
 
     def _acquire_mutation_lease(self) -> None:
         with self._lifecycle:
@@ -600,7 +611,9 @@ class DurableLaneService:
                 "handoff requires a matching non-empty durable job baseline SHA"
             )
         with self._mutation_lease():
-            mutation_authority = _issue_handoff_mutation_authority()
+            mutation_authority = _issue_handoff_mutation_authority(
+                self._has_active_mutation_lease, store.sqlite_path, job_id
+            )
             return _SessionHandoffCoordinator(
                 ledger=SessionHandoffLedger(
                     store.sqlite_path, mutation_authority=mutation_authority
@@ -648,7 +661,9 @@ class DurableLaneService:
                 raise KeyError(job_id)
             ledger = SessionHandoffLedger(
                 store.sqlite_path,
-                mutation_authority=_issue_handoff_mutation_authority(),
+                mutation_authority=_issue_handoff_mutation_authority(
+                    self._has_active_mutation_lease, store.sqlite_path, job_id
+                ),
             )
             state = ledger.get(job_id, handoff_id)
             if state is None:

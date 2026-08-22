@@ -9,12 +9,19 @@ coordinator is constructed. The effectful coordinator exists only in the
 authorized lane method's local scope, so it cannot be imported and called
 around activation, identity, or mutation-lease checks. A normally constructed
 ledger is read-only: every durable mutation helper also requires an opaque,
-identity-checked mutation authority issued only for the lane-local coordinator
-or the lane's authorized reconciliation path while the lane mutation lease is
-held. Renaming helpers private is not treated as authorization. This prevents a
-caller that merely constructs a ledger from forging completed effects without
-invoking adapters. Shadow mode refuses the coordinator call rather than
-invoking injected ports.
+identity-checked mutation authority bound to the exact SQLite database, the
+authorized durable job, and a live `DurableLaneService` mutation-lease witness.
+Issuance re-runs the lane's enabled/identity/owner authorization for that job;
+the authority is issued only for the lane-local coordinator or authorized
+reconciliation path while that lease is held, and every mutation revalidates
+the witness, job, and database. Replacing the stored value, constructing the
+slotted class via `object.__new__`, calling the issuer without the lane gates,
+reusing it after lease release, or using it for another job/database fails
+closed before SQL. Plain-ledger construction never initializes or migrates
+schema. Renaming helpers private is not treated as authorization. This prevents
+a caller that merely constructs a ledger from forging completed effects without
+invoking adapters. Shadow mode refuses the coordinator call rather than invoking
+injected ports.
 
 ## Policy
 
