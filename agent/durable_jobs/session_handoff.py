@@ -494,6 +494,7 @@ class SessionHandoffLedger:
         effect_digest = hashlib.sha256(effect_identity).hexdigest()
         lock_root = Path(tempfile.gettempdir()) / "hermes-session-handoff-effect-locks"
         lock_paths = (
+            lock_root / "global" / f"{effect_digest}.lock",
             lock_root / "database" / database_digest / f"{effect_digest}.lock",
             lock_root / "pathname" / pathname_digest / f"{effect_digest}.lock",
         )

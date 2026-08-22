@@ -79,14 +79,17 @@ The lane acquires its mutation lease before job lookup or ledger construction, s
 constructor schema DDL and identity checks cannot race `close()`. This prevents
 reconciliation from invalidating a live owner and prevents stale owners from
 completing or fail-closing a reassigned generation, including when an owner token
-is reused. Each effect guard takes two ordered locks: one namespace is derived
-from the SQLite file's filesystem identity (device plus inode/file index), so
-symlink, relative-path, and hardlink aliases of the same live database contend;
-the second is derived from the normalized absolute pathname, so replacing that
-path with a different file cannot let a newly constructed ledger bypass a live
-owner. The ledger captures the file identity at construction, revalidates it
-after both owner locks are acquired and immediately around every SQLite open,
-and fails closed if pathname replacement changes the database identity.
+is reused. Each effect guard takes three ordered locks. A host-global effect
+namespace, derived only from `(job_id, handoff_id, effect_name)`, prevents a
+live owner from being bypassed even if one hardlink alias is replaced while
+another remains open. The other namespaces are derived from the SQLite file's
+filesystem identity (device plus inode/file index) and the normalized absolute
+pathname. The global namespace intentionally serializes matching effect
+identities across otherwise independent ledger files on the same host; safety
+takes precedence over that concurrency. The ledger captures the file identity
+at construction, revalidates it after all owner locks are acquired and
+immediately around every SQLite open, and fails closed if pathname replacement
+changes the database identity.
 Secret-shaped receipts are rejected before persistence. Legacy effect tables
 are upgraded transactionally with the generation and reconciliation-receipt
 columns before use.

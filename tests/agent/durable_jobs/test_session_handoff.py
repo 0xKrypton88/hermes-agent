@@ -1360,6 +1360,34 @@ def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
             alias_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT").acquire()
 
 
+def test_hardlink_alias_replacement_cannot_split_live_owner_namespace(tmp_path):
+    import gc
+    import os
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        EffectOwnershipLost,
+        SessionHandoffLedger,
+    )
+
+    database = tmp_path / "jobs.sqlite"
+    alias = tmp_path / "jobs-alias.sqlite"
+    replacement = tmp_path / "replacement.sqlite"
+    original_ledger = SessionHandoffLedger(database)
+    os.link(database, alias)
+    SessionHandoffLedger(replacement)
+    gc.collect()
+
+    with original_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
+        os.replace(replacement, alias)
+        replacement_ledger = SessionHandoffLedger(alias)
+        with pytest.raises(EffectOwnershipLost):
+            replacement_ledger.effect_owner_guard(
+                "job", "handoff", "LINEAR_UPSERT"
+            ).acquire()
+
+
 def test_database_replacement_cannot_split_live_owner_namespace(tmp_path):
     import gc
     import os
