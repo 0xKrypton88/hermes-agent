@@ -817,6 +817,9 @@ def _transport_resolves_at_request_boundary(
         return False
     if type(request) is not request_cls:
         return False
+    resolver = _instance_attr(request, "_credential_resolver")
+    if resolver is None or not callable(resolver):
+        return False
     for name, wanted in expected:
         transport_value = _instance_attr(transport, name)
         request_value = _instance_attr(request, name)

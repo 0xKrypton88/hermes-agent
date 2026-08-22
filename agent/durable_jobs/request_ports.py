@@ -4,7 +4,7 @@ These wrap an already-constructed client that matches the repository's
 existing seams. They never construct HTTP/SDK clients, never read secret
 *values* into logs, and never mint a client from config flags.
 
-Credential resolution, when provided, is a request-time dependency only.
+Credential resolution is a mandatory request-time dependency only.
 Attach/preflight must not invoke it.
 """
 
@@ -74,6 +74,12 @@ def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
         raise TypeError(
             "injected client is required; no HTTP/SDK client is constructed"
         )
+    try:
+        lookup = inspect.getattr_static(type(client), "__getattribute__")
+    except BaseException:
+        lookup = None
+    if lookup is not object.__getattribute__:
+        raise TypeError("injected client requires static client lookup")
     missing = []
     for name in methods:
         try:
@@ -192,7 +198,7 @@ def _resolve_secret(
     resolver: Optional[Callable[[str], Any]], secret_ref: str
 ) -> Any:
     if resolver is None:
-        return None
+        raise RequestPortError("credential resolver is required")
     try:
         value = resolver(secret_ref)
     except RequestPortError:
@@ -305,8 +311,14 @@ class _FrozenDict(ABCMapping[str, Any]):
 
 
 def _sanitize_snapshot_key(raw: Any, secret: Optional[str]) -> str:
-    """Redact one copied mapping key, stringifying non-strings once."""
-    text = raw if type(raw) is str else str(raw)
+    """Redact one copied mapping key without propagating hostile hooks."""
+    if type(raw) is str:
+        text = raw
+    else:
+        try:
+            text = str(raw)
+        except BaseException:
+            text = f"<{type(raw).__name__}>"
     if secret:
         text = text.replace(secret, "[REDACTED]")
     return _redact(text)
@@ -315,15 +327,30 @@ def _sanitize_snapshot_key(raw: Any, secret: Optional[str]) -> str:
 def _sanitize_snapshot(raw: Any, secret_value: Any = None) -> Any:
     """Recursively copy, redact the resolved value everywhere, and freeze."""
     secret = secret_value if type(secret_value) is str and secret_value else None
-    if isinstance(raw, Mapping):
+    if type(raw) is dict:
         return _FrozenDict(
             {
                 _sanitize_snapshot_key(key, secret): _sanitize_snapshot(value, secret)
-                for key, value in raw.items()
+                for key, value in dict.items(raw)
             }
         )
-    if isinstance(raw, (list, tuple, set, frozenset)):
+    if type(raw) in (list, tuple, set, frozenset):
         return tuple(_sanitize_snapshot(value, secret) for value in raw)
+    if type(raw) is _FrozenDict:
+        values = object.__getattribute__(raw, "_data")
+        if type(values) is not MappingProxyType:
+            return _FrozenDict({"type": type(raw).__name__})
+        return _FrozenDict(
+            {
+                _sanitize_snapshot_key(key, secret): _sanitize_snapshot(value, secret)
+                for key, value in values.items()
+            }
+        )
+    if isinstance(raw, Mapping):
+        # Arbitrary Mapping implementations can execute attacker-controlled
+        # iteration/items hooks. Preserve no data rather than risk surfacing a
+        # resolved credential from a sanitizer exception.
+        return _FrozenDict({"type": type(raw).__name__})
     if type(raw) is str:
         text = raw.replace(secret, "[REDACTED]") if secret else raw
         return _redact(text)

@@ -56,6 +56,7 @@ def _ports_and_clients(ports):
         secret_ref=_SECRET_CURSOR,
         workspace_id=WORKSPACE,
         repository_identity=REPO,
+        credential_resolver=lambda _secret_ref: CURSOR_SECRET_VALUE,
     )
     slack_port = ports.SlackInjectedRequestPort(
         client=slack_client,
@@ -64,6 +65,7 @@ def _ports_and_clients(ports):
         channel_id=CHANNEL,
         repository_identity=REPO,
         root_thread_ts=THREAD,
+        credential_resolver=lambda _secret_ref: SLACK_SECRET_VALUE,
     )
     return cursor_client, slack_client, cursor_port, slack_port
 

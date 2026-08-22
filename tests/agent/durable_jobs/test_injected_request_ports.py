@@ -201,6 +201,7 @@ def _load_ports():
         RequestPortMismatch,
         RequestPortTimeout,
         SlackInjectedRequestPort,
+        _FrozenDict,
     )
 
     return SimpleNamespace(
@@ -210,10 +211,14 @@ def _load_ports():
         RequestPortError=RequestPortError,
         RequestPortMismatch=RequestPortMismatch,
         RequestPortTimeout=RequestPortTimeout,
+        FrozenDict=_FrozenDict,
     )
 
 
 def _cursor_port(ports, client, **kwargs):
+    kwargs.setdefault(
+        "credential_resolver", lambda _secret_ref: "offline-cursor-credential"
+    )
     return ports.CursorCloudInjectedRequestPort(
         client=client,
         secret_ref=_SECRET_CURSOR,
@@ -224,6 +229,9 @@ def _cursor_port(ports, client, **kwargs):
 
 
 def _slack_port(ports, client, **kwargs):
+    kwargs.setdefault(
+        "credential_resolver", lambda _secret_ref: "offline-slack-credential"
+    )
     return ports.SlackInjectedRequestPort(
         client=client,
         secret_ref=_SECRET_SLACK,
@@ -361,6 +369,111 @@ def test_client_seam_validation_is_static_and_rejects_descriptors_without_effect
         _cursor_port(ports, HostileCursor())
 
     assert effects == []
+
+
+def test_hostile_getattribute_cannot_mint_concrete_client_capability():
+    ports = _load_ports()
+    effects = []
+
+    class HostileCursor:
+        def __getattribute__(self, name):
+            if name in {"create_agent", "get_agent", "get_run"}:
+                effects.append(("dynamic_lookup", name))
+                return lambda *_args, **_kwargs: effects.append(("provider", name))
+            return object.__getattribute__(self, name)
+
+        def create_agent(self, _payload):
+            effects.append("concrete_provider")
+
+        def get_agent(self, _agent_id):
+            effects.append("concrete_provider")
+
+        def get_run(self, _agent_id, _run_id):
+            effects.append("concrete_provider")
+
+    with pytest.raises(TypeError, match="static client lookup"):
+        _cursor_port(
+            ports,
+            HostileCursor(),
+            credential_resolver=lambda _name: effects.append("resolver") or "secret",
+        )
+
+    assert effects == []
+
+
+def test_missing_resolver_denies_preflight_and_direct_request_but_positive_resolves_once(
+    tmp_path,
+):
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    ports = _load_ports()
+    cursor_client = FakeCursorCloudClient()
+    slack_client = FakeSlackClient()
+    cursor_request = _cursor_port(ports, cursor_client, credential_resolver=None)
+    slack_request = _slack_port(ports, slack_client, credential_resolver=None)
+    cursor_transport = CursorCloudInjectedTransport(
+        request=cursor_request, secret_ref=_SECRET_CURSOR
+    )
+    slack_transport = SlackInjectedTransport(
+        request=slack_request, secret_ref=_SECRET_SLACK
+    )
+
+    report = preflight_durable_jobs(
+        _complete(tmp_path, dispatch_enabled=True),
+        cursor_transport=cursor_transport,
+        slack_transport=slack_transport,
+    )
+    assert report.runtime_ready is False
+    assert report.dispatch_allowed is False
+    assert "secret_refs_missing" in report.reasons
+
+    with pytest.raises(ports.RequestPortError, match="credential resolver is required"):
+        cursor_request(
+            operation="create",
+            secret_ref=_SECRET_CURSOR,
+            payload=_cursor_create_payload(),
+        )
+    with pytest.raises(ports.RequestPortError, match="credential resolver is required"):
+        slack_request(
+            operation="post_root",
+            secret_ref=_SECRET_SLACK,
+            payload=_slack_payload(),
+        )
+    assert cursor_client.calls == []
+    assert slack_client.calls == []
+
+    resolver_calls = []
+
+    def resolver(secret_ref):
+        resolver_calls.append(secret_ref)
+        return "request-bound-test-credential"
+
+    positive_cursor_request = _cursor_port(
+        ports, FakeCursorCloudClient(), credential_resolver=resolver
+    )
+    positive_slack_request = _slack_port(
+        ports, FakeSlackClient(), credential_resolver=resolver
+    )
+    positive_cursor_transport = CursorCloudInjectedTransport(
+        request=positive_cursor_request, secret_ref=_SECRET_CURSOR
+    )
+    positive_slack_transport = SlackInjectedTransport(
+        request=positive_slack_request, secret_ref=_SECRET_SLACK
+    )
+    positive_report = preflight_durable_jobs(
+        _complete(tmp_path, dispatch_enabled=True),
+        cursor_transport=positive_cursor_transport,
+        slack_transport=positive_slack_transport,
+    )
+    assert positive_report.runtime_ready is True
+    assert positive_report.dispatch_allowed is True
+    assert resolver_calls == []
+    positive_cursor_request(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("resolver-once"),
+    )
+    assert resolver_calls == [_SECRET_CURSOR]
 
 
 def test_cursor_create_lookup_status_success():
@@ -936,6 +1049,9 @@ def test_explicit_injected_client_can_be_wrapped_by_production_binding(
         _durable_job_slack_client=slack_client,
         _durable_job_slack_channel_id=CHANNEL,
         _durable_job_slack_root_thread_ts=THREAD,
+        _durable_job_credential_resolver=lambda name: (
+            CURSOR_SECRET_VALUE if name == _SECRET_CURSOR else SLACK_SECRET_VALUE
+        ),
     )
     kwargs = production_attach_kwargs(owner=owner, raw_config=_complete(tmp_path))
     bound = bind_production_transports(owner=owner, raw_config=_complete(tmp_path))
@@ -1097,6 +1213,75 @@ def test_cursor_idempotent_retry_after_credential_rotation_never_leaks_either_va
     assert first == second
     assert [item[0] for item in client.calls] == ["create_agent"]
     assert len(port.receipts) == 2
+
+
+def test_hostile_mapping_sanitizer_failure_cannot_rethrow_resolved_credential():
+    ports = _load_ports()
+    secret = "resolved-credential-must-never-escape"
+    sanitizer_effects = []
+
+    class HostileMapping(Mapping):
+        def __getitem__(self, _key):
+            raise AssertionError(secret)
+
+        def __iter__(self):
+            raise AssertionError(secret)
+
+        def __len__(self):
+            return 1
+
+        def items(self):
+            sanitizer_effects.append("items")
+            raise RuntimeError(f"sanitizer exploded with {secret}")
+
+    class HostileResponseCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            self.calls.append(("create_agent", payload))
+            return {"safe": "ok", "nested": HostileMapping()}
+
+    client = HostileResponseCursor()
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda _name: secret,
+    )
+
+    result = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("hostile-sanitizer"),
+    )
+
+    exposed = repr((result, port.receipts))
+    assert secret not in exposed
+    assert result["safe"] == "ok"
+    assert result["nested"]["type"] == "HostileMapping"
+    assert sanitizer_effects == []
+    assert [call[0] for call in client.calls] == ["create_agent"]
+
+
+def test_provider_supplied_frozen_snapshot_is_resanitized():
+    ports = _load_ports()
+    secret = "resolved-credential-inside-frozen-snapshot"
+
+    class FrozenResponseCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            self.calls.append(("create_agent", payload))
+            return ports.FrozenDict({"nested": secret})
+
+    port = _cursor_port(
+        ports,
+        FrozenResponseCursor(),
+        credential_resolver=lambda _name: secret,
+    )
+    result = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("frozen-snapshot-redaction"),
+    )
+
+    assert secret not in repr((result, port.receipts))
+    assert result["nested"] == "[REDACTED]"
 
 
 def test_slack_repeated_post_claim_invokes_provider_once():
