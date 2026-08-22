@@ -160,14 +160,14 @@ def _enabled_handoff_config():
 
 def _complete_ledger_effect(ledger, job_id, handoff_id, effect_name, receipt=None):
     owner = f"setup-{effect_name.lower()}"
-    claim = ledger.claim_effect(
+    claim = ledger._claim_effect(
         job_id,
         handoff_id,
         effect_name,
         owner_token=owner,
     )
     assert claim.acquired
-    return ledger.complete_effect(
+    return ledger._complete_effect(
         job_id,
         handoff_id,
         effect_name,
@@ -181,7 +181,7 @@ def _reconcile_ledger_effect(ledger, **kwargs):
     with ledger.effect_owner_guard(
         kwargs["job_id"], kwargs["handoff_id"], kwargs["effect_name"]
     ) as guard:
-        return ledger.reconcile_effect(owner_guard=guard, **kwargs)
+        return ledger._reconcile_effect(owner_guard=guard, **kwargs)
 
 
 def test_enabled_shadow_mode_refuses_all_external_effects(tmp_path):
@@ -468,11 +468,11 @@ def test_direct_advance_cannot_bypass_effect_claims(tmp_path):
 
     lane, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="linear-owner"
     )
-    ledger.complete_effect(
+    ledger._complete_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
@@ -482,7 +482,7 @@ def test_direct_advance_cannot_bypass_effect_claims(tmp_path):
     )
 
     with pytest.raises(ValueError):
-        ledger.advance(
+        ledger._advance(
             job.job_id, "ho_123", "CHILD_CREATED", child_session_id="child-1"
         )
     state = ledger.get(job.job_id, "ho_123")
@@ -500,11 +500,11 @@ def test_failed_closed_checkpoint_cannot_advance_without_manual_resume(tmp_path)
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="linear-owner"
     )
-    ledger.complete_effect(
+    ledger._complete_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
@@ -512,10 +512,10 @@ def test_failed_closed_checkpoint_cannot_advance_without_manual_resume(tmp_path)
         expected_generation=1,
         receipt="linear:ENG-122",
     )
-    failed = ledger.fail_closed(job.job_id, "ho_123", "ConnectionError")
+    failed = ledger._fail_closed(job.job_id, "ho_123", "ConnectionError")
 
     with pytest.raises(ValueError):
-        ledger.advance(job.job_id, "ho_123", "SLACK_RECEIPTED")
+        ledger._advance(job.job_id, "ho_123", "SLACK_RECEIPTED")
     stale = ledger.get(job.job_id, "ho_123")
 
     assert failed.stage == "FAILED_CLOSED"
@@ -747,15 +747,15 @@ def test_effect_claim_is_durable_and_exclusive(tmp_path):
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
+    ledger._stage(job.job_id, "parent-1", _handoff())
 
-    first = ledger.claim_effect(
+    first = ledger._claim_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="owner-a",
     )
-    second = ledger.claim_effect(
+    second = ledger._claim_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
@@ -779,13 +779,13 @@ def test_effect_claim_has_one_sqlite_winner_under_concurrency(tmp_path):
     _lane_service, job = _lane(tmp_path)
     ledger_path = tmp_path / "jobs.sqlite"
     ledger = SessionHandoffLedger(ledger_path)
-    ledger.stage(job.job_id, "parent-1", _handoff())
+    ledger._stage(job.job_id, "parent-1", _handoff())
     workers = 24
     barrier = threading.Barrier(workers)
 
     def compete(index):
         barrier.wait()
-        return SessionHandoffLedger(ledger_path).claim_effect(
+        return SessionHandoffLedger(ledger_path)._claim_effect(
             job.job_id,
             "ho_123",
             "LINEAR_UPSERT",
@@ -808,15 +808,15 @@ def test_effect_completion_atomically_advances_handoff(tmp_path):
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="owner-a",
     )
 
-    state = ledger.complete_effect(
+    state = ledger._complete_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
@@ -843,15 +843,15 @@ def test_effect_completion_cannot_skip_stages_or_persist_secret_receipts(tmp_pat
 
     _lane_service, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(
         job.job_id,
         "ho_123",
         "CHILD_CREATE",
         owner_token="child-owner",
     )
     with pytest.raises(EffectOwnershipLost):
-        ledger.complete_effect(
+        ledger._complete_effect(
             job.job_id,
             "ho_123",
             "CHILD_CREATE",
@@ -860,14 +860,14 @@ def test_effect_completion_cannot_skip_stages_or_persist_secret_receipts(tmp_pat
             receipt="child-1",
         )
 
-    ledger.claim_effect(
+    ledger._claim_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="linear-owner",
     )
     with pytest.raises(ValueError):
-        ledger.complete_effect(
+        ledger._complete_effect(
             job.job_id,
             "ho_123",
             "LINEAR_UPSERT",
@@ -893,7 +893,7 @@ def test_manual_applied_reconciliation_requires_persisted_verification_evidence(
 
     _lane_service, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
+    ledger._stage(job.job_id, "parent-1", _handoff())
     _complete_ledger_effect(
         ledger, job.job_id, "ho_123", "LINEAR_UPSERT", "linear:ENG-122"
     )
@@ -902,7 +902,7 @@ def test_manual_applied_reconciliation_requires_persisted_verification_evidence(
     )
     _complete_ledger_effect(ledger, job.job_id, "ho_123", "CHILD_CREATE", "child-1")
     _complete_ledger_effect(ledger, job.job_id, "ho_123", "HANDOFF_INJECT")
-    dead_claim = ledger.claim_effect(
+    dead_claim = ledger._claim_effect(
         job.job_id,
         "ho_123",
         "FIRST_TURN_START",
@@ -946,8 +946,8 @@ def test_orphaned_effect_claim_fences_replay_before_external_effects(tmp_path):
 
     lane, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(
         job.job_id,
         "ho_123",
         "LINEAR_UPSERT",
@@ -987,7 +987,7 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
     handoff = _handoff()
     ledger_path = tmp_path / "jobs.sqlite"
     ledger = SessionHandoffLedger(ledger_path)
-    ledger.stage(job.job_id, "parent-1", handoff)
+    ledger._stage(job.job_id, "parent-1", handoff)
     _complete_ledger_effect(
         ledger, job.job_id, handoff.handoff_id, "LINEAR_UPSERT", "linear:ENG-122"
     )
@@ -1000,7 +1000,7 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
         "import os; from pathlib import Path; "
         "from agent.durable_jobs.session_handoff import SessionHandoffLedger; "
         f"ledger=SessionHandoffLedger({str(ledger_path)!r}); "
-        f"claim=ledger.claim_effect({job.job_id!r}, {handoff.handoff_id!r}, "
+        f"claim=ledger._claim_effect({job.job_id!r}, {handoff.handoff_id!r}, "
         "'CHILD_CREATE', owner_token='crashed-process-owner'); "
         f"assert claim.acquired; Path({str(effect_marker)!r}).write_text("
         "'child-external-1', encoding='utf-8'); os._exit(91)"
@@ -1054,8 +1054,8 @@ def test_manual_resume_requires_an_actual_boolean(tmp_path):
 
     lane, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.fail_closed(job.job_id, "ho_123", "ConnectionError")
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._fail_closed(job.job_id, "ho_123", "ConnectionError")
     linear, slack, sessions = _Linear(), _Slack(), _Sessions()
 
     for invalid in ("false", "true", 1, object()):
@@ -1086,8 +1086,8 @@ def test_reconciliation_requires_exact_dead_owner_witness(tmp_path):
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    claim = ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    claim = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="live-owner"
     )
 
@@ -1117,7 +1117,7 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
+    ledger._stage(job.job_id, "parent-1", _handoff())
     _complete_ledger_effect(
         ledger, job.job_id, "ho_123", "LINEAR_UPSERT", "linear:ENG-122"
     )
@@ -1126,7 +1126,7 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
     )
     _complete_ledger_effect(ledger, job.job_id, "ho_123", "CHILD_CREATE", "child-1")
     _complete_ledger_effect(ledger, job.job_id, "ho_123", "HANDOFF_INJECT")
-    old = ledger.claim_effect(
+    old = ledger._claim_effect(
         job.job_id, "ho_123", "FIRST_TURN_START", owner_token="owner-a"
     )
     _reconcile_ledger_effect(
@@ -1139,11 +1139,11 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
         expected_generation=old.generation,
         dead_owner_verified=True,
     )
-    current = ledger.claim_effect(
+    current = ledger._claim_effect(
         job.job_id, "ho_123", "FIRST_TURN_START", owner_token="owner-b"
     )
 
-    stale_result = ledger.fail_closed(
+    stale_result = ledger._fail_closed(
         job.job_id,
         "ho_123",
         "ConnectionError",
@@ -1151,7 +1151,7 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
         expected_owner_token="owner-a",
         expected_generation=old.generation,
     )
-    completed = ledger.complete_effect(
+    completed = ledger._complete_effect(
         job.job_id,
         "ho_123",
         "FIRST_TURN_START",
@@ -1174,11 +1174,11 @@ def test_token_shaped_receipts_are_rejected_before_persistence(tmp_path):
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    ledger.claim_effect(job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="owner-a")
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    ledger._claim_effect(job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="owner-a")
     secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
     with pytest.raises(ValueError):
-        ledger.complete_effect(
+        ledger._complete_effect(
             job.job_id,
             "ho_123",
             "LINEAR_UPSERT",
@@ -1208,8 +1208,8 @@ def test_reconciliation_is_gated_and_revalidates_frozen_identity(tmp_path):
 
     lane, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    claim = ledger.claim_effect(
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    claim = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="dead-owner"
     )
     kwargs = dict(
@@ -1289,9 +1289,11 @@ def test_stale_generation_cannot_complete_reclaimed_effect_with_reused_owner(tmp
 
     _, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    assert "expected_generation" in inspect.signature(ledger.complete_effect).parameters
-    ledger.stage(job.job_id, "parent-1", _handoff())
-    old = ledger.claim_effect(
+    assert (
+        "expected_generation" in inspect.signature(ledger._complete_effect).parameters
+    )
+    ledger._stage(job.job_id, "parent-1", _handoff())
+    old = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="reused-worker"
     )
     _reconcile_ledger_effect(
@@ -1304,12 +1306,12 @@ def test_stale_generation_cannot_complete_reclaimed_effect_with_reused_owner(tmp
         expected_generation=old.generation,
         dead_owner_verified=True,
     )
-    current = ledger.claim_effect(
+    current = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="reused-worker"
     )
 
     with pytest.raises(EffectOwnershipLost):
-        ledger.complete_effect(
+        ledger._complete_effect(
             job.job_id,
             "ho_123",
             "LINEAR_UPSERT",
@@ -1335,6 +1337,23 @@ def test_effect_coordinator_is_not_importable_authorization_bypass():
         )
 
 
+def test_ledger_has_no_public_mutation_authorization_bypass(tmp_path):
+    from agent.durable_jobs.session_handoff import SessionHandoffLedger
+
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
+
+    for method_name in (
+        "stage",
+        "claim_effect",
+        "complete_effect",
+        "advance",
+        "fail_closed",
+        "resume_failed",
+        "reconcile_effect",
+    ):
+        assert not hasattr(ledger, method_name), method_name
+
+
 def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
     tmp_path,
 ):
@@ -1358,6 +1377,34 @@ def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
     with real_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
         with pytest.raises(EffectOwnershipLost):
             alias_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT").acquire()
+
+
+def test_global_owner_namespace_does_not_depend_on_replaceable_file_locks(
+    tmp_path, monkeypatch
+):
+    import agent.durable_jobs.session_handoff as session_handoff_module
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        EffectOwnershipLost,
+        SessionHandoffLedger,
+    )
+
+    if session_handoff_module.os.name == "nt":
+        import msvcrt
+
+        monkeypatch.setattr(msvcrt, "locking", lambda *_args: None)
+    else:
+        import fcntl
+
+        monkeypatch.setattr(fcntl, "flock", lambda *_args: None)
+
+    first = SessionHandoffLedger(tmp_path / "first.sqlite")
+    second = SessionHandoffLedger(tmp_path / "second.sqlite")
+
+    with first.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
+        with pytest.raises(EffectOwnershipLost, match="still live"):
+            second.effect_owner_guard("job", "handoff", "LINEAR_UPSERT").acquire()
 
 
 def test_hardlink_alias_replacement_cannot_split_live_owner_namespace(tmp_path):
@@ -1474,7 +1521,7 @@ def test_reconciliation_constructs_mutating_ledger_only_under_lane_lease(tmp_pat
 
     lane, job = _lane(tmp_path)
     ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
-    ledger.stage(job.job_id, "parent-1", _handoff())
+    ledger._stage(job.job_id, "parent-1", _handoff())
     with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
         conn.execute("DROP TABLE session_handoff_effects")
 

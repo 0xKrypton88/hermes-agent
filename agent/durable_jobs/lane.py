@@ -405,7 +405,7 @@ class DurableLaneService:
                     ) from exc
                 owner_token = uuid4().hex
                 try:
-                    claim = self.ledger.claim_effect(
+                    claim = self.ledger._claim_effect(
                         job_id,
                         handoff_id,
                         effect_name,
@@ -428,7 +428,7 @@ class DurableLaneService:
                 receipt: str | None = None,
             ) -> HandoffState:
                 try:
-                    return self.ledger.complete_effect(
+                    return self.ledger._complete_effect(
                         claim.job_id,
                         claim.handoff_id,
                         claim.effect_name,
@@ -472,13 +472,13 @@ class DurableLaneService:
                     raise HandoffIdentityMismatch(
                         "issue must be a secret-free Linear identifier"
                     )
-                state = self.ledger.stage(job_id, parent_session_id, handoff)
+                state = self.ledger._stage(job_id, parent_session_id, handoff)
                 if state.failure_reason and not manual_resume:
                     raise ManualResumeRequired(
                         state.manual_resume_action or _MANUAL_RESUME
                     )
                 if state.failure_reason:
-                    state = self.ledger.resume_failed(job_id, handoff.handoff_id)
+                    state = self.ledger._resume_failed(job_id, handoff.handoff_id)
                 canonical = self.ledger.canonical(job_id, handoff.handoff_id)
                 canonical_payload = json.loads(canonical)
                 safe_resume_pointer = str(canonical_payload["resume_pointer"])
@@ -557,7 +557,7 @@ class DurableLaneService:
                         state = self._complete_effect(active_claim, active_guard)
                         active_guard = None
                     if state.stage != "COMPLETE":
-                        state = self.ledger.advance(
+                        state = self.ledger._advance(
                             job_id, handoff.handoff_id, "COMPLETE"
                         )
                     return state
@@ -565,11 +565,11 @@ class DurableLaneService:
                     raise
                 except Exception as exc:
                     if active_claim is None:
-                        self.ledger.fail_closed(
+                        self.ledger._fail_closed(
                             job_id, handoff.handoff_id, type(exc).__name__
                         )
                     else:
-                        self.ledger.fail_closed(
+                        self.ledger._fail_closed(
                             job_id,
                             handoff.handoff_id,
                             type(exc).__name__,
@@ -656,7 +656,7 @@ class DurableLaneService:
                     "reconciliation requires current durable job repository and frozen SHA identity"
                 )
             with ledger.effect_owner_guard(job_id, handoff_id, effect_name) as guard:
-                return ledger.reconcile_effect(
+                return ledger._reconcile_effect(
                     job_id=job_id,
                     handoff_id=handoff_id,
                     effect_name=effect_name,

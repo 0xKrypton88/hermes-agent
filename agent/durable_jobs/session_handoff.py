@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -197,21 +198,24 @@ class _EffectOwnerGuard:
         self,
         lock_paths: tuple[Path, ...],
         *,
+        kernel_endpoint: tuple[str, int],
         job_id: str,
         handoff_id: str,
         effect_name: str,
         validate_database_identity: Any,
     ) -> None:
         self.lock_paths = tuple(sorted(set(lock_paths), key=os.fspath))
+        self.kernel_endpoint = kernel_endpoint
         self.job_id = job_id
         self.handoff_id = handoff_id
         self.effect_name = effect_name
         self._validate_database_identity = validate_database_identity
         self._handles: list[Any] = []
+        self._kernel_socket: socket.socket | None = None
 
     @property
     def held(self) -> bool:
-        return bool(self._handles)
+        return self._kernel_socket is not None
 
     @staticmethod
     def _lock(handle: Any) -> None:
@@ -242,9 +246,16 @@ class _EffectOwnerGuard:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def acquire(self) -> "_EffectOwnerGuard":
-        if self._handles:
+        if self.held:
             return self
+        kernel_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                kernel_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
+            kernel_socket.bind(self.kernel_endpoint)
+            self._kernel_socket = kernel_socket
             for lock_path in self.lock_paths:
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 handle = open(lock_path, "a+b")
@@ -255,6 +266,8 @@ class _EffectOwnerGuard:
                     raise
                 self._handles.append(handle)
         except OSError as exc:
+            if self._kernel_socket is None:
+                kernel_socket.close()
             self.release()
             raise EffectOwnershipLost("effect owner is still live") from exc
         try:
@@ -271,6 +284,9 @@ class _EffectOwnerGuard:
                 self._unlock(handle)
             finally:
                 handle.close()
+        kernel_socket, self._kernel_socket = self._kernel_socket, None
+        if kernel_socket is not None:
+            kernel_socket.close()
 
     def __enter__(self) -> "_EffectOwnerGuard":
         return self.acquire()
@@ -492,14 +508,24 @@ class SessionHandoffLedger:
         pathname_digest = hashlib.sha256(pathname_identity).hexdigest()
         effect_identity = "\0".join((job_id, handoff_id, effect_name)).encode("utf-8")
         effect_digest = hashlib.sha256(effect_identity).hexdigest()
+        endpoint_bytes = bytes.fromhex(effect_digest[:10])
+        kernel_endpoint = (
+            ".".join((
+                "127",
+                str(1 + endpoint_bytes[0] % 254),
+                str(1 + endpoint_bytes[1] % 254),
+                str(1 + endpoint_bytes[2] % 254),
+            )),
+            20000 + (int.from_bytes(endpoint_bytes[3:5], "big") % 20000),
+        )
         lock_root = Path(tempfile.gettempdir()) / "hermes-session-handoff-effect-locks"
         lock_paths = (
-            lock_root / "global" / f"{effect_digest}.lock",
             lock_root / "database" / database_digest / f"{effect_digest}.lock",
             lock_root / "pathname" / pathname_digest / f"{effect_digest}.lock",
         )
         return _EffectOwnerGuard(
             lock_paths,
+            kernel_endpoint=kernel_endpoint,
             job_id=job_id,
             handoff_id=handoff_id,
             effect_name=effect_name,
@@ -510,7 +536,7 @@ class SessionHandoffLedger:
     def _hash(canonical: str) -> str:
         return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def stage(
+    def _stage(
         self, job_id: str, parent_session_id: str, handoff: SessionHandoff
     ) -> HandoffState:
         canonical = handoff.canonical_json()
@@ -561,7 +587,7 @@ class SessionHandoffLedger:
             raise KeyError(handoff_id)
         return str(row[0])
 
-    def claim_effect(
+    def _claim_effect(
         self,
         job_id: str,
         handoff_id: str,
@@ -645,7 +671,7 @@ class SessionHandoffLedger:
             acquired=False,
         )
 
-    def complete_effect(
+    def _complete_effect(
         self,
         job_id: str,
         handoff_id: str,
@@ -729,7 +755,7 @@ class SessionHandoffLedger:
             )
         return self.get(job_id, handoff_id)  # type: ignore[return-value]
 
-    def reconcile_effect(
+    def _reconcile_effect(
         self,
         *,
         job_id: str,
@@ -864,7 +890,7 @@ class SessionHandoffLedger:
             manual_resume_action=row["manual_resume_action"],
         )
 
-    def advance(
+    def _advance(
         self, job_id: str, handoff_id: str, stage: str, **values: Any
     ) -> HandoffState:
         if stage != "COMPLETE" or values:
@@ -902,7 +928,7 @@ class SessionHandoffLedger:
                     raise KeyError(handoff_id)
         return self.get(job_id, handoff_id)  # type: ignore[return-value]
 
-    def resume_failed(self, job_id: str, handoff_id: str) -> HandoffState:
+    def _resume_failed(self, job_id: str, handoff_id: str) -> HandoffState:
         """Explicitly release the persisted fail-closed fence for manual resume."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -941,7 +967,7 @@ class SessionHandoffLedger:
                     raise KeyError(handoff_id)
         return self.get(job_id, handoff_id)  # type: ignore[return-value]
 
-    def fail_closed(
+    def _fail_closed(
         self,
         job_id: str,
         handoff_id: str,
