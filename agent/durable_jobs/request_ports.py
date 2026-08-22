@@ -123,10 +123,14 @@ def _check_deadline(
     if deadline is not None and time.monotonic() >= deadline:
         raise RequestPortTimeout("timeout")
     if cancel_event is not None:
+        invalid_cancellation = False
         try:
             cancelled = getattr(cancel_event, "is_set", lambda: False)()
-        except BaseException as exc:
-            raise RequestPortTimeout("invalid cancellation hook") from exc
+        except BaseException:
+            invalid_cancellation = True
+            cancelled = False
+        if invalid_cancellation:
+            raise RequestPortTimeout("invalid cancellation hook")
         if cancelled:
             raise RequestPortTimeout("cancelled")
         # Calling the user-supplied hook is admission work and consumes budget.
@@ -134,10 +138,14 @@ def _check_deadline(
             raise RequestPortTimeout("timeout")
     if timeout_seconds is None:
         return
+    invalid_timeout = False
     try:
         seconds = float(timeout_seconds)
-    except (TypeError, ValueError) as exc:
-        raise RequestPortTimeout("invalid timeout") from exc
+    except (TypeError, ValueError):
+        invalid_timeout = True
+        seconds = 0.0
+    if invalid_timeout:
+        raise RequestPortTimeout("invalid timeout")
     if seconds <= 0:
         raise RequestPortTimeout("timeout")
 
@@ -156,7 +164,7 @@ def _unwrap_response(result: Any) -> Any:
     json_fn = json_seam.__get__(result, type(result))
     try:
         unwrapped = json_fn()
-    except Exception:
+    except BaseException:
         return result
     if inspect.iscoroutine(unwrapped):
         unwrapped.close()
@@ -185,15 +193,35 @@ def _invoke(
     **kwargs: Any,
 ) -> Any:
     method = _client_method(client, method_name)
+    lane_closed = False
+    provider_error_message = None
+    provider_base_failed = False
     try:
         result = method(*args, **kwargs)
-    except (LaneClosedError, RequestPortError):
-        raise
+    except LaneClosedError:
+        lane_closed = True
+        result = None
     except Exception as exc:
-        text = _redact(exc)
+        try:
+            provider_error_message = _redact(exc)
+        except BaseException:
+            provider_error_message = "provider request failed"
         if type(_secret_value) is str and _secret_value:
-            text = text.replace(_secret_value, "[REDACTED]")
-        raise RequestPortError(text) from None
+            provider_error_message = provider_error_message.replace(
+                _secret_value, "[REDACTED]"
+            )
+        result = None
+    except BaseException:
+        provider_base_failed = True
+        result = None
+    if lane_closed:
+        raise LaneClosedError("lane closed during request")
+    if provider_error_message is not None:
+        raise RequestPortError(provider_error_message)
+    if provider_base_failed:
+        # Provider BaseException objects and chains are untrusted and may carry
+        # resolved credentials. Preserve no provider-controlled diagnostics.
+        raise RequestPortError("provider request failed")
     if inspect.iscoroutine(result):
         result.close()
         raise RequestPortError(
@@ -207,12 +235,14 @@ def _resolve_secret(
 ) -> Any:
     if resolver is None:
         raise RequestPortError("credential resolver is required")
+    resolver_failed = False
     try:
         value = resolver(secret_ref)
-    except RequestPortError:
-        raise
-    except Exception as exc:
-        raise RequestPortError(_redact(exc)) from None
+    except BaseException:
+        resolver_failed = True
+        value = None
+    if resolver_failed:
+        raise RequestPortError("credential resolver failed")
     if value is None or (isinstance(value, str) and not value.strip()):
         raise RequestPortError("credential resolver returned empty")
     return value
@@ -435,10 +465,14 @@ class _InjectedRequestPortBase:
         if timeout_seconds is None:
             deadline = None
         else:
+            invalid_timeout = False
             try:
                 seconds = float(timeout_seconds)
-            except BaseException as exc:
-                raise RequestPortTimeout("invalid timeout") from exc
+            except BaseException:
+                invalid_timeout = True
+                seconds = 0.0
+            if invalid_timeout:
+                raise RequestPortTimeout("invalid timeout")
             if not math.isfinite(seconds) or seconds <= 0:
                 raise RequestPortTimeout("timeout")
             deadline = admission_started + seconds
@@ -554,7 +588,8 @@ class _InjectedRequestPortBase:
                     # Cache only a credential-independent frozen snapshot.
                     claim["result"] = sanitize_result(call())
                 except BaseException as exc:
-                    # Preserved verbatim for the waiting caller; never converted here.
+                    # Stored only until the waiting caller normalizes the error
+                    # into a fresh, chainless domain exception.
                     claim["exception"] = exc
                 finally:
                     with self._idle:
@@ -564,6 +599,7 @@ class _InjectedRequestPortBase:
                         claim["event"].set()
                         self._idle.notify_all()
 
+            start_failed = False
             try:
                 thread = threading.Thread(
                     target=worker,
@@ -572,6 +608,7 @@ class _InjectedRequestPortBase:
                 )
                 thread.start()
             except BaseException as exc:
+                start_failed = True
                 with self._idle:
                     unresolved = not claim["event"].is_set()
                     if accounting["owned"]:
@@ -587,7 +624,8 @@ class _InjectedRequestPortBase:
                         claim["exception"] = exc
                         claim["event"].set()
                     self._idle.notify_all()
-                raise RequestPortError("request worker failed to start") from exc
+            if start_failed:
+                raise RequestPortError("request worker failed to start")
 
         while True:
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -596,15 +634,22 @@ class _InjectedRequestPortBase:
             wait_for = 0.005 if remaining is None else min(0.005, remaining)
             if claim["event"].wait(wait_for):
                 break
-            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                raise RequestPortTimeout("cancelled")
+            if cancel_event is not None:
+                _check_deadline(deadline=None, cancel_event=cancel_event)
         # Event.wait() can return true only after its requested interval.  A
         # completion that crossed this caller's deadline is still a timeout.
-        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-            raise RequestPortTimeout("cancelled")
+        if cancel_event is not None:
+            _check_deadline(deadline=None, cancel_event=cancel_event)
         _check_deadline(deadline=deadline, cancel_event=cancel_event)
         if "exception" in claim:
-            raise claim["exception"]
+            exc = claim["exception"]
+            if type(exc) is LaneClosedError:
+                raise LaneClosedError("lane closed during request")
+            if type(exc) is RequestPortError:
+                message = str(exc)
+            else:
+                message = "provider worker failed"
+            raise RequestPortError(message)
         return claim.get("result")
 
     def _validate_common(

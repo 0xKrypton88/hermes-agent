@@ -1318,6 +1318,68 @@ def test_hostile_response_json_descriptor_is_not_executed():
     assert [call[0] for call in client.calls] == ["create_agent"]
 
 
+def test_provider_base_exception_is_converted_without_secret_chain():
+    ports = _load_ports()
+    secret = "resolved-cursor-baseexception-secret"
+
+    class BaseExceptionCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            self.calls.append(("create_agent", payload))
+            raise KeyboardInterrupt(secret)
+
+    client = BaseExceptionCursor()
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda _name: secret,
+    )
+
+    with pytest.raises(ports.RequestPortError) as caught:
+        port(
+            operation="create",
+            secret_ref=_SECRET_CURSOR,
+            payload=_cursor_create_payload(key="provider-baseexception"),
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in repr(caught.value)
+    assert secret not in repr(port.receipts)
+    assert len(client.calls) == 1
+
+
+def test_hostile_cancellation_exception_has_no_secret_chain():
+    ports = _load_ports()
+    secret = "hostile-cancellation-secret"
+
+    class HostileCancellation:
+        def is_set(self):
+            raise RuntimeError(secret)
+
+    client = FakeCursorCloudClient()
+    resolver_calls = []
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+    )
+
+    with pytest.raises(ports.RequestPortTimeout) as caught:
+        port(
+            operation="create",
+            secret_ref=_SECRET_CURSOR,
+            payload=_cursor_create_payload(key="hostile-cancellation"),
+            cancel_event=HostileCancellation(),
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in repr(caught.value)
+    assert secret not in repr(port.receipts)
+    assert resolver_calls == []
+    assert client.calls == []
+
+
 def test_slack_repeated_post_claim_invokes_provider_once():
     ports = _load_ports()
     client = FakeSlackClient()
@@ -1585,15 +1647,16 @@ def test_resolved_secret_is_redacted_from_mapping_keys_in_response_and_receipt()
         top["new"] = "mutated"
 
 
-def test_provider_baseexception_is_preserved_verbatim():
+def test_provider_baseexception_is_converted_to_chainless_domain_error():
     ports = _load_ports()
     client = FakeCursorCloudClient()
     primary = KeyboardInterrupt("provider interrupt")
     client.create_error = primary
     port = _cursor_port(ports, client)
-    with pytest.raises(KeyboardInterrupt) as caught:
+    with pytest.raises(ports.RequestPortError, match="provider request failed") as caught:
         port(operation="create", secret_ref=_SECRET_CURSOR, payload=_cursor_create_payload())
-    assert caught.value is primary
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_non_idempotent_reads_ignore_clock_collisions_and_return_fresh_results(
