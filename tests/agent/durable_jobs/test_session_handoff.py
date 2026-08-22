@@ -1360,6 +1360,96 @@ def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
             alias_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT").acquire()
 
 
+def test_database_replacement_between_guard_creation_and_acquisition_fails_closed(
+    tmp_path,
+):
+    import gc
+    import os
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        DatabaseIdentityChanged,
+        SessionHandoffLedger,
+    )
+
+    database = tmp_path / "jobs.sqlite"
+    replacement = tmp_path / "replacement.sqlite"
+    ledger = SessionHandoffLedger(database)
+    SessionHandoffLedger(replacement)
+    guard = ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT")
+    gc.collect()
+
+    os.replace(replacement, database)
+    with pytest.raises(DatabaseIdentityChanged):
+        guard.acquire()
+    assert not guard.held
+
+
+def test_database_replacement_after_owner_guard_acquisition_fails_closed(tmp_path):
+    import gc
+    import os
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        DatabaseIdentityChanged,
+        SessionHandoffLedger,
+    )
+
+    database = tmp_path / "jobs.sqlite"
+    replacement = tmp_path / "replacement.sqlite"
+    ledger = SessionHandoffLedger(database)
+    SessionHandoffLedger(replacement)
+    gc.collect()
+
+    with ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
+        os.replace(replacement, database)
+        with pytest.raises(DatabaseIdentityChanged):
+            ledger.get("job", "handoff")
+
+
+def test_reconciliation_constructs_mutating_ledger_only_under_lane_lease(tmp_path):
+    from contextlib import contextmanager
+    import sqlite3
+
+    import pytest
+
+    from agent.durable_jobs.lane import LaneClosedError
+    from agent.durable_jobs.session_handoff import SessionHandoffLedger
+
+    lane, job = _lane(tmp_path)
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
+    ledger.stage(job.job_id, "parent-1", _handoff())
+    with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+        conn.execute("DROP TABLE session_handoff_effects")
+
+    @contextmanager
+    def denied_lease():
+        raise LaneClosedError("lease denied")
+        yield
+
+    lane._mutation_lease = denied_lease
+    with pytest.raises(LaneClosedError, match="lease denied"):
+        lane.reconcile_session_handoff_effect(
+            job_id=job.job_id,
+            handoff_id="ho_123",
+            effect_name="LINEAR_UPSERT",
+            outcome="NOT_APPLIED",
+            expected_owner_token="dead-owner",
+            expected_generation=1,
+            dead_owner_verified=True,
+            handoff_config=_enabled_handoff_config(),
+        )
+
+    with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+        recreated = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='session_handoff_effects'"
+        ).fetchone()
+    assert recreated is None
+
+
 def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_path):
     import threading
 

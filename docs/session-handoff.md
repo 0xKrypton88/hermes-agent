@@ -75,12 +75,16 @@ SHA against the current durable job. The operator must submit the exact owner
 token and generation observed for the ambiguous claim plus an explicit
 dead-owner witness. Reconciliation must also acquire the same non-blocking
 OS-backed owner lock; a lock still held by a live effect caller fails closed.
-This prevents reconciliation from invalidating a live owner and prevents stale
-owners from completing or fail-closing a reassigned generation, including when
-an owner token is reused. The lock namespace is derived from the SQLite file's
-filesystem identity (device plus inode/file index), not its pathname, so
-symlink, relative-path, and hardlink aliases of the same database contend on
-the same owner lock.
+The lane acquires its mutation lease before job lookup or ledger construction, so
+constructor schema DDL and identity checks cannot race `close()`. This prevents
+reconciliation from invalidating a live owner and prevents stale owners from
+completing or fail-closing a reassigned generation, including when an owner token
+is reused. The lock namespace is derived from the SQLite file's filesystem
+identity (device plus inode/file index), not its pathname, so symlink,
+relative-path, and hardlink aliases of the same database contend on the same
+owner lock. The ledger captures that identity at construction, revalidates it
+after owner-lock acquisition and immediately around every SQLite open, and
+fails closed if pathname replacement changes the database identity.
 Secret-shaped receipts are rejected before persistence. Legacy effect tables
 are upgraded transactionally with the generation and reconciliation-receipt
 columns before use.

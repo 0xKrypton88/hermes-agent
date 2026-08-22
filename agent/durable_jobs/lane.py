@@ -636,25 +636,25 @@ class DurableLaneService:
             raise PilotDisabledError(
                 "session handoff reconciliation requires enabled=True and shadow=False"
             )
-        store = self._acquire_authorized_mutation(job_id)
-        job = store.get_job(job_id)
-        if job is None:
-            raise KeyError(job_id)
-        ledger = SessionHandoffLedger(store.sqlite_path)
-        state = ledger.get(job_id, handoff_id)
-        if state is None:
-            raise KeyError(handoff_id)
-        canonical = json.loads(ledger.canonical(job_id, handoff_id))
-        if (
-            str(canonical.get("repository", "")).strip()
-            != str(job.repository_identity).strip()
-            or not job.frozen_baseline_sha
-            or canonical.get("exact_sha") != job.frozen_baseline_sha
-        ):
-            raise HandoffIdentityMismatch(
-                "reconciliation requires current durable job repository and frozen SHA identity"
-            )
         with self._mutation_lease():
+            store = self._acquire_authorized_mutation(job_id)
+            job = store.get_job(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            ledger = SessionHandoffLedger(store.sqlite_path)
+            state = ledger.get(job_id, handoff_id)
+            if state is None:
+                raise KeyError(handoff_id)
+            canonical = json.loads(ledger.canonical(job_id, handoff_id))
+            if (
+                str(canonical.get("repository", "")).strip()
+                != str(job.repository_identity).strip()
+                or not job.frozen_baseline_sha
+                or canonical.get("exact_sha") != job.frozen_baseline_sha
+            ):
+                raise HandoffIdentityMismatch(
+                    "reconciliation requires current durable job repository and frozen SHA identity"
+                )
             with ledger.effect_owner_guard(job_id, handoff_id, effect_name) as guard:
                 return ledger.reconcile_effect(
                     job_id=job_id,

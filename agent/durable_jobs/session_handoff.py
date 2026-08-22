@@ -174,6 +174,10 @@ class HandoffIdentityMismatch(RuntimeError):
     pass
 
 
+class DatabaseIdentityChanged(RuntimeError):
+    """The configured SQLite pathname no longer names the ledger file."""
+
+
 class ProjectionVerificationError(RuntimeError):
     pass
 
@@ -196,11 +200,13 @@ class _EffectOwnerGuard:
         job_id: str,
         handoff_id: str,
         effect_name: str,
+        validate_database_identity: Any,
     ) -> None:
         self.lock_path = lock_path
         self.job_id = job_id
         self.handoff_id = handoff_id
         self.effect_name = effect_name
+        self._validate_database_identity = validate_database_identity
         self._handle: Any | None = None
 
     @property
@@ -228,6 +234,11 @@ class _EffectOwnerGuard:
             handle.close()
             raise EffectOwnershipLost("effect owner is still live") from exc
         self._handle = handle
+        try:
+            self._validate_database_identity()
+        except BaseException:
+            self.release()
+            raise
         return self
 
     def release(self) -> None:
@@ -351,6 +362,14 @@ class SessionHandoffLedger:
 
     def __init__(self, sqlite_path: Any) -> None:
         self.sqlite_path = sqlite_path
+        database = Path(sqlite_path)
+        try:
+            descriptor = os.open(database, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+        self._database_identity: tuple[int, int] | None = self._path_identity()
         with self._connect() as conn:
             conn.execute(
                 """
@@ -407,8 +426,42 @@ class SessionHandoffLedger:
                     "ADD COLUMN reconciliation_receipt TEXT"
                 )
 
+    def _path_identity(self) -> tuple[int, int]:
+        stat = Path(self.sqlite_path).stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if stat.st_ino == 0:
+            raise RuntimeError("database file identity is unavailable")
+        return identity
+
+    def _assert_database_identity(self) -> tuple[int, int]:
+        identity = self._path_identity()
+        expected = self._database_identity
+        if expected is not None and identity != expected:
+            raise DatabaseIdentityChanged(
+                "SQLite pathname no longer identifies the ledger database"
+            )
+        return identity
+
     def _connect(self) -> sqlite3.Connection:
+        before: tuple[int, int] | None = None
+        if Path(self.sqlite_path).exists():
+            before = self._assert_database_identity()
         conn = sqlite3.connect(self.sqlite_path, timeout=10)
+        try:
+            after = self._path_identity()
+            if before is not None and after != before:
+                raise DatabaseIdentityChanged(
+                    "SQLite pathname changed identity while opening the ledger"
+                )
+            if self._database_identity is None:
+                self._database_identity = after
+            elif after != self._database_identity:
+                raise DatabaseIdentityChanged(
+                    "SQLite pathname no longer identifies the ledger database"
+                )
+        except BaseException:
+            conn.close()
+            raise
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
@@ -417,11 +470,8 @@ class SessionHandoffLedger:
     def effect_owner_guard(
         self, job_id: str, handoff_id: str, effect_name: str
     ) -> _EffectOwnerGuard:
-        database = Path(self.sqlite_path)
-        stat = database.stat()
-        if stat.st_ino == 0:
-            raise RuntimeError("database file identity is unavailable")
-        database_identity = f"{stat.st_dev}:{stat.st_ino}".encode("ascii")
+        device, inode = self._assert_database_identity()
+        database_identity = f"{device}:{inode}".encode("ascii")
         database_digest = hashlib.sha256(database_identity).hexdigest()
         effect_identity = "\0".join((job_id, handoff_id, effect_name)).encode("utf-8")
         effect_digest = hashlib.sha256(effect_identity).hexdigest()
@@ -436,6 +486,7 @@ class SessionHandoffLedger:
             job_id=job_id,
             handoff_id=handoff_id,
             effect_name=effect_name,
+            validate_database_identity=self._assert_database_identity,
         )
 
     @staticmethod
