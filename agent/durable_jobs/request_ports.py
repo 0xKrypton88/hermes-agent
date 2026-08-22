@@ -69,7 +69,9 @@ def _require_text(value: Any, field: str) -> str:
     return value.strip()
 
 
-def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
+def _require_client(
+    client: Any, methods: tuple[str, ...]
+) -> tuple[Any, Mapping[str, tuple[Any, bool]]]:
     if client is None:
         raise TypeError(
             "injected client is required; no HTTP/SDK client is constructed"
@@ -81,6 +83,7 @@ def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
     if lookup is not object.__getattribute__:
         raise TypeError("injected client requires static client lookup")
     missing = []
+    capabilities: dict[str, tuple[Any, bool]] = {}
     for name in methods:
         try:
             seam = inspect.getattr_static(client, name)
@@ -92,12 +95,18 @@ def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
         # rejected without executing any client-controlled hook.
         if not (inspect.isfunction(seam) or inspect.isbuiltin(seam)):
             missing.append(name)
+            continue
+        try:
+            class_seam = inspect.getattr_static(type(client), name)
+        except BaseException:
+            class_seam = None
+        capabilities[name] = (seam, seam is class_seam)
     if missing:
         raise TypeError(
             "injected client is missing required seam methods: "
             + ", ".join(missing)
         )
-    return client
+    return client, MappingProxyType(capabilities)
 
 
 def _as_payload(payload: Any) -> dict[str, Any]:
@@ -183,30 +192,47 @@ def _unwrap_response(result: Any) -> Any:
     return unwrapped
 
 
-def _client_method(client: Any, method_name: str) -> Any:
-    method = getattr(client, method_name, None)
-    if method is None or not callable(method):
+def _client_method(
+    client: Any,
+    capabilities: Mapping[str, tuple[Any, bool]],
+    method_name: str,
+) -> tuple[Any, bool]:
+    capability = capabilities.get(method_name)
+    if capability is None:
         raise RequestPortError(f"injected client is missing {method_name}")
-    if inspect.iscoroutinefunction(method):
+    expected, _pass_client = capability
+    try:
+        current = inspect.getattr_static(client, method_name)
+    except BaseException:
+        current = None
+    if current is not expected:
+        raise RequestPortError(f"injected client capability changed: {method_name}")
+    if inspect.iscoroutinefunction(expected):
         raise RequestPortError(
             "async client methods are not invoked from request ports"
         )
-    return method
+    return capability
 
 
 def _invoke(
     client: Any,
-    method_name: str,
+    capability: tuple[Any, bool],
     *args: Any,
     _secret_value: Any = None,
+    _invocation_state: Optional[dict[str, bool]] = None,
     **kwargs: Any,
 ) -> Any:
-    method = _client_method(client, method_name)
+    method, pass_client = capability
     lane_closed = False
     provider_error_message = None
     provider_base_failed = False
     try:
-        result = method(*args, **kwargs)
+        if _invocation_state is not None:
+            _invocation_state["started"] = True
+        if pass_client:
+            result = method(client, *args, **kwargs)
+        else:
+            result = method(*args, **kwargs)
     except LaneClosedError:
         lane_closed = True
         result = None
@@ -438,7 +464,7 @@ class _InjectedRequestPortBase:
         methods: tuple[str, ...],
         credential_resolver: Optional[Callable[[str], Any]] = None,
     ) -> None:
-        self._client = _require_client(client, methods)
+        self._client, self._client_capabilities = _require_client(client, methods)
         self._secret_ref = validate_secret_ref_name(secret_ref, field="secret_ref")
         self._workspace_id = _require_text(workspace_id, "workspace_id")
         self._repository_identity = _require_text(
@@ -457,6 +483,11 @@ class _InjectedRequestPortBase:
         if capacity <= 0:
             raise ValueError("permanent write claim capacity must be positive")
         self._write_claim_capacity = capacity
+
+    def _client_method(self, method_name: str) -> tuple[Any, bool]:
+        return _client_method(
+            self._client, self._client_capabilities, method_name
+        )
 
     def _reserve_write_claim(self, claim_key: str) -> tuple[dict[str, Any], bool]:
         """Atomically return an existing claim or reserve one permanent slot."""
@@ -838,6 +869,7 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
         cancel_event: Any = None,
     ) -> Any:
         client_invoked = False
+        invocation_state = {"started": False}
         secret_value = None
         admitted = False
         write_claim_key: Optional[str] = None
@@ -866,12 +898,12 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                 write_claim, write_claim_owner = self._reserve_write_claim(
                     write_claim_key
                 )
-                _client_method(self._client, "create_agent")
+                self._client_method("create_agent")
             elif operation == "lookup":
                 key = _cursor_key(body)
                 _verify_cursor_correlation(body, key)
                 agent_id = cursor_correlation_agent_id(key)
-                _client_method(self._client, "get_agent")
+                self._client_method("get_agent")
             elif operation == "status":
                 key = _cursor_key(body)
                 _name, expected_agent_id = _verify_cursor_correlation(body, key)
@@ -883,7 +915,7 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                     )
                 if type(run_id) is not str or not run_id.strip():
                     raise RequestPortMismatch("run_id is required")
-                _client_method(self._client, "get_run")
+                self._client_method("get_run")
             else:
                 raise RequestPortError(f"unsupported cursor operation: {operation}")
 
@@ -892,15 +924,25 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                     deadline=deadline,
                     cancel_event=cancel_event,
                 )
+            # Credential resolution is an untrusted boundary and may mutate
+            # the client class. Revalidate statically before worker admission;
+            # the worker repeats this immediately before exact-function call.
+            if operation == "create":
+                self._client_method("create_agent")
+            elif operation == "lookup":
+                self._client_method("get_agent")
+            else:
+                self._client_method("get_run")
             if operation == "create":
                 client_invoked = write_claim_owner
                 result = self._run_sync(
                     write_claim_key,
                     lambda: _invoke(
                         self._client,
-                        "create_agent",
+                        self._client_method("create_agent"),
                         {"name": name, "agentId": agent_id},
                         _secret_value=secret_value,
+                        _invocation_state=invocation_state,
                     ),
                     deadline=deadline,
                     cancel_event=cancel_event,
@@ -916,9 +958,10 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                     f"cursor:lookup:{key}",
                     lambda: _invoke(
                         self._client,
-                        "get_agent",
+                        self._client_method("get_agent"),
                         agent_id,
                         _secret_value=secret_value,
+                        _invocation_state=invocation_state,
                     ),
                     idempotent=False,
                     deadline=deadline,
@@ -933,10 +976,11 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                     f"cursor:status:{agent_id}:{run_id}",
                     lambda: _invoke(
                         self._client,
-                        "get_run",
+                        self._client_method("get_run"),
                         expected_agent_id,
                         run_id.strip(),
                         _secret_value=secret_value,
+                        _invocation_state=invocation_state,
                     ),
                     idempotent=False,
                     deadline=deadline,
@@ -963,7 +1007,7 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                 secret_ref=secret_ref,
                 payload=payload,
                 outcome="error",
-                client_invoked=client_invoked,
+                client_invoked=invocation_state["started"],
                 error=exc,
                 secret_value=secret_value,
             )
@@ -1011,6 +1055,7 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
         cancel_event: Any = None,
     ) -> Any:
         client_invoked = False
+        invocation_state = {"started": False}
         secret_value = None
         admitted = False
         write_claim_key: Optional[str] = None
@@ -1046,9 +1091,9 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                 write_claim, write_claim_owner = self._reserve_write_claim(
                     write_claim_key
                 )
-                _client_method(self._client, "chat_postMessage")
+                self._client_method("chat_postMessage")
             elif operation == "lookup":
-                _client_method(self._client, "conversations_replies")
+                self._client_method("conversations_replies")
             else:
                 raise RequestPortError(f"unsupported slack operation: {operation}")
 
@@ -1057,18 +1102,24 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                     deadline=deadline,
                     cancel_event=cancel_event,
                 )
+            # Revalidate after the untrusted resolver and again in the worker.
+            if operation == "post_root":
+                self._client_method("chat_postMessage")
+            else:
+                self._client_method("conversations_replies")
             if operation == "post_root":
                 client_invoked = write_claim_owner
                 result = self._run_sync(
                     write_claim_key,
                     lambda: _invoke(
                         self._client,
-                        "chat_postMessage",
+                        self._client_method("chat_postMessage"),
                         channel=self._channel_id,
                         thread_ts=self._root_thread_ts,
                         client_msg_id=key,
                         text=text,
                         _secret_value=secret_value,
+                        _invocation_state=invocation_state,
                     ),
                     deadline=deadline,
                     cancel_event=cancel_event,
@@ -1084,10 +1135,11 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                     f"slack:lookup:{key}",
                     lambda: _invoke(
                         self._client,
-                        "conversations_replies",
+                        self._client_method("conversations_replies"),
                         channel=self._channel_id,
                         ts=self._root_thread_ts,
                         _secret_value=secret_value,
+                        _invocation_state=invocation_state,
                     ),
                     idempotent=False,
                     deadline=deadline,
@@ -1115,7 +1167,7 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                 secret_ref=secret_ref,
                 payload=payload,
                 outcome="error",
-                client_invoked=client_invoked,
+                client_invoked=invocation_state["started"],
                 error=exc,
                 secret_value=secret_value,
             )

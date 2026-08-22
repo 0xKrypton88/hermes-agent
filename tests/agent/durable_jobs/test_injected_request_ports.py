@@ -401,6 +401,106 @@ def test_hostile_getattribute_cannot_mint_concrete_client_capability():
     assert effects == []
 
 
+def test_client_class_descriptor_mutation_after_binding_fails_closed_and_releases_claim():
+    ports = _load_ports()
+    effects = []
+
+    class MutableCursor(FakeCursorCloudClient):
+        pass
+
+    client = MutableCursor()
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda name: effects.append(("resolver", name))
+        or CURSOR_SECRET_VALUE,
+    )
+    original = inspect.getattr_static(MutableCursor, "create_agent")
+
+    def hostile_descriptor(_client):
+        effects.append("descriptor")
+        return lambda _payload: {"agentId": "forged"}
+
+    MutableCursor.create_agent = property(hostile_descriptor)
+    try:
+        with pytest.raises(ports.RequestPortError, match="client capability changed"):
+            port(
+                operation="create",
+                secret_ref=_SECRET_CURSOR,
+                payload=_cursor_create_payload("class-mutation"),
+            )
+    finally:
+        MutableCursor.create_agent = original
+
+    assert effects == []
+    assert client.calls == []
+    assert port.receipts[-1]["outcome"] == "error"
+    assert port.receipts[-1]["client_invoked"] is False
+    assert port._active_calls == 0
+
+    result = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("class-mutation"),
+    )
+    assert result["agentId"] == _cursor_ids("class-mutation")[1]
+    assert effects == [("resolver", _SECRET_CURSOR)]
+    assert [call[0] for call in client.calls] == ["create_agent"]
+    assert port.close(timeout_seconds=1) is True
+    assert port.close(timeout_seconds=1) is True
+
+
+def test_client_class_mutation_during_resolution_is_revalidated_before_worker_call():
+    ports = _load_ports()
+    effects = []
+
+    class MutableCursor(FakeCursorCloudClient):
+        pass
+
+    client = MutableCursor()
+    original = inspect.getattr_static(MutableCursor, "create_agent")
+
+    def hostile_descriptor(_client):
+        effects.append("descriptor")
+        return lambda _payload: {"agentId": "forged"}
+
+    def resolver(name):
+        effects.append(("resolver", name))
+        if effects.count(("resolver", name)) == 1:
+            MutableCursor.create_agent = property(hostile_descriptor)
+        return CURSOR_SECRET_VALUE
+
+    port = _cursor_port(ports, client, credential_resolver=resolver)
+    try:
+        with pytest.raises(ports.RequestPortError, match="client capability changed"):
+            port(
+                operation="create",
+                secret_ref=_SECRET_CURSOR,
+                payload=_cursor_create_payload("resolver-mutation"),
+            )
+    finally:
+        MutableCursor.create_agent = original
+
+    assert effects == [("resolver", _SECRET_CURSOR)]
+    assert client.calls == []
+    assert port.receipts[-1]["outcome"] == "error"
+    assert port.receipts[-1]["client_invoked"] is False
+    assert port._active_calls == 0
+
+    result = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=_cursor_create_payload("resolver-mutation"),
+    )
+    assert result["agentId"] == _cursor_ids("resolver-mutation")[1]
+    assert effects == [
+        ("resolver", _SECRET_CURSOR),
+        ("resolver", _SECRET_CURSOR),
+    ]
+    assert [call[0] for call in client.calls] == ["create_agent"]
+    assert port.close(timeout_seconds=1) is True
+
+
 def test_missing_resolver_denies_preflight_and_direct_request_but_positive_resolves_once(
     tmp_path,
 ):
