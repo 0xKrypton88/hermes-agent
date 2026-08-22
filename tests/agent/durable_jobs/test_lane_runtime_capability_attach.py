@@ -61,6 +61,65 @@ def _idle_request(calls: list):
     return request
 
 
+def _approved_idle_transports(calls: list):
+    from agent.durable_jobs.injected_transports import (
+        CursorCloudInjectedTransport,
+        SlackInjectedTransport,
+    )
+    from agent.durable_jobs.request_ports import (
+        CursorCloudInjectedRequestPort,
+        SlackInjectedRequestPort,
+    )
+
+    class _IdleCursorClient:
+        def create_agent(self, _payload):
+            calls.append("cursor.create_agent")
+            raise AssertionError("preflight/attach must not call the transport")
+
+        def get_agent(self, _agent_id):
+            calls.append("cursor.get_agent")
+            raise AssertionError("preflight/attach must not call the transport")
+
+        def get_run(self, _agent_id, _run_id):
+            calls.append("cursor.get_run")
+            raise AssertionError("preflight/attach must not call the transport")
+
+    class _IdleSlackClient:
+        def chat_postMessage(self, **_kwargs):
+            calls.append("slack.chat_postMessage")
+            raise AssertionError("preflight/attach must not call the transport")
+
+        def conversations_replies(self, **_kwargs):
+            calls.append("slack.conversations_replies")
+            raise AssertionError("preflight/attach must not call the transport")
+
+    def _no_network_resolver(secret_ref: str) -> str:
+        return f"test-only:{secret_ref}"
+
+    cursor_request = CursorCloudInjectedRequestPort(
+        client=_IdleCursorClient(),
+        secret_ref="CURSOR_API_KEY",
+        workspace_id="T1",
+        repository_identity="github.com/example/repo",
+        credential_resolver=_no_network_resolver,
+    )
+    slack_request = SlackInjectedRequestPort(
+        client=_IdleSlackClient(),
+        secret_ref="SLACK_BOT_TOKEN",
+        workspace_id="T1",
+        channel_id="C123",
+        repository_identity="github.com/example/repo",
+        root_thread_ts="111.222",
+        credential_resolver=_no_network_resolver,
+    )
+    return (
+        CursorCloudInjectedTransport(
+            request=cursor_request, secret_ref="CURSOR_API_KEY"
+        ),
+        SlackInjectedTransport(request=slack_request, secret_ref="SLACK_BOT_TOKEN"),
+    )
+
+
 def _spy_adapter_factories(monkeypatch, cursor_calls: list, slack_calls: list):
     import agent.durable_jobs.cursor_cloud as cursor_cloud
     import agent.durable_jobs.slack_bridge as slack_bridge
@@ -384,10 +443,6 @@ def test_attach_matching_approved_concrete_transports_wires_without_calling(
     tmp_path, monkeypatch
 ):
     from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
-    from agent.durable_jobs.injected_transports import (
-        CursorCloudInjectedTransport,
-        SlackInjectedTransport,
-    )
     from agent.durable_jobs.preflight import preflight_durable_jobs
     from agent.durable_jobs.slack_bridge import SlackClientBridge
     from gateway.durable_job_lane import (
@@ -402,12 +457,7 @@ def test_attach_matching_approved_concrete_transports_wires_without_calling(
     slack_calls: list = []
     _spy_adapter_factories(monkeypatch, cursor_calls, slack_calls)
     raw = _complete(tmp_path)
-    cursor = CursorCloudInjectedTransport(
-        request=_idle_request(transport_calls), secret_ref="CURSOR_API_KEY"
-    )
-    slack = SlackInjectedTransport(
-        request=_idle_request(transport_calls), secret_ref="SLACK_BOT_TOKEN"
-    )
+    cursor, slack = _approved_idle_transports(transport_calls)
     report = preflight_durable_jobs(
         raw, cursor_transport=cursor, slack_transport=slack
     )
@@ -441,10 +491,6 @@ def test_attach_and_preflight_open_no_sockets_even_when_unready(
 
 
 def test_failed_attach_does_not_occupy_owner_slot(tmp_path, monkeypatch):
-    from agent.durable_jobs.injected_transports import (
-        CursorCloudInjectedTransport,
-        SlackInjectedTransport,
-    )
     from gateway.durable_job_lane import attach_durable_job_lane
 
     raw = _complete(tmp_path)
@@ -453,14 +499,11 @@ def test_failed_attach_does_not_occupy_owner_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("CURSOR_API_KEY", CURSOR_TOKEN)
     monkeypatch.setenv("SLACK_BOT_TOKEN", SLACK_TOKEN)
     calls: list = []
+    cursor, slack = _approved_idle_transports(calls)
     handle = attach_durable_job_lane(
         raw_config=raw,
-        cursor_transport=CursorCloudInjectedTransport(
-            request=_idle_request(calls), secret_ref="CURSOR_API_KEY"
-        ),
-        slack_transport=SlackInjectedTransport(
-            request=_idle_request(calls), secret_ref="SLACK_BOT_TOKEN"
-        ),
+        cursor_transport=cursor,
+        slack_transport=slack,
     )
     assert handle is not None
     assert calls == []
