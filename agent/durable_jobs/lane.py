@@ -361,11 +361,11 @@ class DurableLaneService:
         """Run inactive ENG-122 handoff work under this lane's write lease."""
         from agent.durable_jobs.session_handoff import (
             HandoffIdentityMismatch,
-            SessionHandoffCoordinator,
+            _SessionHandoffCoordinator,
             SessionHandoffLedger,
         )
 
-        if not handoff_config.enabled or handoff_config.shadow:
+        if handoff_config.enabled is not True or handoff_config.shadow is not False:
             raise PilotDisabledError(
                 "session handoff effects require enabled=True and shadow=False"
             )
@@ -382,7 +382,7 @@ class DurableLaneService:
                 "handoff requires a matching non-empty durable job baseline SHA"
             )
         with self._mutation_lease():
-            return SessionHandoffCoordinator(
+            return _SessionHandoffCoordinator(
                 ledger=SessionHandoffLedger(store.sqlite_path),
                 linear=linear,
                 slack=slack,
@@ -438,16 +438,18 @@ class DurableLaneService:
                 "reconciliation requires current durable job repository and frozen SHA identity"
             )
         with self._mutation_lease():
-            return ledger.reconcile_effect(
-                job_id=job_id,
-                handoff_id=handoff_id,
-                effect_name=effect_name,
-                outcome=outcome,
-                receipt=receipt,
-                expected_owner_token=expected_owner_token,
-                expected_generation=expected_generation,
-                dead_owner_verified=dead_owner_verified,
-            )
+            with ledger.effect_owner_guard(job_id, handoff_id, effect_name) as guard:
+                return ledger.reconcile_effect(
+                    job_id=job_id,
+                    handoff_id=handoff_id,
+                    effect_name=effect_name,
+                    outcome=outcome,
+                    receipt=receipt,
+                    expected_owner_token=expected_owner_token,
+                    expected_generation=expected_generation,
+                    dead_owner_verified=dead_owner_verified,
+                    owner_guard=guard,
+                )
 
     def bind_slack(
         self,

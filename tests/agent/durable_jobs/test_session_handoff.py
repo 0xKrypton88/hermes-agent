@@ -172,8 +172,16 @@ def _complete_ledger_effect(ledger, job_id, handoff_id, effect_name, receipt=Non
         handoff_id,
         effect_name,
         owner_token=owner,
+        expected_generation=claim.generation,
         receipt=receipt,
     )
+
+
+def _reconcile_ledger_effect(ledger, **kwargs):
+    with ledger.effect_owner_guard(
+        kwargs["job_id"], kwargs["handoff_id"], kwargs["effect_name"]
+    ) as guard:
+        return ledger.reconcile_effect(owner_guard=guard, **kwargs)
 
 
 def test_enabled_shadow_mode_refuses_all_external_effects(tmp_path):
@@ -469,6 +477,7 @@ def test_direct_advance_cannot_bypass_effect_claims(tmp_path):
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="linear-owner",
+        expected_generation=1,
         receipt="linear:ENG-122",
     )
 
@@ -500,6 +509,7 @@ def test_failed_closed_checkpoint_cannot_advance_without_manual_resume(tmp_path)
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="linear-owner",
+        expected_generation=1,
         receipt="linear:ENG-122",
     )
     failed = ledger.fail_closed(job.job_id, "ho_123", "ConnectionError")
@@ -811,6 +821,7 @@ def test_effect_completion_atomically_advances_handoff(tmp_path):
         "ho_123",
         "LINEAR_UPSERT",
         owner_token="owner-a",
+        expected_generation=1,
         receipt="linear:ENG-122",
     )
     claim = ledger.get_effect(job.job_id, "ho_123", "LINEAR_UPSERT")
@@ -845,6 +856,7 @@ def test_effect_completion_cannot_skip_stages_or_persist_secret_receipts(tmp_pat
             "ho_123",
             "CHILD_CREATE",
             owner_token="child-owner",
+            expected_generation=1,
             receipt="child-1",
         )
 
@@ -860,6 +872,7 @@ def test_effect_completion_cannot_skip_stages_or_persist_secret_receipts(tmp_pat
             "ho_123",
             "LINEAR_UPSERT",
             owner_token="linear-owner",
+            expected_generation=1,
             receipt="token=must-not-persist",
         )
     state = ledger.get(job.job_id, "ho_123")
@@ -897,7 +910,8 @@ def test_manual_applied_reconciliation_requires_persisted_verification_evidence(
     )
 
     with pytest.raises(ProjectionVerificationError):
-        ledger.reconcile_effect(
+        _reconcile_ledger_effect(
+            ledger,
             job_id=job.job_id,
             handoff_id="ho_123",
             effect_name="FIRST_TURN_START",
@@ -907,7 +921,8 @@ def test_manual_applied_reconciliation_requires_persisted_verification_evidence(
             dead_owner_verified=True,
         )
 
-    reconciled = ledger.reconcile_effect(
+    reconciled = _reconcile_ledger_effect(
+        ledger,
         job_id=job.job_id,
         handoff_id="ho_123",
         effect_name="FIRST_TURN_START",
@@ -1082,7 +1097,8 @@ def test_reconciliation_requires_exact_dead_owner_witness(tmp_path):
         ("live-owner", claim.generation + 1, True),
     ):
         with pytest.raises(EffectOwnershipLost):
-            ledger.reconcile_effect(
+            _reconcile_ledger_effect(
+                ledger,
                 job_id=job.job_id,
                 handoff_id="ho_123",
                 effect_name="LINEAR_UPSERT",
@@ -1113,7 +1129,8 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
     old = ledger.claim_effect(
         job.job_id, "ho_123", "FIRST_TURN_START", owner_token="owner-a"
     )
-    ledger.reconcile_effect(
+    _reconcile_ledger_effect(
+        ledger,
         job_id=job.job_id,
         handoff_id="ho_123",
         effect_name="FIRST_TURN_START",
@@ -1139,6 +1156,7 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
         "ho_123",
         "FIRST_TURN_START",
         owner_token="owner-b",
+        expected_generation=current.generation,
         receipt=None,
     )
 
@@ -1165,6 +1183,7 @@ def test_token_shaped_receipts_are_rejected_before_persistence(tmp_path):
             "ho_123",
             "LINEAR_UPSERT",
             owner_token="owner-a",
+            expected_generation=1,
             receipt=secret,
         )
     with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
@@ -1246,3 +1265,129 @@ def test_effect_schema_migrates_reconciliation_columns_idempotently(tmp_path):
             row[1] for row in conn.execute("PRAGMA table_info(session_handoff_effects)")
         }
     assert {"generation", "reconciliation_receipt"} <= columns
+
+
+def test_activation_flags_require_exact_booleans():
+    import pytest
+
+    from agent.durable_jobs.session_handoff import SessionHandoffConfig
+
+    for enabled, shadow in ((1, False), (True, 0), ("yes", False), (True, [])):
+        with pytest.raises((TypeError, ValueError)):
+            SessionHandoffConfig(policies={}, enabled=enabled, shadow=shadow)
+
+
+def test_stale_generation_cannot_complete_reclaimed_effect_with_reused_owner(tmp_path):
+    import inspect
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        EffectOwnershipLost,
+        SessionHandoffLedger,
+    )
+
+    _, job = _lane(tmp_path)
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
+    assert "expected_generation" in inspect.signature(ledger.complete_effect).parameters
+    ledger.stage(job.job_id, "parent-1", _handoff())
+    old = ledger.claim_effect(
+        job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="reused-worker"
+    )
+    _reconcile_ledger_effect(
+        ledger,
+        job_id=job.job_id,
+        handoff_id="ho_123",
+        effect_name="LINEAR_UPSERT",
+        outcome="NOT_APPLIED",
+        expected_owner_token="reused-worker",
+        expected_generation=old.generation,
+        dead_owner_verified=True,
+    )
+    current = ledger.claim_effect(
+        job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="reused-worker"
+    )
+
+    with pytest.raises(EffectOwnershipLost):
+        ledger.complete_effect(
+            job.job_id,
+            "ho_123",
+            "LINEAR_UPSERT",
+            owner_token="reused-worker",
+            expected_generation=old.generation,
+            receipt="linear:stale",
+        )
+    assert current.generation == old.generation + 1
+    assert ledger.get(job.job_id, "ho_123").stage == "STAGED"
+
+
+def test_effect_coordinator_is_not_a_public_authorization_bypass():
+    import agent.durable_jobs.session_handoff as session_handoff
+
+    assert not hasattr(session_handoff, "SessionHandoffCoordinator")
+
+
+def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_path):
+    import threading
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        EffectOwnershipLost,
+        SemanticWaypoint,
+        SessionHandoffLedger,
+    )
+
+    lane, job = _lane(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    linear = _Linear()
+    original_upsert = linear.upsert_handoff
+
+    def blocking_upsert(**kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_upsert(**kwargs)
+
+    linear.upsert_handoff = blocking_upsert
+    failures = []
+
+    def run_resume():
+        try:
+            lane.resume_session_handoff(
+                job_id=job.job_id,
+                parent_session_id="parent-1",
+                handoff=_handoff(),
+                waypoint=SemanticWaypoint(verified=True),
+                pressure=_armed(),
+                linear=linear,
+                slack=_Slack(),
+                sessions=_Sessions(),
+                handoff_config=_enabled_handoff_config(),
+            )
+        except BaseException as exc:  # pragma: no cover - diagnostic handoff
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_resume)
+    worker.start()
+    assert entered.wait(timeout=5)
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
+    claim = ledger.get_effect(job.job_id, "ho_123", "LINEAR_UPSERT")
+    assert claim is not None
+    try:
+        with pytest.raises(EffectOwnershipLost):
+            lane.reconcile_session_handoff_effect(
+                job_id=job.job_id,
+                handoff_id="ho_123",
+                effect_name="LINEAR_UPSERT",
+                outcome="NOT_APPLIED",
+                expected_owner_token=claim.owner_token or "",
+                expected_generation=claim.generation,
+                dead_owner_verified=True,
+                handoff_config=_enabled_handoff_config(),
+            )
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not failures

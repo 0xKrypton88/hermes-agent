@@ -3,8 +3,10 @@
 The `agent.durable_jobs.session_handoff` path reuses the durable-job SQLite
 database and mutation lease. It is inactive by default and has no live Linear,
 Slack, child-session, or provider client. Those boundaries are injected ports.
-External effects require both `enabled=True` and `shadow=False`; shadow mode
-refuses the coordinator call rather than invoking injected ports.
+External effects require the exact boolean pair `enabled is True` and
+`shadow is False`; non-boolean truthy/falsy values are rejected before the
+coordinator is reached. Shadow mode refuses the coordinator call rather than
+invoking injected ports.
 
 ## Policy
 
@@ -48,8 +50,10 @@ After fixing the boundary, an operator may call the same
 be supplied. The coordinator resumes from the last checkpoint. Stable adapter
 idempotency keys remain defense in depth, not the crash fence.
 
-Before every external effect, the ledger atomically creates a persistent
-`IN_FLIGHT` claim with an owner token. A successful adapter return is committed
+Before every external effect, the lane-internal coordinator takes an OS-backed
+effect-owner lock and the ledger atomically creates a persistent `IN_FLIGHT`
+claim with an owner token and monotonically increasing generation. A successful
+adapter return is committed only when both owner and generation still match,
 together with `APPLIED` and the next checkpoint in one SQLite transaction. A
 concurrent caller or restarted process that observes an unresolved claim raises
 `EffectReconciliationRequired` and never invokes that effect again.
@@ -67,8 +71,11 @@ Reconciliation is effectful and uses the same `enabled=True, shadow=False`
 gate as resume. It also revalidates the staged canonical repository and exact
 SHA against the current durable job. The operator must submit the exact owner
 token and generation observed for the ambiguous claim plus an explicit
-dead-owner witness. This prevents reconciliation from invalidating a live
-owner and prevents stale owners from fail-closing a reassigned generation.
+dead-owner witness. Reconciliation must also acquire the same non-blocking
+OS-backed owner lock; a lock still held by a live effect caller fails closed.
+This prevents reconciliation from invalidating a live owner and prevents stale
+owners from completing or fail-closing a reassigned generation, including when
+an owner token is reused.
 Secret-shaped receipts are rejected before persistence. Legacy effect tables
 are upgraded transactionally with the generation and reconciliation-receipt
 columns before use.
