@@ -740,6 +740,7 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
         try:
             if type(operation) is not str:
                 operation = ""
+                payload = {}
                 raise RequestPortMismatch("operation must be plain text")
             deadline = self._admit_public_call(
                 timeout_seconds=timeout_seconds,
@@ -912,6 +913,7 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
         try:
             if type(operation) is not str:
                 operation = ""
+                payload = {}
                 raise RequestPortMismatch("operation must be plain text")
             deadline = self._admit_public_call(
                 timeout_seconds=timeout_seconds,

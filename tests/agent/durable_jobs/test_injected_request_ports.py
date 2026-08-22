@@ -683,6 +683,8 @@ def test_hostile_operation_equality_baseexception_is_fail_closed(provider):
         secret_ref = _SECRET_SLACK
         payload = _slack_payload()
 
+    payload["note"] = "novel-secret-before-resolution"
+
     with pytest.raises(
         ports.RequestPortMismatch, match="operation must be plain text"
     ) as caught:
@@ -694,6 +696,7 @@ def test_hostile_operation_equality_baseexception_is_fail_closed(provider):
     assert resolver_calls == []
     assert client.calls == []
     assert port.receipts[-1]["operation"] == ""
+    assert "novel-secret-before-resolution" not in repr(port.receipts[-1])
     assert port.receipts[-1]["client_invoked"] is False
     assert port.receipts[-1]["outcome"] == "error"
 
