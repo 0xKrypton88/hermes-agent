@@ -106,6 +106,12 @@ def _as_payload(payload: Any) -> dict[str, Any]:
     # subclasses and arbitrary Mapping implementations before membership/get.
     if type(payload) is not dict:
         raise RequestPortMismatch("payload must be a plain dictionary")
+    # Even an exact built-in dict can contain attacker-controlled key objects.
+    # Built-in lookup would execute their __hash__/__eq__ and could let one
+    # masquerade as a bound identity key.  Inspect the native key iterator and
+    # fail closed before any lookup; dict.keys itself executes no key hooks.
+    if any(type(key) is not str for key in dict.keys(payload)):
+        raise RequestPortMismatch("payload must use plain text keys")
     return payload
 
 
@@ -351,39 +357,60 @@ class _FrozenDict(ABCMapping[str, Any]):
         return repr(dict(self._data))
 
 
-def _sanitize_snapshot_key(raw: Any, secret: Optional[str]) -> str:
+def _sanitize_snapshot_key(
+    raw: Any, secret: Optional[str], *, allow_hooks: bool
+) -> str:
     """Redact one copied mapping key without propagating hostile hooks."""
     if type(raw) is str:
         text = raw
-    else:
+    elif allow_hooks:
         try:
             text = str(raw)
         except BaseException:
             text = f"<{type(raw).__name__}>"
+    else:
+        # Caller-supplied payload keys are an authority boundary. Never
+        # inspect or stringify them while recording a rejected request:
+        # metaclass/type-name and __str__ hooks can leak data or raise
+        # BaseException.
+        text = "<non-text-key>"
     if secret:
         text = text.replace(secret, "[REDACTED]")
     return _redact(text)
 
 
-def _sanitize_snapshot(raw: Any, secret_value: Any = None) -> Any:
+def _sanitize_snapshot(
+    raw: Any, secret_value: Any = None, *, allow_key_hooks: bool = True
+) -> Any:
     """Recursively copy, redact the resolved value everywhere, and freeze."""
     secret = secret_value if type(secret_value) is str and secret_value else None
     if type(raw) is dict:
         return _FrozenDict(
             {
-                _sanitize_snapshot_key(key, secret): _sanitize_snapshot(value, secret)
+                _sanitize_snapshot_key(
+                    key, secret, allow_hooks=allow_key_hooks
+                ): _sanitize_snapshot(
+                    value, secret, allow_key_hooks=allow_key_hooks
+                )
                 for key, value in dict.items(raw)
             }
         )
     if type(raw) in (list, tuple, set, frozenset):
-        return tuple(_sanitize_snapshot(value, secret) for value in raw)
+        return tuple(
+            _sanitize_snapshot(value, secret, allow_key_hooks=allow_key_hooks)
+            for value in raw
+        )
     if type(raw) is _FrozenDict:
         values = object.__getattribute__(raw, "_data")
         if type(values) is not MappingProxyType:
             return _FrozenDict({"type": type(raw).__name__})
         return _FrozenDict(
             {
-                _sanitize_snapshot_key(key, secret): _sanitize_snapshot(value, secret)
+                _sanitize_snapshot_key(
+                    key, secret, allow_hooks=allow_key_hooks
+                ): _sanitize_snapshot(
+                    value, secret, allow_key_hooks=allow_key_hooks
+                )
                 for key, value in values.items()
             }
         )
@@ -529,7 +556,9 @@ class _InjectedRequestPortBase:
             receipt: dict[str, Any] = {
                 "operation": operation if type(operation) is str else "",
                 "secret_ref": offered,
-                "payload": _sanitize_snapshot(payload, secret_value),
+                "payload": _sanitize_snapshot(
+                    payload, secret_value, allow_key_hooks=False
+                ),
                 "outcome": outcome,
                 "client_invoked": bool(client_invoked),
             }
@@ -587,6 +616,9 @@ class _InjectedRequestPortBase:
 
             def worker() -> None:
                 try:
+                    # This is the final dispatch-authority gate: admission and
+                    # Thread.start() can consume the caller's remaining budget.
+                    _check_deadline(deadline=deadline, cancel_event=cancel_event)
                     # Claims may outlive the credential resolved by this caller.
                     # Cache only a credential-independent frozen snapshot.
                     claim["result"] = sanitize_result(call())
@@ -685,12 +717,86 @@ class _InjectedRequestPortBase:
         deadline: Optional[float] = None,
         cancel_event: Any = None,
     ) -> Any:
-        secret_value = _resolve_secret(self._credential_resolver, self._secret_ref)
-        # The injected resolver can block. Re-check closure and deadline after
-        # it returns and before admitting any provider worker.
-        self._ensure_open()
-        _check_deadline(deadline=deadline, cancel_event=cancel_event)
-        return secret_value
+        # Credential resolution is untrusted request-bound work and must consume
+        # the same absolute budget as provider dispatch.  Keep its worker in
+        # lifecycle accounting after a caller times out, but abandon its value
+        # so late completion can never become orphan dispatch authority.
+        state: dict[str, Any] = {"done": False, "abandoned": False}
+        with self._idle:
+            if self._closed:
+                raise RequestPortClosed("request port is closed")
+            self._active_calls += 1
+
+        def worker() -> None:
+            value = None
+            error_message = None
+            try:
+                value = _resolve_secret(self._credential_resolver, self._secret_ref)
+            except BaseException as exc:
+                if type(exc) is RequestPortError:
+                    error_message = str(exc)
+                else:
+                    error_message = "credential resolver failed"
+            finally:
+                with self._idle:
+                    if not state["abandoned"]:
+                        if error_message is not None:
+                            state["error"] = error_message
+                        elif (
+                            not self._closed
+                            and (deadline is None or time.monotonic() < deadline)
+                        ):
+                            state["value"] = value
+                    state["done"] = True
+                    self._active_calls -= 1
+                    self._idle.notify_all()
+
+        start_failed = False
+        try:
+            thread = threading.Thread(
+                target=worker,
+                name="request-port-credential-resolver",
+                daemon=True,
+            )
+            thread.start()
+        except BaseException:
+            start_failed = True
+            with self._idle:
+                self._active_calls -= 1
+                state["abandoned"] = True
+                state["done"] = True
+                self._idle.notify_all()
+        if start_failed:
+            raise RequestPortError("request worker failed to start")
+
+        try:
+            while True:
+                with self._idle:
+                    if state["done"]:
+                        break
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
+                    if remaining is not None and remaining <= 0:
+                        state["abandoned"] = True
+                        raise RequestPortTimeout("timeout")
+                    self._idle.wait(
+                        0.005 if remaining is None else min(0.005, remaining)
+                    )
+                _check_deadline(deadline=deadline, cancel_event=cancel_event)
+            self._ensure_open()
+            _check_deadline(deadline=deadline, cancel_event=cancel_event)
+        except BaseException:
+            with self._idle:
+                state["abandoned"] = True
+                state.pop("value", None)
+            raise
+
+        if "error" in state:
+            raise RequestPortError(state["error"])
+        if "value" not in state:
+            raise RequestPortTimeout("timeout")
+        return state.pop("value")
 
     def __repr__(self) -> str:
         return (

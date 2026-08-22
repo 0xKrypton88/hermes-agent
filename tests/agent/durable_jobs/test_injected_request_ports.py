@@ -656,6 +656,105 @@ def test_hostile_payload_contains_baseexception_is_fail_closed(provider):
 
 
 @pytest.mark.parametrize("provider", ("cursor", "slack"))
+def test_non_exact_dict_key_cannot_masquerade_as_workspace_id(provider):
+    ports = _load_ports()
+    resolver_calls = []
+    hostile_hooks = []
+
+    class HostileWorkspaceKey:
+        def __hash__(self):
+            hostile_hooks.append("hash")
+            return hash("workspace_id")
+
+        def __eq__(self, other):
+            hostile_hooks.append("eq")
+            return other == "workspace_id"
+
+        def __str__(self):
+            hostile_hooks.append("str")
+            return "hostile-workspace-key"
+
+    if provider == "cursor":
+        client = FakeCursorCloudClient()
+        port = _cursor_port(
+            ports,
+            client,
+            credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+        )
+        operation = "create"
+        secret_ref = _SECRET_CURSOR
+        payload = _cursor_create_payload()
+    else:
+        client = FakeSlackClient()
+        port = _slack_port(
+            ports,
+            client,
+            credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+        )
+        operation = "post_root"
+        secret_ref = _SECRET_SLACK
+        payload = _slack_payload()
+
+    del payload["workspace_id"]
+    payload[HostileWorkspaceKey()] = WORKSPACE
+    hostile_hooks.clear()
+
+    with pytest.raises(ports.RequestPortMismatch, match="plain text keys") as caught:
+        port(operation=operation, secret_ref=secret_ref, payload=payload)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert hostile_hooks == []
+    assert resolver_calls == []
+    assert client.calls == []
+    assert port.receipts[-1]["client_invoked"] is False
+    assert port.receipts[-1]["outcome"] == "error"
+    assert "hostile-workspace-key" not in repr(port.receipts[-1])
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
+
+
+def test_hostile_key_metaclass_cannot_escape_safe_rejected_payload_receipt():
+    ports = _load_ports()
+    hostile_hooks = []
+    resolver_calls = []
+
+    class HostileKeyMeta(type):
+        def __getattribute__(cls, name):
+            hostile_hooks.append(name)
+            if name == "__name__":
+                raise KeyboardInterrupt("hostile key type name")
+            return super().__getattribute__(name)
+
+    class HostileKey(metaclass=HostileKeyMeta):
+        pass
+
+    client = FakeCursorCloudClient()
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+    )
+    payload = _cursor_create_payload()
+    payload[HostileKey()] = "hostile-value"
+    hostile_hooks.clear()
+
+    with pytest.raises(ports.RequestPortMismatch, match="plain text keys") as caught:
+        port(operation="create", secret_ref=_SECRET_CURSOR, payload=payload)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert hostile_hooks == []
+    assert resolver_calls == []
+    assert client.calls == []
+    assert port.receipts[-1]["outcome"] == "error"
+    assert port.receipts[-1]["client_invoked"] is False
+    assert "<non-text-key>" in repr(port.receipts[-1]["payload"])
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
+
+
+@pytest.mark.parametrize("provider", ("cursor", "slack"))
 def test_hostile_operation_equality_baseexception_is_fail_closed(provider):
     ports = _load_ports()
     resolver_calls = []
@@ -1478,6 +1577,56 @@ def test_slack_repeated_post_claim_invokes_provider_once():
     assert [item[0] for item in client.calls] == ["chat_postMessage"]
 
 
+def test_blocked_credential_resolver_times_out_without_orphan_authority():
+    ports = _load_ports()
+    resolver_entered = threading.Event()
+    resolver_release = threading.Event()
+    resolver_calls = []
+    errors = []
+
+    def resolver(name):
+        resolver_calls.append(name)
+        resolver_entered.set()
+        assert resolver_release.wait(1)
+        return "late-resolved-credential"
+
+    client = FakeCursorCloudClient()
+    port = _cursor_port(ports, client, credential_resolver=resolver)
+
+    def call():
+        try:
+            port(
+                operation="create",
+                secret_ref=_SECRET_CURSOR,
+                payload=_cursor_create_payload(key="blocked-resolver-timeout"),
+                timeout_seconds=0.02,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=call)
+    started = time.monotonic()
+    caller.start()
+    assert resolver_entered.wait(1)
+    try:
+        caller.join(0.2)
+        assert not caller.is_alive()
+        assert time.monotonic() - started < 0.2
+        assert len(errors) == 1
+        assert isinstance(errors[0], ports.RequestPortTimeout)
+        assert resolver_calls == [_SECRET_CURSOR]
+        assert client.calls == []
+        assert port._active_calls == 1
+        assert port.close(timeout_seconds=0.01) is False
+        assert "late-resolved-credential" not in repr(port.receipts)
+    finally:
+        resolver_release.set()
+        caller.join(1)
+    assert port.close(timeout_seconds=1) is True
+    assert port._active_calls == 0
+    assert client.calls == []
+
+
 def test_inflight_cancellation_and_close_are_bounded_and_accounted():
     ports = _load_ports()
     entered = threading.Event()
@@ -2079,6 +2228,75 @@ def test_resolver_time_consumes_the_single_absolute_request_deadline(monkeypatch
     assert client.calls == []
     assert port._active_calls == 0
     assert port._claims == {}
+    assert port.close(timeout_seconds=1) is True
+
+
+@pytest.mark.parametrize("provider", ["cursor", "slack"])
+def test_provider_worker_rechecks_deadline_immediately_before_dispatch(
+    monkeypatch, provider
+):
+    import agent.durable_jobs.request_ports as request_ports_module
+
+    ports = _load_ports()
+    now = [300.0]
+    real_start = threading.Thread.start
+    provider_starts = []
+    monkeypatch.setattr(request_ports_module.time, "monotonic", lambda: now[0])
+
+    def start_after_deadline(thread):
+        if (
+            thread.name.startswith("request-port-")
+            and thread.name != "request-port-credential-resolver"
+        ):
+            provider_starts.append(thread.name)
+            now[0] = 300.2
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start_after_deadline)
+    if provider == "cursor":
+        client = FakeCursorCloudClient()
+        port = _cursor_port(ports, client)
+        operation, secret_ref, payload = (
+            "create",
+            _SECRET_CURSOR,
+            _cursor_create_payload(key="worker-start-deadline-cursor"),
+        )
+        claim_key = "cursor:create:worker-start-deadline-cursor"
+    else:
+        client = FakeSlackClient()
+        port = _slack_port(ports, client)
+        operation, secret_ref, payload = (
+            "post_root",
+            _SECRET_SLACK,
+            _slack_payload(key="worker-start-deadline-slack"),
+        )
+        claim_key = "slack:post_root:worker-start-deadline-slack"
+
+    with pytest.raises(ports.RequestPortTimeout, match="timeout"):
+        port(
+            operation=operation,
+            secret_ref=secret_ref,
+            payload=payload,
+            timeout_seconds=0.1,
+        )
+
+    assert len(provider_starts) == 1
+    assert port._claims[claim_key]["event"].wait(1)
+    assert port._active_calls == 0
+    assert client.calls == []
+
+    now[0] = 300.0
+    with pytest.raises(ports.RequestPortError, match="provider worker failed"):
+        port(
+            operation=operation,
+            secret_ref=secret_ref,
+            payload=payload,
+            timeout_seconds=0.1,
+        )
+    assert len(provider_starts) == 1
+    assert client.calls == []
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
     assert port.close(timeout_seconds=1) is True
 
 
