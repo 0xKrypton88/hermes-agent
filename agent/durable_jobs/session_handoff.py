@@ -195,45 +195,68 @@ class _EffectOwnerGuard:
 
     def __init__(
         self,
-        lock_path: Path,
+        lock_paths: tuple[Path, ...],
         *,
         job_id: str,
         handoff_id: str,
         effect_name: str,
         validate_database_identity: Any,
     ) -> None:
-        self.lock_path = lock_path
+        self.lock_paths = tuple(sorted(set(lock_paths), key=os.fspath))
         self.job_id = job_id
         self.handoff_id = handoff_id
         self.effect_name = effect_name
         self._validate_database_identity = validate_database_identity
-        self._handle: Any | None = None
+        self._handles: list[Any] = []
 
     @property
     def held(self) -> bool:
-        return self._handle is not None
+        return bool(self._handles)
+
+    @staticmethod
+    def _lock(handle: Any) -> None:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(handle: Any) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def acquire(self) -> "_EffectOwnerGuard":
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.lock_path, "a+b")
+        if self._handles:
+            return self
         try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for lock_path in self.lock_paths:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(lock_path, "a+b")
+                try:
+                    self._lock(handle)
+                except OSError:
+                    handle.close()
+                    raise
+                self._handles.append(handle)
         except OSError as exc:
-            handle.close()
+            self.release()
             raise EffectOwnershipLost("effect owner is still live") from exc
-        self._handle = handle
         try:
             self._validate_database_identity()
         except BaseException:
@@ -242,22 +265,12 @@ class _EffectOwnerGuard:
         return self
 
     def release(self) -> None:
-        handle = self._handle
-        if handle is None:
-            return
-        try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
-            self._handle = None
+        handles, self._handles = self._handles, []
+        for handle in reversed(handles):
+            try:
+                self._unlock(handle)
+            finally:
+                handle.close()
 
     def __enter__(self) -> "_EffectOwnerGuard":
         return self.acquire()
@@ -473,16 +486,19 @@ class SessionHandoffLedger:
         device, inode = self._assert_database_identity()
         database_identity = f"{device}:{inode}".encode("ascii")
         database_digest = hashlib.sha256(database_identity).hexdigest()
+        pathname_identity = os.path.normcase(
+            os.path.abspath(os.fspath(self.sqlite_path))
+        ).encode("utf-8")
+        pathname_digest = hashlib.sha256(pathname_identity).hexdigest()
         effect_identity = "\0".join((job_id, handoff_id, effect_name)).encode("utf-8")
         effect_digest = hashlib.sha256(effect_identity).hexdigest()
-        lock_path = (
-            Path(tempfile.gettempdir())
-            / "hermes-session-handoff-effect-locks"
-            / database_digest
-            / f"{effect_digest}.lock"
+        lock_root = Path(tempfile.gettempdir()) / "hermes-session-handoff-effect-locks"
+        lock_paths = (
+            lock_root / "database" / database_digest / f"{effect_digest}.lock",
+            lock_root / "pathname" / pathname_digest / f"{effect_digest}.lock",
         )
         return _EffectOwnerGuard(
-            lock_path,
+            lock_paths,
             job_id=job_id,
             handoff_id=handoff_id,
             effect_name=effect_name,
