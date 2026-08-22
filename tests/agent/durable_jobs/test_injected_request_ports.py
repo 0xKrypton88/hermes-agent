@@ -501,6 +501,109 @@ def test_client_class_mutation_during_resolution_is_revalidated_before_worker_ca
     assert port.close(timeout_seconds=1) is True
 
 
+def test_client_function_code_mutation_during_resolution_uses_bound_behavior_and_claim():
+    ports = _load_ports()
+    resolver_calls = []
+
+    class MutableCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            return FakeCursorCloudClient.create_agent(self, payload)
+
+    def hostile_create_agent(self, payload):
+        self.calls.append(("hostile_create_agent", payload))
+        return {"agentId": "forged-by-mutated-code"}
+
+    client = MutableCursor()
+    original_code = MutableCursor.create_agent.__code__
+
+    def resolver(name):
+        resolver_calls.append(name)
+        MutableCursor.create_agent.__code__ = hostile_create_agent.__code__
+        return CURSOR_SECRET_VALUE
+
+    port = _cursor_port(ports, client, credential_resolver=resolver)
+    payload = _cursor_create_payload("in-place-code-resolver")
+    try:
+        result = port(
+            operation="create",
+            secret_ref=_SECRET_CURSOR,
+            payload=payload,
+        )
+    finally:
+        MutableCursor.create_agent.__code__ = original_code
+
+    assert result["agentId"] == _cursor_ids("in-place-code-resolver")[1]
+    assert resolver_calls == [_SECRET_CURSOR]
+    assert [call[0] for call in client.calls] == ["create_agent"]
+    assert port.receipts[-1]["outcome"] == "ok"
+    assert port.receipts[-1]["client_invoked"] is True
+
+    duplicate = port(
+        operation="create",
+        secret_ref=_SECRET_CURSOR,
+        payload=payload,
+    )
+    assert duplicate == result
+    assert resolver_calls == [_SECRET_CURSOR]
+    assert [call[0] for call in client.calls] == ["create_agent"]
+    assert port.receipts[-1]["outcome"] == "ok"
+    assert port.receipts[-1]["client_invoked"] is False
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
+    assert port.close(timeout_seconds=1) is True
+
+
+def test_client_function_code_mutation_at_worker_start_uses_bound_behavior(
+    monkeypatch,
+):
+    ports = _load_ports()
+    resolver_calls = []
+    mutation_points = []
+
+    class MutableCursor(FakeCursorCloudClient):
+        def create_agent(self, payload):
+            return FakeCursorCloudClient.create_agent(self, payload)
+
+    def hostile_create_agent(self, payload):
+        self.calls.append(("hostile_create_agent", payload))
+        return {"agentId": "forged-by-worker-race"}
+
+    client = MutableCursor()
+    original_code = MutableCursor.create_agent.__code__
+    real_start = threading.Thread.start
+
+    def mutate_before_worker_start(thread):
+        if thread.name.startswith("request-port-cursor:create:"):
+            mutation_points.append(thread.name)
+            MutableCursor.create_agent.__code__ = hostile_create_agent.__code__
+        return real_start(thread)
+
+    port = _cursor_port(
+        ports,
+        client,
+        credential_resolver=lambda name: resolver_calls.append(name)
+        or CURSOR_SECRET_VALUE,
+    )
+    monkeypatch.setattr(threading.Thread, "start", mutate_before_worker_start)
+    try:
+        result = port(
+            operation="create",
+            secret_ref=_SECRET_CURSOR,
+            payload=_cursor_create_payload("in-place-code-worker"),
+        )
+    finally:
+        MutableCursor.create_agent.__code__ = original_code
+
+    assert len(mutation_points) == 1
+    assert result["agentId"] == _cursor_ids("in-place-code-worker")[1]
+    assert resolver_calls == [_SECRET_CURSOR]
+    assert [call[0] for call in client.calls] == ["create_agent"]
+    assert port.receipts[-1]["outcome"] == "ok"
+    assert port.receipts[-1]["client_invoked"] is True
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
+
+
 def test_missing_resolver_denies_preflight_and_direct_request_but_positive_resolves_once(
     tmp_path,
 ):

@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections.abc import Iterator, Mapping as ABCMapping
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
 from agent.durable_jobs.config import validate_secret_ref_name
@@ -71,7 +71,7 @@ def _require_text(value: Any, field: str) -> str:
 
 def _require_client(
     client: Any, methods: tuple[str, ...]
-) -> tuple[Any, Mapping[str, tuple[Any, bool]]]:
+) -> tuple[Any, Mapping[str, tuple[Any, bool, Any]]]:
     if client is None:
         raise TypeError(
             "injected client is required; no HTTP/SDK client is constructed"
@@ -83,7 +83,7 @@ def _require_client(
     if lookup is not object.__getattribute__:
         raise TypeError("injected client requires static client lookup")
     missing = []
-    capabilities: dict[str, tuple[Any, bool]] = {}
+    capabilities: dict[str, tuple[Any, bool, Any]] = {}
     for name in methods:
         try:
             seam = inspect.getattr_static(client, name)
@@ -100,7 +100,26 @@ def _require_client(
             class_seam = inspect.getattr_static(type(client), name)
         except BaseException:
             class_seam = None
-        capabilities[name] = (seam, seam is class_seam)
+        if inspect.isfunction(seam):
+            # A function object is mutable in place: identity remains stable
+            # while __code__, __defaults__, or __kwdefaults__ can be replaced.
+            # Invoke a construction-time private clone so later mutation of the
+            # client-visible function cannot alter the authorized behavior.
+            invocation = FunctionType(
+                seam.__code__,
+                seam.__globals__,
+                seam.__name__,
+                None if seam.__defaults__ is None else tuple(seam.__defaults__),
+                seam.__closure__,
+            )
+            invocation.__kwdefaults__ = (
+                None if seam.__kwdefaults__ is None else dict(seam.__kwdefaults__)
+            )
+        else:
+            # Builtin function/method objects do not expose the mutable Python
+            # function surfaces above and are already the concrete capability.
+            invocation = seam
+        capabilities[name] = (seam, seam is class_seam, invocation)
     if missing:
         raise TypeError(
             "injected client is missing required seam methods: "
@@ -194,20 +213,20 @@ def _unwrap_response(result: Any) -> Any:
 
 def _client_method(
     client: Any,
-    capabilities: Mapping[str, tuple[Any, bool]],
+    capabilities: Mapping[str, tuple[Any, bool, Any]],
     method_name: str,
-) -> tuple[Any, bool]:
+) -> tuple[Any, bool, Any]:
     capability = capabilities.get(method_name)
     if capability is None:
         raise RequestPortError(f"injected client is missing {method_name}")
-    expected, _pass_client = capability
+    expected, _pass_client, invocation = capability
     try:
         current = inspect.getattr_static(client, method_name)
     except BaseException:
         current = None
     if current is not expected:
         raise RequestPortError(f"injected client capability changed: {method_name}")
-    if inspect.iscoroutinefunction(expected):
+    if inspect.iscoroutinefunction(invocation):
         raise RequestPortError(
             "async client methods are not invoked from request ports"
         )
@@ -216,13 +235,13 @@ def _client_method(
 
 def _invoke(
     client: Any,
-    capability: tuple[Any, bool],
+    capability: tuple[Any, bool, Any],
     *args: Any,
     _secret_value: Any = None,
     _invocation_state: Optional[dict[str, bool]] = None,
     **kwargs: Any,
 ) -> Any:
-    method, pass_client = capability
+    _expected, pass_client, method = capability
     lane_closed = False
     provider_error_message = None
     provider_base_failed = False
@@ -484,7 +503,7 @@ class _InjectedRequestPortBase:
             raise ValueError("permanent write claim capacity must be positive")
         self._write_claim_capacity = capacity
 
-    def _client_method(self, method_name: str) -> tuple[Any, bool]:
+    def _client_method(self, method_name: str) -> tuple[Any, bool, Any]:
         return _client_method(
             self._client, self._client_capabilities, method_name
         )
@@ -996,7 +1015,7 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
                 secret_ref=secret_ref,
                 payload=payload,
                 outcome="ok",
-                client_invoked=True,
+                client_invoked=invocation_state["started"],
                 response=result,
                 secret_value=secret_value,
             )
@@ -1156,7 +1175,7 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
                 secret_ref=secret_ref,
                 payload=payload,
                 outcome="ok",
-                client_invoked=True,
+                client_invoked=invocation_state["started"],
                 response=result,
                 secret_value=secret_value,
             )
