@@ -613,6 +613,48 @@ def test_cursor_identity_mismatch_is_fail_closed():
     assert all(item["client_invoked"] is False for item in port.receipts)
 
 
+@pytest.mark.parametrize("provider", ("cursor", "slack"))
+def test_hostile_payload_contains_baseexception_is_fail_closed(provider):
+    ports = _load_ports()
+    resolver_calls = []
+
+    class HostilePayload(dict):
+        def __contains__(self, _key):
+            raise KeyboardInterrupt("hostile-payload")
+
+    if provider == "cursor":
+        client = FakeCursorCloudClient()
+        port = _cursor_port(
+            ports,
+            client,
+            credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+        )
+        operation = "create"
+        secret_ref = _SECRET_CURSOR
+        payload = HostilePayload(_cursor_create_payload())
+    else:
+        client = FakeSlackClient()
+        port = _slack_port(
+            ports,
+            client,
+            credential_resolver=lambda name: resolver_calls.append(name) or "unused",
+        )
+        operation = "post_root"
+        secret_ref = _SECRET_SLACK
+        payload = HostilePayload(_slack_payload())
+
+    with pytest.raises(ports.RequestPortMismatch, match="plain dictionary") as caught:
+        port(operation=operation, secret_ref=secret_ref, payload=payload)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "hostile-payload" not in str(caught.value)
+    assert resolver_calls == []
+    assert client.calls == []
+    assert port.receipts[-1]["client_invoked"] is False
+    assert port.receipts[-1]["outcome"] == "error"
+
+
 def test_slack_identity_mismatch_is_fail_closed():
     ports = _load_ports()
     client = FakeSlackClient()

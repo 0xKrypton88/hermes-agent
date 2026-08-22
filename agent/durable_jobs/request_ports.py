@@ -100,9 +100,12 @@ def _require_client(client: Any, methods: tuple[str, ...]) -> Any:
     return client
 
 
-def _as_payload(payload: Any) -> Mapping[str, Any]:
-    if not isinstance(payload, Mapping):
-        raise RequestPortMismatch("payload must be a mapping")
+def _as_payload(payload: Any) -> dict[str, Any]:
+    # Payload validation must not execute attacker-controlled Mapping hooks.
+    # The public request contract requires a plain built-in dictionary; reject
+    # subclasses and arbitrary Mapping implementations before membership/get.
+    if type(payload) is not dict:
+        raise RequestPortMismatch("payload must be a plain dictionary")
     return payload
 
 
