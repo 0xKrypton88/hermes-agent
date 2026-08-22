@@ -7,12 +7,14 @@ External effects require the exact boolean pair `enabled is True` and
 `shadow is False`; non-boolean truthy/falsy values are rejected before the
 coordinator is constructed. The effectful coordinator exists only in the
 authorized lane method's local scope, so it cannot be imported and called
-around activation, identity, or mutation-lease checks. The ledger exposes only
-read and owner-guard operations as public methods; all durable mutation helpers
-are private and are invoked only by that lane-local coordinator or the lane's
-authorized reconciliation path. This prevents callers from using the public
-ledger API to forge completed effects without invoking their adapters. Shadow
-mode refuses the coordinator call rather than invoking injected ports.
+around activation, identity, or mutation-lease checks. A normally constructed
+ledger is read-only: every durable mutation helper also requires an opaque,
+identity-checked mutation authority issued only for the lane-local coordinator
+or the lane's authorized reconciliation path while the lane mutation lease is
+held. Renaming helpers private is not treated as authorization. This prevents a
+caller that merely constructs a ledger from forging completed effects without
+invoking adapters. Shadow mode refuses the coordinator call rather than
+invoking injected ports.
 
 ## Policy
 

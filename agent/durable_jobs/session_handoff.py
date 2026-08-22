@@ -191,6 +191,29 @@ class EffectOwnershipLost(RuntimeError):
     pass
 
 
+class HandoffMutationUnauthorized(RuntimeError):
+    """A read-only ledger was asked to mutate durable handoff state."""
+
+
+_MUTATION_AUTHORITY_ISSUER = object()
+
+
+class _HandoffMutationAuthority:
+    """Process-local capability issued only to the durable lane coordinator."""
+
+    __slots__ = ()
+
+    def __init__(self, issuer: object) -> None:
+        if issuer is not _MUTATION_AUTHORITY_ISSUER:
+            raise HandoffMutationUnauthorized(
+                "handoff mutation authority must be issued by the durable lane"
+            )
+
+
+def _issue_handoff_mutation_authority() -> _HandoffMutationAuthority:
+    return _HandoffMutationAuthority(_MUTATION_AUTHORITY_ISSUER)
+
+
 class _EffectOwnerGuard:
     """OS-backed witness that no live coordinator owns this effect."""
 
@@ -389,7 +412,17 @@ def _validate_receipt(receipt: str) -> None:
 class SessionHandoffLedger:
     """Canonical state in the existing durable lane's SQLite database."""
 
-    def __init__(self, sqlite_path: Any) -> None:
+    def __init__(
+        self,
+        sqlite_path: Any,
+        *,
+        mutation_authority: _HandoffMutationAuthority | None = None,
+    ) -> None:
+        if mutation_authority is not None and not isinstance(
+            mutation_authority, _HandoffMutationAuthority
+        ):
+            raise HandoffMutationUnauthorized("invalid handoff mutation authority")
+        self._mutation_authority = mutation_authority
         self.sqlite_path = sqlite_path
         database = Path(sqlite_path)
         try:
@@ -454,6 +487,12 @@ class SessionHandoffLedger:
                     "ALTER TABLE session_handoff_effects "
                     "ADD COLUMN reconciliation_receipt TEXT"
                 )
+
+    def _require_mutation_authority(self) -> None:
+        if self._mutation_authority is None:
+            raise HandoffMutationUnauthorized(
+                "handoff ledger mutations require a lane-issued authority"
+            )
 
     def _path_identity(self) -> tuple[int, int]:
         stat = Path(self.sqlite_path).stat()
@@ -539,6 +578,7 @@ class SessionHandoffLedger:
     def _stage(
         self, job_id: str, parent_session_id: str, handoff: SessionHandoff
     ) -> HandoffState:
+        self._require_mutation_authority()
         canonical = handoff.canonical_json()
         digest = self._hash(canonical)
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -595,6 +635,7 @@ class SessionHandoffLedger:
         *,
         owner_token: str,
     ) -> EffectClaim:
+        self._require_mutation_authority()
         if effect_name not in _EFFECT_NAMES:
             raise ValueError("unsupported handoff effect")
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", owner_token):
@@ -681,6 +722,7 @@ class SessionHandoffLedger:
         expected_generation: int,
         receipt: str | None = None,
     ) -> HandoffState:
+        self._require_mutation_authority()
         if effect_name not in _EFFECT_TARGETS:
             raise ValueError("unsupported handoff effect")
         target_stage, receipt_field = _EFFECT_TARGETS[effect_name]
@@ -769,6 +811,7 @@ class SessionHandoffLedger:
         owner_guard: _EffectOwnerGuard,
     ) -> HandoffState:
         """Resolve an ambiguous effect only after an operator verifies its outcome."""
+        self._require_mutation_authority()
         if effect_name not in _EFFECT_TARGETS:
             raise ValueError("unsupported handoff effect")
         if outcome not in {"APPLIED", "NOT_APPLIED"}:
@@ -893,6 +936,7 @@ class SessionHandoffLedger:
     def _advance(
         self, job_id: str, handoff_id: str, stage: str, **values: Any
     ) -> HandoffState:
+        self._require_mutation_authority()
         if stage != "COMPLETE" or values:
             raise ValueError(
                 "effect stages require complete_effect or reconcile_effect"
@@ -930,6 +974,7 @@ class SessionHandoffLedger:
 
     def _resume_failed(self, job_id: str, handoff_id: str) -> HandoffState:
         """Explicitly release the persisted fail-closed fence for manual resume."""
+        self._require_mutation_authority()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             unresolved = conn.execute(
@@ -977,6 +1022,7 @@ class SessionHandoffLedger:
         expected_owner_token: str | None = None,
         expected_generation: int | None = None,
     ) -> HandoffState:
+        self._require_mutation_authority()
         # Persist only exception type, never raw provider text/prompt/reasoning/secrets.
         safe_reason = reason[:128]
         with self._connect() as conn:

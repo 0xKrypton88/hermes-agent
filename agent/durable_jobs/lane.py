@@ -372,6 +372,7 @@ class DurableLaneService:
             SessionHandoffLedger,
             UnsafeHandoffWaypoint,
             _EffectOwnerGuard,
+            _issue_handoff_mutation_authority,
             _MANUAL_RESUME,
             _STAGE_INDEX,
         )
@@ -599,8 +600,11 @@ class DurableLaneService:
                 "handoff requires a matching non-empty durable job baseline SHA"
             )
         with self._mutation_lease():
+            mutation_authority = _issue_handoff_mutation_authority()
             return _SessionHandoffCoordinator(
-                ledger=SessionHandoffLedger(store.sqlite_path),
+                ledger=SessionHandoffLedger(
+                    store.sqlite_path, mutation_authority=mutation_authority
+                ),
                 linear=linear,
                 slack=slack,
                 sessions=sessions,
@@ -630,6 +634,7 @@ class DurableLaneService:
         from agent.durable_jobs.session_handoff import (
             HandoffIdentityMismatch,
             SessionHandoffLedger,
+            _issue_handoff_mutation_authority,
         )
 
         if handoff_config.enabled is not True or handoff_config.shadow is not False:
@@ -641,7 +646,10 @@ class DurableLaneService:
             job = store.get_job(job_id)
             if job is None:
                 raise KeyError(job_id)
-            ledger = SessionHandoffLedger(store.sqlite_path)
+            ledger = SessionHandoffLedger(
+                store.sqlite_path,
+                mutation_authority=_issue_handoff_mutation_authority(),
+            )
             state = ledger.get(job_id, handoff_id)
             if state is None:
                 raise KeyError(handoff_id)
