@@ -738,6 +738,9 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
         write_claim: Optional[dict[str, Any]] = None
         write_claim_owner = False
         try:
+            if type(operation) is not str:
+                operation = ""
+                raise RequestPortMismatch("operation must be plain text")
             deadline = self._admit_public_call(
                 timeout_seconds=timeout_seconds,
                 cancel_event=cancel_event,
@@ -907,6 +910,9 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
         write_claim: Optional[dict[str, Any]] = None
         write_claim_owner = False
         try:
+            if type(operation) is not str:
+                operation = ""
+                raise RequestPortMismatch("operation must be plain text")
             deadline = self._admit_public_call(
                 timeout_seconds=timeout_seconds,
                 cancel_event=cancel_event,
