@@ -14,9 +14,10 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Protocol
-from uuid import uuid4
+
 
 from agent.durable_jobs.redaction import redact_secret_text
 
@@ -416,11 +417,19 @@ class SessionHandoffLedger:
     def effect_owner_guard(
         self, job_id: str, handoff_id: str, effect_name: str
     ) -> _EffectOwnerGuard:
-        identity = "\0".join((job_id, handoff_id, effect_name)).encode("utf-8")
-        digest = hashlib.sha256(identity).hexdigest()
         database = Path(self.sqlite_path)
+        stat = database.stat()
+        if stat.st_ino == 0:
+            raise RuntimeError("database file identity is unavailable")
+        database_identity = f"{stat.st_dev}:{stat.st_ino}".encode("ascii")
+        database_digest = hashlib.sha256(database_identity).hexdigest()
+        effect_identity = "\0".join((job_id, handoff_id, effect_name)).encode("utf-8")
+        effect_digest = hashlib.sha256(effect_identity).hexdigest()
         lock_path = (
-            database.parent / f".{database.name}.effect-locks" / f"{digest}.lock"
+            Path(tempfile.gettempdir())
+            / "hermes-session-handoff-effect-locks"
+            / database_digest
+            / f"{effect_digest}.lock"
         )
         return _EffectOwnerGuard(
             lock_path,
@@ -920,193 +929,3 @@ class SessionHandoffLedger:
                 ),
             )
         return self.get(job_id, handoff_id)  # type: ignore[return-value]
-
-
-class _SessionHandoffCoordinator:
-    def __init__(
-        self,
-        *,
-        ledger: SessionHandoffLedger,
-        linear: LinearHandoffProjection,
-        slack: SlackHandoffProjection,
-        sessions: ChildSessionPort,
-    ) -> None:
-        self.ledger = ledger
-        self.linear = linear
-        self.slack = slack
-        self.sessions = sessions
-
-    def _claim_effect(
-        self, job_id: str, handoff_id: str, effect_name: str
-    ) -> tuple[EffectClaim, _EffectOwnerGuard]:
-        guard = self.ledger.effect_owner_guard(job_id, handoff_id, effect_name)
-        try:
-            guard.acquire()
-        except EffectOwnershipLost as exc:
-            raise EffectReconciliationRequired(
-                f"{effect_name} has a live effect owner"
-            ) from exc
-        owner_token = uuid4().hex
-        try:
-            claim = self.ledger.claim_effect(
-                job_id,
-                handoff_id,
-                effect_name,
-                owner_token=owner_token,
-            )
-            if not claim.acquired:
-                raise EffectReconciliationRequired(
-                    f"{effect_name} is {claim.status}; reconcile its durable claim before resume"
-                )
-            return claim, guard
-        except BaseException:
-            guard.release()
-            raise
-
-    def _complete_effect(
-        self,
-        claim: EffectClaim,
-        guard: _EffectOwnerGuard,
-        *,
-        receipt: str | None = None,
-    ) -> HandoffState:
-        try:
-            return self.ledger.complete_effect(
-                claim.job_id,
-                claim.handoff_id,
-                claim.effect_name,
-                owner_token=claim.owner_token or "",
-                expected_generation=claim.generation,
-                receipt=receipt,
-            )
-        finally:
-            guard.release()
-
-    def resume(
-        self,
-        *,
-        job_id: str,
-        parent_session_id: str,
-        handoff: SessionHandoff,
-        waypoint: SemanticWaypoint,
-        pressure: HandoffPressure,
-        manual_resume: bool = False,
-    ) -> HandoffState:
-        if type(manual_resume) is not bool:
-            raise ValueError("manual_resume must be a boolean")
-        if not waypoint.safe:
-            raise UnsafeHandoffWaypoint(
-                "handoff requires a verified safe semantic waypoint"
-            )
-        if not pressure.armed:
-            raise HandoffNotArmed(
-                "session handoff has not reached its configured soft threshold"
-            )
-        key = handoff.idempotency_key
-        if redact_secret_text(key) != key:
-            raise HandoffIdentityMismatch(
-                "handoff idempotency key must not contain secret-bearing text"
-            )
-        if redact_secret_text(handoff.issue) != handoff.issue or not re.fullmatch(
-            r"[A-Z][A-Z0-9]*-[1-9][0-9]*", handoff.issue
-        ):
-            raise HandoffIdentityMismatch(
-                "issue must be a secret-free Linear identifier"
-            )
-        state = self.ledger.stage(job_id, parent_session_id, handoff)
-        if state.failure_reason and not manual_resume:
-            raise ManualResumeRequired(state.manual_resume_action or _MANUAL_RESUME)
-        if state.failure_reason:
-            state = self.ledger.resume_failed(job_id, handoff.handoff_id)
-        canonical = self.ledger.canonical(job_id, handoff.handoff_id)
-        canonical_payload = json.loads(canonical)
-        safe_resume_pointer = str(canonical_payload["resume_pointer"])
-        safe_next_action = str(canonical_payload["next_action"])
-        active_claim: EffectClaim | None = None
-        active_guard: _EffectOwnerGuard | None = None
-        try:
-            if _STAGE_INDEX[state.stage] < _STAGE_INDEX["LINEAR_VERIFIED"]:
-                active_claim, active_guard = self._claim_effect(
-                    job_id, handoff.handoff_id, "LINEAR_UPSERT"
-                )
-                receipt = self.linear.upsert_handoff(
-                    issue=handoff.issue,
-                    canonical=canonical,
-                    idempotency_key=f"{key}:linear",
-                )
-                if self.linear.read_handoff(issue=handoff.issue) != canonical:
-                    raise ProjectionVerificationError("Linear readback mismatch")
-                state = self._complete_effect(
-                    active_claim, active_guard, receipt=receipt
-                )
-                active_guard = None
-            if _STAGE_INDEX[state.stage] < _STAGE_INDEX["SLACK_RECEIPTED"]:
-                active_claim, active_guard = self._claim_effect(
-                    job_id, handoff.handoff_id, "SLACK_RECEIPT"
-                )
-                receipt = self.slack.post_handoff_receipt(
-                    handoff_id=handoff.handoff_id,
-                    resume_pointer=safe_resume_pointer,
-                    idempotency_key=f"{key}:slack",
-                )
-                state = self._complete_effect(
-                    active_claim, active_guard, receipt=receipt
-                )
-                active_guard = None
-            if _STAGE_INDEX[state.stage] < _STAGE_INDEX["CHILD_CREATED"]:
-                active_claim, active_guard = self._claim_effect(
-                    job_id, handoff.handoff_id, "CHILD_CREATE"
-                )
-                child = self.sessions.find_or_create_child(
-                    parent_session_id=parent_session_id,
-                    handoff_id=handoff.handoff_id,
-                    idempotency_key=f"{key}:child",
-                )
-                state = self._complete_effect(active_claim, active_guard, receipt=child)
-                active_guard = None
-            child_id = state.child_session_id
-            if not child_id:
-                raise ProjectionVerificationError("child session receipt missing")
-            if _STAGE_INDEX[state.stage] < _STAGE_INDEX["HANDOFF_INJECTED"]:
-                active_claim, active_guard = self._claim_effect(
-                    job_id, handoff.handoff_id, "HANDOFF_INJECT"
-                )
-                self.sessions.inject_handoff(
-                    child_session_id=child_id,
-                    canonical=canonical,
-                    idempotency_key=f"{key}:inject",
-                )
-                state = self._complete_effect(active_claim, active_guard)
-                active_guard = None
-            if _STAGE_INDEX[state.stage] < _STAGE_INDEX["FIRST_TURN_STARTED"]:
-                active_claim, active_guard = self._claim_effect(
-                    job_id, handoff.handoff_id, "FIRST_TURN_START"
-                )
-                self.sessions.start_first_turn(
-                    child_session_id=child_id,
-                    next_action=safe_next_action,
-                    idempotency_key=f"{key}:first-turn",
-                )
-                state = self._complete_effect(active_claim, active_guard)
-                active_guard = None
-            if state.stage != "COMPLETE":
-                state = self.ledger.advance(job_id, handoff.handoff_id, "COMPLETE")
-            return state
-        except EffectReconciliationRequired:
-            raise
-        except Exception as exc:
-            if active_claim is None:
-                self.ledger.fail_closed(job_id, handoff.handoff_id, type(exc).__name__)
-            else:
-                self.ledger.fail_closed(
-                    job_id,
-                    handoff.handoff_id,
-                    type(exc).__name__,
-                    effect_name=active_claim.effect_name,
-                    expected_owner_token=active_claim.owner_token,
-                    expected_generation=active_claim.generation,
-                )
-            raise
-        finally:
-            if active_guard is not None:
-                active_guard.release()

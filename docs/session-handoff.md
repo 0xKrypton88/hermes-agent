@@ -5,8 +5,10 @@ database and mutation lease. It is inactive by default and has no live Linear,
 Slack, child-session, or provider client. Those boundaries are injected ports.
 External effects require the exact boolean pair `enabled is True` and
 `shadow is False`; non-boolean truthy/falsy values are rejected before the
-coordinator is reached. Shadow mode refuses the coordinator call rather than
-invoking injected ports.
+coordinator is constructed. The effectful coordinator exists only in the
+authorized lane method's local scope, so it cannot be imported and called
+around activation, identity, or mutation-lease checks. Shadow mode refuses the
+coordinator call rather than invoking injected ports.
 
 ## Policy
 
@@ -75,7 +77,10 @@ dead-owner witness. Reconciliation must also acquire the same non-blocking
 OS-backed owner lock; a lock still held by a live effect caller fails closed.
 This prevents reconciliation from invalidating a live owner and prevents stale
 owners from completing or fail-closing a reassigned generation, including when
-an owner token is reused.
+an owner token is reused. The lock namespace is derived from the SQLite file's
+filesystem identity (device plus inode/file index), not its pathname, so
+symlink, relative-path, and hardlink aliases of the same database contend on
+the same owner lock.
 Secret-shaped receipts are rejected before persistence. Legacy effect tables
 are upgraded transactionally with the generation and reconciliation-receipt
 columns before use.

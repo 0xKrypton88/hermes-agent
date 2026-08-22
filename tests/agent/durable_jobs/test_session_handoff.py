@@ -1321,10 +1321,43 @@ def test_stale_generation_cannot_complete_reclaimed_effect_with_reused_owner(tmp
     assert ledger.get(job.job_id, "ho_123").stage == "STAGED"
 
 
-def test_effect_coordinator_is_not_a_public_authorization_bypass():
+def test_effect_coordinator_is_not_importable_authorization_bypass():
+    import pytest
+
     import agent.durable_jobs.session_handoff as session_handoff
 
     assert not hasattr(session_handoff, "SessionHandoffCoordinator")
+    assert not hasattr(session_handoff, "_SessionHandoffCoordinator")
+    with pytest.raises(ImportError):
+        exec(
+            "from agent.durable_jobs.session_handoff import _SessionHandoffCoordinator",
+            {},
+        )
+
+
+def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
+    tmp_path,
+):
+    import os
+
+    import pytest
+
+    from agent.durable_jobs.session_handoff import (
+        EffectOwnershipLost,
+        SessionHandoffLedger,
+    )
+
+    real_path = tmp_path / "real" / "jobs.sqlite"
+    alias_path = tmp_path / "alias" / "same-database.sqlite"
+    real_path.parent.mkdir()
+    alias_path.parent.mkdir()
+    real_ledger = SessionHandoffLedger(real_path)
+    os.link(real_path, alias_path)
+    alias_ledger = SessionHandoffLedger(alias_path)
+
+    with real_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
+        with pytest.raises(EffectOwnershipLost):
+            alias_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT").acquire()
 
 
 def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_path):
