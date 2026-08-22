@@ -657,12 +657,11 @@ class _InjectedRequestPortBase:
         *,
         secret_ref: str,
         payload: Any,
-        timeout_seconds: Any = None,
         deadline: Optional[float] = None,
         cancel_event: Any = None,
     ) -> Mapping[str, Any]:
         _check_deadline(
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=None,
             deadline=deadline,
             cancel_event=cancel_event,
         )
@@ -744,7 +743,6 @@ class CursorCloudInjectedRequestPort(_InjectedRequestPortBase):
             body = self._validate_common(
                 secret_ref=secret_ref,
                 payload=payload,
-                timeout_seconds=timeout_seconds,
                 deadline=deadline,
                 cancel_event=cancel_event,
             )
@@ -914,7 +912,6 @@ class SlackInjectedRequestPort(_InjectedRequestPortBase):
             body = self._validate_common(
                 secret_ref=secret_ref,
                 payload=payload,
-                timeout_seconds=timeout_seconds,
                 deadline=deadline,
                 cancel_event=cancel_event,
             )

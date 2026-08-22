@@ -1485,6 +1485,54 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
     assert port._active_calls == 0
 
 
+@pytest.mark.parametrize("provider", ("cursor", "slack"))
+def test_hostile_timeout_is_converted_once(provider):
+    ports = _load_ports()
+    marker = "synthetic-timeout-marker"
+
+    class Timeout:
+        calls = 0
+
+        def __float__(self):
+            self.calls += 1
+            if self.calls > 1:
+                raise KeyboardInterrupt(marker)
+            return 1.0
+
+    timeout = Timeout()
+    resolver_calls = []
+
+    def resolver(name):
+        resolver_calls.append(name)
+        return "secret"
+
+    if provider == "cursor":
+        client = FakeCursorCloudClient()
+        port = _cursor_port(ports, client, credential_resolver=resolver)
+        operation = "create"
+        secret_ref = _SECRET_CURSOR
+        payload = _cursor_create_payload()
+    else:
+        client = FakeSlackClient()
+        port = _slack_port(ports, client, credential_resolver=resolver)
+        operation = "post_root"
+        secret_ref = _SECRET_SLACK
+        payload = _slack_payload()
+    result = port(
+        operation=operation,
+        secret_ref=secret_ref,
+        payload=payload,
+        timeout_seconds=timeout,
+    )
+
+    assert result is not None
+    assert timeout.calls == 1
+    assert resolver_calls == [secret_ref]
+    assert len(client.calls) == 1
+    assert port._active_calls == 0
+    assert port.close(timeout_seconds=1) is True
+
+
 @pytest.mark.parametrize(
     ("provider", "operation"),
     (
