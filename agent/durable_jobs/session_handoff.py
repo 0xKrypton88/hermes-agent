@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -200,6 +201,61 @@ class HandoffMutationUnauthorized(RuntimeError):
 _MUTATION_AUTHORITY_ISSUER = object()
 
 
+def _build_handoff_authority_validator_cell():
+    validator = None
+
+    def seal(candidate: Any) -> None:
+        nonlocal validator
+        if validator is not None:
+            raise HandoffMutationUnauthorized(
+                "handoff authority validator is already sealed"
+            )
+        validator = candidate
+
+    def validate(ticket: object, sqlite_path: Any, job_id: str) -> bool:
+        if validator is None:
+            return False
+        return bool(validator(ticket, sqlite_path, job_id))
+
+    return seal, validate
+
+
+(
+    _seal_handoff_authority_validator,
+    _validate_handoff_authority_ticket,
+) = _build_handoff_authority_validator_cell()
+del _build_handoff_authority_validator_cell
+
+
+def _build_handoff_authority_constructor_guard(issuer: object):
+    def guarded(operation: Any) -> Any:
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            kwargs["_sealed_issuer"] = issuer
+            return operation(self, *args, **kwargs)
+
+        wrapper.__name__ = operation.__name__
+        wrapper.__qualname__ = operation.__qualname__
+        wrapper.__doc__ = operation.__doc__
+        wrapper.__module__ = operation.__module__
+        wrapper.__annotations__ = operation.__annotations__
+        signature = inspect.signature(operation)
+        wrapper.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.name != "_sealed_issuer"
+            ]
+        )
+        return wrapper
+
+    return guarded
+
+
+_handoff_authority_constructor_guarded = _build_handoff_authority_constructor_guard(
+    _MUTATION_AUTHORITY_ISSUER
+)
+
+
 class _HandoffMutationAuthority:
     """Exact-lease ticket bound to one thread, database, and durable job."""
 
@@ -210,10 +266,16 @@ class _HandoffMutationAuthority:
         "_ticket",
     )
 
+    @_handoff_authority_constructor_guarded
     def __init__(
-        self, issuer: object, lease_witness: Any, sqlite_path: Any, job_id: str
+        self,
+        issuer: object,
+        lease_witness: Any,
+        sqlite_path: Any,
+        job_id: str,
+        _sealed_issuer: object | None = None,
     ) -> None:
-        if issuer is not _MUTATION_AUTHORITY_ISSUER:
+        if issuer is not _sealed_issuer:
             raise HandoffMutationUnauthorized(
                 "handoff mutation authority must be issued by the durable lane"
             )
@@ -222,21 +284,26 @@ class _HandoffMutationAuthority:
         self._sqlite_path = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
         self._job_id = str(job_id)
 
-    def valid_for(self, sqlite_path: Any, job_id: Optional[str] = None) -> bool:
+    def valid_for(
+        self,
+        sqlite_path: Any,
+        job_id: Optional[str] = None,
+        _validate_ticket: Any = _validate_handoff_authority_ticket,
+    ) -> bool:
         try:
             requested_job = self._job_id if job_id is None else str(job_id)
-            from agent.durable_jobs.lane import _validate_handoff_mutation_ticket
-
             return (
                 self._sqlite_path
                 == os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
                 and self._job_id == requested_job
-                and _validate_handoff_mutation_ticket(
-                    self._ticket, sqlite_path, requested_job
-                )
+                and _validate_ticket(self._ticket, sqlite_path, requested_job)
             )
         except (AttributeError, TypeError):
             return False
+
+
+del _handoff_authority_constructor_guarded
+del _build_handoff_authority_constructor_guard
 
 
 class _EffectOwnerGuard:
@@ -427,7 +494,36 @@ _EFFECT_TARGETS = {
 _MANUAL_RESUME = "Call resume_session_handoff(..., manual_resume=True) after fixing the injected boundary"
 
 
+def _build_handoff_authority_guard(authority_type: type[Any]):
+    def guarded(operation: Any) -> Any:
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            kwargs["_sealed_authority_type"] = authority_type
+            return operation(self, *args, **kwargs)
+
+        wrapper.__name__ = operation.__name__
+        wrapper.__qualname__ = operation.__qualname__
+        wrapper.__doc__ = operation.__doc__
+        wrapper.__module__ = operation.__module__
+        wrapper.__annotations__ = operation.__annotations__
+        signature = inspect.signature(operation)
+        wrapper.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.name != "_sealed_authority_type"
+            ]
+        )
+        return wrapper
+
+    return guarded
+
+
+_handoff_authority_guarded = _build_handoff_authority_guard(_HandoffMutationAuthority)
+
+
 def _validate_receipt(receipt: str) -> None:
+    if type(receipt) is not str:
+        raise ValueError("effect receipt must be an exact plain string")
     if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,512}", receipt):
         raise ValueError("invalid effect receipt")
     if redact_secret_text(receipt) != receipt:
@@ -437,15 +533,19 @@ def _validate_receipt(receipt: str) -> None:
 class SessionHandoffLedger:
     """Canonical state in the existing durable lane's SQLite database."""
 
+    __slots__ = ("sqlite_path", "_mutation_authority", "_database_identity")
+
+    @_handoff_authority_guarded
     def __init__(
         self,
         sqlite_path: Any,
         *,
         mutation_authority: _HandoffMutationAuthority | None = None,
+        _sealed_authority_type: type[Any] | None = None,
     ) -> None:
         if mutation_authority is not None and (
-            type(mutation_authority) is not _HandoffMutationAuthority
-            or not mutation_authority.valid_for(sqlite_path)
+            type(mutation_authority) is not _sealed_authority_type
+            or not _sealed_authority_type.valid_for(mutation_authority, sqlite_path)
         ):
             raise HandoffMutationUnauthorized("invalid handoff mutation authority")
         self._mutation_authority = mutation_authority
@@ -521,10 +621,13 @@ class SessionHandoffLedger:
                     "ADD COLUMN reconciliation_receipt TEXT"
                 )
 
-    def _require_mutation_authority(self, job_id: str) -> None:
+    @_handoff_authority_guarded
+    def _require_mutation_authority(
+        self, job_id: str, *, _sealed_authority_type: type[Any] | None = None
+    ) -> None:
         authority = self._mutation_authority
-        if type(authority) is not _HandoffMutationAuthority or not authority.valid_for(
-            self.sqlite_path, job_id
+        if type(authority) is not _sealed_authority_type or not (
+            _sealed_authority_type.valid_for(authority, self.sqlite_path, job_id)
         ):
             raise HandoffMutationUnauthorized(
                 "handoff ledger mutations require an active lane-issued authority"
@@ -612,10 +715,27 @@ class SessionHandoffLedger:
         return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _stage(
-        self, job_id: str, parent_session_id: str, handoff: SessionHandoff
+        self,
+        job_id: str,
+        parent_session_id: str,
+        handoff: SessionHandoff,
+        *,
+        canonical_payload: Optional[str] = None,
+        staged_handoff_id: Optional[str] = None,
+        staged_idempotency_key: Optional[str] = None,
     ) -> HandoffState:
         self._require_mutation_authority(job_id)
-        canonical = handoff.canonical_json()
+        canonical = (
+            handoff.canonical_json() if canonical_payload is None else canonical_payload
+        )
+        handoff_id = (
+            handoff.handoff_id if staged_handoff_id is None else staged_handoff_id
+        )
+        idempotency_key = (
+            handoff.idempotency_key
+            if staged_idempotency_key is None
+            else staged_idempotency_key
+        )
         digest = self._hash(canonical)
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         with self._connect() as conn:
@@ -629,19 +749,19 @@ class SessionHandoffLedger:
                 """,
                 (
                     job_id,
-                    handoff.handoff_id,
+                    handoff_id,
                     parent_session_id,
-                    handoff.idempotency_key,
+                    idempotency_key,
                     canonical,
                     digest,
                     now,
                 ),
             )
-        state = self.get(job_id, handoff.handoff_id)
+        state = self.get(job_id, handoff_id)
         with self._connect() as conn:
             identity = conn.execute(
                 "SELECT parent_session_id FROM session_handoffs WHERE job_id=? AND handoff_id=?",
-                (job_id, handoff.handoff_id),
+                (job_id, handoff_id),
             ).fetchone()
         if state is None or state.canonical_hash != digest:
             raise ProjectionVerificationError(
@@ -1105,3 +1225,8 @@ class SessionHandoffLedger:
                 ),
             )
         return self.get(job_id, handoff_id)  # type: ignore[return-value]
+
+
+del _handoff_authority_guarded
+del _build_handoff_authority_guard
+del _validate_handoff_authority_ticket

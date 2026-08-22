@@ -40,6 +40,7 @@ it cannot deadlock with coordinator/SQLite.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -75,13 +76,85 @@ from agent.durable_jobs.slack_contract import (
 from agent.durable_jobs.store import DurableJobStore
 
 logger = logging.getLogger(__name__)
-_AUTHENTIC_LANE_INSTANCES: weakref.WeakSet[DurableLaneService] = weakref.WeakSet()
 
 
 def _build_handoff_operation_gate():
     """Lexically seal handoff mutation tickets inside real lane operations."""
+    import agent.durable_jobs.session_handoff as handoff_module
+
+    authority_type = handoff_module._HandoffMutationAuthority
+    authority_issuer = handoff_module._MUTATION_AUTHORITY_ISSUER
+    handoff_type = handoff_module.SessionHandoff
+    handoff_identity_error = handoff_module.HandoffIdentityMismatch
+    handoff_canonical_json = handoff_type.canonical_json
+    handoff_fields = tuple(handoff_type.__dataclass_fields__)
+    handoff_tuple_fields = frozenset({
+        "verified",
+        "pending",
+        "remaining",
+        "blockers",
+        "test_evidence",
+        "risk_gates",
+        "forbidden_actions",
+    })
+    ledger_type = handoff_module.SessionHandoffLedger
+    mutators = {
+        name: getattr(ledger_type, name)
+        for name in (
+            "_stage",
+            "_resume_failed",
+            "_claim_effect",
+            "_complete_effect",
+            "_advance",
+            "_fail_closed",
+            "_reconcile_effect",
+        )
+    }
+    seal_authority_validator = handoff_module._seal_handoff_authority_validator
     active: dict[object, tuple[weakref.ReferenceType[Any], int, str, str]] = {}
+    operations: dict[int, tuple[weakref.ReferenceType[Any], int, str, str]] = {}
+    authentic_instances: weakref.WeakSet[Any] = weakref.WeakSet()
+    authentic_lane_type: type[Any] | None = None
+    authentic_mutation_lease: Any = None
     registry_lock = threading.Lock()
+    callback_threads: tuple[int, ...] = ()
+
+    def freeze_handoff(handoff: Any) -> tuple[Any, str]:
+        """Snapshot caller data before any mutation capability exists."""
+        values: dict[str, Any] = {}
+        for name in handoff_fields:
+            try:
+                value = getattr(handoff, name)
+            except Exception as exc:
+                raise handoff_identity_error(
+                    f"handoff field {name!r} could not be read safely"
+                ) from exc
+            if name in handoff_tuple_fields:
+                if type(value) is not tuple or any(
+                    type(item) is not str for item in value
+                ):
+                    raise handoff_identity_error(
+                        f"handoff field {name!r} must be a tuple of plain strings"
+                    )
+            elif name == "version":
+                if type(value) is not int:
+                    raise handoff_identity_error(
+                        "handoff version must be a plain integer"
+                    )
+            elif type(value) is not str:
+                raise handoff_identity_error(
+                    f"handoff field {name!r} must be a plain string"
+                )
+            values[name] = value
+        frozen = handoff_type(**values)
+        return frozen, handoff_canonical_json(frozen)
+
+    def seal_lane_type(lane_type: type[Any]) -> None:
+        nonlocal authentic_lane_type, authentic_mutation_lease
+        if authentic_lane_type is not None or not isinstance(lane_type, type):
+            raise RuntimeError("durable lane type is already sealed")
+        authentic_lane_type = lane_type
+        authentic_mutation_lease = lane_type._mutation_lease
 
     def validate(ticket: object, sqlite_path: Any, job_id: str) -> bool:
         normalized = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
@@ -90,23 +163,50 @@ def _build_handoff_operation_gate():
         if record is None:
             return False
         lane_ref, owner_thread, expected_path, expected_job = record
+        lane = lane_ref()
         return (
-            lane_ref() is not None
+            lane is not None
+            and type(lane) is authentic_lane_type
+            and lane in authentic_instances
             and owner_thread == threading.get_ident()
             and expected_path == normalized
             and expected_job == str(job_id)
         )
 
+    def constructor_gate(constructor: Any) -> Any:
+        def guarded_constructor(lane: Any, *args: Any, **kwargs: Any) -> Any:
+            result = constructor(lane, *args, **kwargs)
+            if authentic_lane_type is not None and type(lane) is authentic_lane_type:
+                authentic_instances.add(lane)
+            return result
+
+        guarded_constructor.__name__ = constructor.__name__
+        guarded_constructor.__qualname__ = constructor.__qualname__
+        guarded_constructor.__doc__ = constructor.__doc__
+        guarded_constructor.__module__ = constructor.__module__
+        guarded_constructor.__annotations__ = constructor.__annotations__
+        guarded_constructor.__signature__ = inspect.signature(constructor)  # type: ignore[attr-defined]
+        return guarded_constructor
+
     def operation_gate(operation: Any) -> Any:
         def guarded_operation(lane: Any, *args: Any, **kwargs: Any) -> Any:
-            @contextmanager
-            def issue(sqlite_path: Any, job_id: str) -> Iterator[Any]:
-                from agent.durable_jobs.session_handoff import (
-                    HandoffMutationUnauthorized,
-                    _HandoffMutationAuthority,
-                    _MUTATION_AUTHORITY_ISSUER,
+            nonlocal callback_threads
+            from agent.durable_jobs.session_handoff import (
+                HandoffMutationUnauthorized,
+            )
+
+            if type(lane) is not authentic_lane_type or lane not in authentic_instances:
+                raise HandoffMutationUnauthorized(
+                    "handoff mutation authority requires an authentic durable lane"
                 )
 
+            if authentic_mutation_lease is None:
+                raise HandoffMutationUnauthorized(
+                    "handoff mutation authority requires a sealed lifecycle lease"
+                )
+
+            @contextmanager
+            def authorize_operation(sqlite_path: Any, job_id: str) -> Iterator[Any]:
                 store = lane._acquire_authorized_mutation(job_id)
                 normalized = os.path.normcase(os.path.abspath(os.fspath(sqlite_path)))
                 authorized_path = os.path.normcase(
@@ -116,35 +216,160 @@ def _build_handoff_operation_gate():
                     raise HandoffMutationUnauthorized(
                         "handoff mutation authority database does not match the authorized job store"
                     )
-                with lane._mutation_lease():
-                    ticket = object()
+                with authentic_mutation_lease(lane):
+                    # Schema creation/migration is itself narrowly authorized and finishes
+                    # before any adapter or other attacker-controlled callback can run.
+                    lane_ref = weakref.ref(lane)
+                    path_identity = normalized
+                    setup_ticket = object()
                     with registry_lock:
-                        active[ticket] = (
+                        active[setup_ticket] = (
+                            lane_ref,
+                            threading.get_ident(),
+                            path_identity,
+                            job_id,
+                        )
+                    try:
+                        setup_authority = authority_type(
+                            authority_issuer,
+                            setup_ticket,
+                            normalized,
+                            str(job_id),
+                        )
+                        ledger_type(normalized, mutation_authority=setup_authority)
+                    finally:
+                        with registry_lock:
+                            active.pop(setup_ticket, None)
+                    operation_token = object()
+                    with registry_lock:
+                        operations[id(operation_token)] = (
                             weakref.ref(lane),
                             threading.get_ident(),
                             normalized,
                             str(job_id),
                         )
                     try:
-                        yield _HandoffMutationAuthority(
-                            _MUTATION_AUTHORITY_ISSUER, ticket, sqlite_path, job_id
-                        )
+                        yield operation_token, normalized
                     finally:
                         with registry_lock:
-                            active.pop(ticket, None)
+                            operations.pop(id(operation_token), None)
 
-            kwargs["_issue_handoff_mutation_authority"] = issue
+            def mutate(
+                operation_token: object,
+                method_name: str,
+                *method_args: Any,
+                **method_kwargs: Any,
+            ) -> Any:
+                if threading.get_ident() in callback_threads:
+                    raise HandoffMutationUnauthorized(
+                        "handoff mutation is forbidden during an external callback"
+                    )
+                with registry_lock:
+                    operation_record = operations.get(id(operation_token))
+                if operation_record is None:
+                    raise HandoffMutationUnauthorized(
+                        "handoff mutation requires an active operation token"
+                    )
+                lane_ref, owner_thread, normalized, authorized_job_id = operation_record
+                if (
+                    type(operation_token) is not object
+                    or lane_ref() is not lane
+                    or owner_thread != threading.get_ident()
+                ):
+                    raise HandoffMutationUnauthorized(
+                        "handoff mutation operation identity is invalid"
+                    )
+                mutator = mutators.get(method_name)
+                if mutator is None:
+                    raise HandoffMutationUnauthorized(
+                        "handoff mutation method is not authorized"
+                    )
+                ticket = object()
+                with registry_lock:
+                    active[ticket] = operation_record
+                try:
+                    ledger = ledger_type(
+                        normalized,
+                        mutation_authority=authority_type(
+                            authority_issuer,
+                            ticket,
+                            normalized,
+                            authorized_job_id,
+                        ),
+                    )
+                    return mutator(ledger, *method_args, **method_kwargs)
+                finally:
+                    with registry_lock:
+                        active.pop(ticket, None)
+
+            def invoke_external(
+                target: Any,
+                method_name: str,
+                return_kind: str,
+                **call_kwargs: Any,
+            ) -> Any:
+                """Run and freeze caller-controlled code while mutation is sealed."""
+                nonlocal callback_threads
+                owner_thread = threading.get_ident()
+                callback_threads = (*callback_threads, owner_thread)
+                try:
+                    result = getattr(target, method_name)(**call_kwargs)
+                    if return_kind == "str":
+                        if type(result) is not str:
+                            raise TypeError(
+                                f"{method_name} must return an exact plain string"
+                            )
+                        return result
+                    if return_kind == "none":
+                        if result is not None:
+                            raise TypeError(f"{method_name} must return None")
+                        return None
+                    raise TypeError("invalid sealed callback return kind")
+                finally:
+                    current = callback_threads
+                    for index in range(len(current) - 1, -1, -1):
+                        if current[index] == owner_thread:
+                            callback_threads = current[:index] + current[index + 1 :]
+                            break
+
+            kwargs["_authorize_handoff_operation"] = authorize_operation
+            kwargs["_mutate_handoff"] = mutate
+            kwargs["_freeze_handoff"] = freeze_handoff
+            kwargs["_invoke_handoff_callback"] = invoke_external
             return operation(lane, *args, **kwargs)
 
         guarded_operation.__name__ = operation.__name__
+        guarded_operation.__qualname__ = operation.__qualname__
         guarded_operation.__doc__ = operation.__doc__
         guarded_operation.__module__ = operation.__module__
+        guarded_operation.__annotations__ = operation.__annotations__
+        operation_signature = inspect.signature(operation)
+        guarded_operation.__signature__ = operation_signature.replace(  # type: ignore[attr-defined]
+            parameters=[
+                parameter
+                for parameter in operation_signature.parameters.values()
+                if parameter.name
+                not in {
+                    "_authorize_handoff_operation",
+                    "_mutate_handoff",
+                    "_freeze_handoff",
+                    "_invoke_handoff_callback",
+                }
+            ]
+        )
         return guarded_operation
 
-    return operation_gate, validate
+    seal_authority_validator(validate)
+    delattr(handoff_module, "_seal_handoff_authority_validator")
+    return seal_lane_type, constructor_gate, operation_gate, validate
 
 
-_handoff_operation, _validate_handoff_mutation_ticket = _build_handoff_operation_gate()
+(
+    _seal_handoff_lane_type,
+    _handoff_lane_constructor,
+    _handoff_operation,
+    _validate_handoff_mutation_ticket,
+) = _build_handoff_operation_gate()
 
 
 class LaneClosedError(RuntimeError):
@@ -156,6 +381,7 @@ class LaneIdentityRejected(RuntimeError):
 
 
 class DurableLaneService:
+    @_handoff_lane_constructor
     def __init__(
         self,
         config: DurableJobsConfig,
@@ -172,11 +398,6 @@ class DurableLaneService:
         self._close_claimed_leases = 0
         self._lifecycle = threading.Lock()
         self._close_idle = threading.Condition(self._lifecycle)
-        _AUTHENTIC_LANE_INSTANCES.add(self)
-
-    @staticmethod
-    def _is_authentic_instance(candidate: object) -> bool:
-        return candidate in _AUTHENTIC_LANE_INSTANCES
 
     def close(self) -> None:
         """Idempotent shutdown. Waits for leases not already inside close().
@@ -437,7 +658,10 @@ class DurableLaneService:
         sessions: Any,
         handoff_config: Any,
         manual_resume: bool = False,
-        _issue_handoff_mutation_authority: Any,
+        _authorize_handoff_operation: Any,
+        _mutate_handoff: Any,
+        _freeze_handoff: Any,
+        _invoke_handoff_callback: Any,
     ) -> Any:
         """Run inactive ENG-122 handoff work under this lane's write lease."""
         from agent.durable_jobs.session_handoff import (
@@ -477,7 +701,12 @@ class DurableLaneService:
                 self.sessions = sessions
 
             def _claim_effect(
-                self, job_id: str, handoff_id: str, effect_name: str
+                self,
+                mutate: Any,
+                operation_token: object,
+                job_id: str,
+                handoff_id: str,
+                effect_name: str,
             ) -> tuple[EffectClaim, _EffectOwnerGuard]:
                 guard = self.ledger.effect_owner_guard(job_id, handoff_id, effect_name)
                 try:
@@ -488,7 +717,9 @@ class DurableLaneService:
                     ) from exc
                 owner_token = uuid4().hex
                 try:
-                    claim = self.ledger._claim_effect(
+                    claim = mutate(
+                        operation_token,
+                        "_claim_effect",
                         job_id,
                         handoff_id,
                         effect_name,
@@ -507,11 +738,15 @@ class DurableLaneService:
                 self,
                 claim: EffectClaim,
                 guard: _EffectOwnerGuard,
+                mutate: Any,
+                operation_token: object,
                 *,
                 receipt: str | None = None,
             ) -> HandoffState:
                 try:
-                    return self.ledger._complete_effect(
+                    return mutate(
+                        operation_token,
+                        "_complete_effect",
                         claim.job_id,
                         claim.handoff_id,
                         claim.effect_name,
@@ -531,18 +766,26 @@ class DurableLaneService:
                 waypoint: SemanticWaypoint,
                 pressure: HandoffPressure,
                 manual_resume: bool = False,
+                _mutate: Any,
+                _operation_token: object,
+                _canonical_handoff: str,
+                _handoff_id: str,
+                _idempotency_key: str,
+                _safe_waypoint: bool,
+                _pressure_armed: bool,
+                _invoke_callback: Any,
             ) -> HandoffState:
                 if type(manual_resume) is not bool:
                     raise ValueError("manual_resume must be a boolean")
-                if not waypoint.safe:
+                if not _safe_waypoint:
                     raise UnsafeHandoffWaypoint(
                         "handoff requires a verified safe semantic waypoint"
                     )
-                if not pressure.armed:
+                if not _pressure_armed:
                     raise HandoffNotArmed(
                         "session handoff has not reached its configured soft threshold"
                     )
-                key = handoff.idempotency_key
+                key = _idempotency_key
                 if redact_secret_text(key) != key:
                     raise HandoffIdentityMismatch(
                         "handoff idempotency key must not contain secret-bearing text"
@@ -555,13 +798,24 @@ class DurableLaneService:
                     raise HandoffIdentityMismatch(
                         "issue must be a secret-free Linear identifier"
                     )
-                state = self.ledger._stage(job_id, parent_session_id, handoff)
+                state = _mutate(
+                    _operation_token,
+                    "_stage",
+                    job_id,
+                    parent_session_id,
+                    handoff,
+                    canonical_payload=_canonical_handoff,
+                    staged_handoff_id=_handoff_id,
+                    staged_idempotency_key=_idempotency_key,
+                )
                 if state.failure_reason and not manual_resume:
                     raise ManualResumeRequired(
                         state.manual_resume_action or _MANUAL_RESUME
                     )
                 if state.failure_reason:
-                    state = self.ledger._resume_failed(job_id, handoff.handoff_id)
+                    state = _mutate(
+                        _operation_token, "_resume_failed", job_id, handoff.handoff_id
+                    )
                 canonical = self.ledger.canonical(job_id, handoff.handoff_id)
                 canonical_payload = json.loads(canonical)
                 safe_resume_pointer = str(canonical_payload["resume_pointer"])
@@ -571,45 +825,86 @@ class DurableLaneService:
                 try:
                     if _STAGE_INDEX[state.stage] < _STAGE_INDEX["LINEAR_VERIFIED"]:
                         active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "LINEAR_UPSERT"
+                            _mutate,
+                            _operation_token,
+                            job_id,
+                            handoff.handoff_id,
+                            "LINEAR_UPSERT",
                         )
-                        receipt = self.linear.upsert_handoff(
+                        receipt = _invoke_callback(
+                            self.linear,
+                            "upsert_handoff",
+                            "str",
                             issue=handoff.issue,
                             canonical=canonical,
                             idempotency_key=f"{key}:linear",
                         )
-                        if self.linear.read_handoff(issue=handoff.issue) != canonical:
+                        if (
+                            _invoke_callback(
+                                self.linear,
+                                "read_handoff",
+                                "str",
+                                issue=handoff.issue,
+                            )
+                            != canonical
+                        ):
                             raise ProjectionVerificationError(
                                 "Linear readback mismatch"
                             )
                         state = self._complete_effect(
-                            active_claim, active_guard, receipt=receipt
+                            active_claim,
+                            active_guard,
+                            _mutate,
+                            _operation_token,
+                            receipt=receipt,
                         )
                         active_guard = None
                     if _STAGE_INDEX[state.stage] < _STAGE_INDEX["SLACK_RECEIPTED"]:
                         active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "SLACK_RECEIPT"
+                            _mutate,
+                            _operation_token,
+                            job_id,
+                            handoff.handoff_id,
+                            "SLACK_RECEIPT",
                         )
-                        receipt = self.slack.post_handoff_receipt(
+                        receipt = _invoke_callback(
+                            self.slack,
+                            "post_handoff_receipt",
+                            "str",
                             handoff_id=handoff.handoff_id,
                             resume_pointer=safe_resume_pointer,
                             idempotency_key=f"{key}:slack",
                         )
                         state = self._complete_effect(
-                            active_claim, active_guard, receipt=receipt
+                            active_claim,
+                            active_guard,
+                            _mutate,
+                            _operation_token,
+                            receipt=receipt,
                         )
                         active_guard = None
                     if _STAGE_INDEX[state.stage] < _STAGE_INDEX["CHILD_CREATED"]:
                         active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "CHILD_CREATE"
+                            _mutate,
+                            _operation_token,
+                            job_id,
+                            handoff.handoff_id,
+                            "CHILD_CREATE",
                         )
-                        child = self.sessions.find_or_create_child(
+                        child = _invoke_callback(
+                            self.sessions,
+                            "find_or_create_child",
+                            "str",
                             parent_session_id=parent_session_id,
                             handoff_id=handoff.handoff_id,
                             idempotency_key=f"{key}:child",
                         )
                         state = self._complete_effect(
-                            active_claim, active_guard, receipt=child
+                            active_claim,
+                            active_guard,
+                            _mutate,
+                            _operation_token,
+                            receipt=child,
                         )
                         active_guard = None
                     child_id = state.child_session_id
@@ -619,40 +914,68 @@ class DurableLaneService:
                         )
                     if _STAGE_INDEX[state.stage] < _STAGE_INDEX["HANDOFF_INJECTED"]:
                         active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "HANDOFF_INJECT"
+                            _mutate,
+                            _operation_token,
+                            job_id,
+                            handoff.handoff_id,
+                            "HANDOFF_INJECT",
                         )
-                        self.sessions.inject_handoff(
+                        _invoke_callback(
+                            self.sessions,
+                            "inject_handoff",
+                            "none",
                             child_session_id=child_id,
                             canonical=canonical,
                             idempotency_key=f"{key}:inject",
                         )
-                        state = self._complete_effect(active_claim, active_guard)
+                        state = self._complete_effect(
+                            active_claim, active_guard, _mutate, _operation_token
+                        )
                         active_guard = None
                     if _STAGE_INDEX[state.stage] < _STAGE_INDEX["FIRST_TURN_STARTED"]:
                         active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "FIRST_TURN_START"
+                            _mutate,
+                            _operation_token,
+                            job_id,
+                            handoff.handoff_id,
+                            "FIRST_TURN_START",
                         )
-                        self.sessions.start_first_turn(
+                        _invoke_callback(
+                            self.sessions,
+                            "start_first_turn",
+                            "none",
                             child_session_id=child_id,
                             next_action=safe_next_action,
                             idempotency_key=f"{key}:first-turn",
                         )
-                        state = self._complete_effect(active_claim, active_guard)
+                        state = self._complete_effect(
+                            active_claim, active_guard, _mutate, _operation_token
+                        )
                         active_guard = None
                     if state.stage != "COMPLETE":
-                        state = self.ledger._advance(
-                            job_id, handoff.handoff_id, "COMPLETE"
+                        state = _mutate(
+                            _operation_token,
+                            "_advance",
+                            job_id,
+                            handoff.handoff_id,
+                            "COMPLETE",
                         )
                     return state
                 except EffectReconciliationRequired:
                     raise
                 except Exception as exc:
                     if active_claim is None:
-                        self.ledger._fail_closed(
-                            job_id, handoff.handoff_id, type(exc).__name__
+                        _mutate(
+                            _operation_token,
+                            "_fail_closed",
+                            job_id,
+                            handoff.handoff_id,
+                            type(exc).__name__,
                         )
                     else:
-                        self.ledger._fail_closed(
+                        _mutate(
+                            _operation_token,
+                            "_fail_closed",
                             job_id,
                             handoff.handoff_id,
                             type(exc).__name__,
@@ -665,6 +988,37 @@ class DurableLaneService:
                     if active_guard is not None:
                         active_guard.release()
 
+        if type(parent_session_id) is not str:
+            raise HandoffIdentityMismatch(
+                "parent_session_id must be an exact plain string"
+            )
+        handoff, canonical_handoff = _freeze_handoff(handoff)
+        if type(waypoint) is not SemanticWaypoint or any(
+            type(value) is not bool
+            for value in (
+                waypoint.verified,
+                waypoint.tool_active,
+                waypoint.external_mutation_active,
+                waypoint.commit_active,
+                waypoint.push_active,
+                waypoint.deploy_active,
+                waypoint.authority_boundary_active,
+            )
+        ):
+            raise UnsafeHandoffWaypoint(
+                "waypoint must contain exact plain boolean state"
+            )
+        safe_waypoint = waypoint.safe
+        if (
+            type(pressure) is not HandoffPressure
+            or type(pressure.armed) is not bool
+            or type(pressure.hard) is not bool
+            or type(pressure.ratio) is not float
+        ):
+            raise HandoffNotArmed("pressure must contain exact plain scalar state")
+        pressure_armed = pressure.armed
+        frozen_handoff_id = handoff.handoff_id
+        frozen_idempotency_key = handoff.idempotency_key
         if handoff_config.enabled is not True or handoff_config.shadow is not False:
             raise PilotDisabledError(
                 "session handoff effects require enabled=True and shadow=False"
@@ -681,23 +1035,31 @@ class DurableLaneService:
             raise HandoffIdentityMismatch(
                 "handoff requires a matching non-empty durable job baseline SHA"
             )
-        with _issue_handoff_mutation_authority(
-            store.sqlite_path, job_id
-        ) as mutation_authority:
+        authorized_job_id = str(job_id)
+        with _authorize_handoff_operation(store.sqlite_path, authorized_job_id) as (
+            operation_token,
+            authorized_sqlite_path,
+        ):
             return _SessionHandoffCoordinator(
-                ledger=SessionHandoffLedger(
-                    store.sqlite_path, mutation_authority=mutation_authority
-                ),
+                ledger=SessionHandoffLedger(authorized_sqlite_path),
                 linear=linear,
                 slack=slack,
                 sessions=sessions,
             ).resume(
-                job_id=job_id,
+                job_id=authorized_job_id,
                 parent_session_id=parent_session_id,
                 handoff=handoff,
                 waypoint=waypoint,
                 pressure=pressure,
                 manual_resume=manual_resume,
+                _mutate=_mutate_handoff,
+                _operation_token=operation_token,
+                _canonical_handoff=canonical_handoff,
+                _handoff_id=frozen_handoff_id,
+                _idempotency_key=frozen_idempotency_key,
+                _safe_waypoint=safe_waypoint,
+                _pressure_armed=pressure_armed,
+                _invoke_callback=_invoke_handoff_callback,
             )
 
     @_handoff_operation
@@ -713,7 +1075,10 @@ class DurableLaneService:
         expected_generation: int,
         dead_owner_verified: bool,
         handoff_config: Any,
-        _issue_handoff_mutation_authority: Any,
+        _authorize_handoff_operation: Any,
+        _mutate_handoff: Any,
+        _freeze_handoff: Any,
+        _invoke_handoff_callback: Any,
     ) -> Any:
         """Resolve a verified ambiguous handoff effect under the lane write lease."""
         from agent.durable_jobs.session_handoff import (
@@ -721,25 +1086,45 @@ class DurableLaneService:
             SessionHandoffLedger,
         )
 
+        exact_string_inputs = (
+            handoff_id,
+            effect_name,
+            outcome,
+            expected_owner_token,
+        )
+        if any(type(value) is not str for value in exact_string_inputs):
+            raise HandoffIdentityMismatch(
+                "reconciliation identity and outcome fields must be exact plain strings"
+            )
+        if receipt is not None and type(receipt) is not str:
+            raise HandoffIdentityMismatch(
+                "reconciliation receipt must be an exact plain string"
+            )
+        if (
+            type(expected_generation) is not int
+            or type(dead_owner_verified) is not bool
+        ):
+            raise HandoffIdentityMismatch(
+                "reconciliation fencing fields must be exact plain scalars"
+            )
         if handoff_config.enabled is not True or handoff_config.shadow is not False:
             raise PilotDisabledError(
                 "session handoff reconciliation requires enabled=True and shadow=False"
             )
         store = self._acquire_authorized_mutation(job_id)
-        with _issue_handoff_mutation_authority(
-            store.sqlite_path, job_id
-        ) as mutation_authority:
-            job = store.get_job(job_id)
+        authorized_job_id = str(job_id)
+        with _authorize_handoff_operation(store.sqlite_path, authorized_job_id) as (
+            operation_token,
+            authorized_sqlite_path,
+        ):
+            job = store.get_job(authorized_job_id)
             if job is None:
-                raise KeyError(job_id)
-            ledger = SessionHandoffLedger(
-                store.sqlite_path,
-                mutation_authority=mutation_authority,
-            )
-            state = ledger.get(job_id, handoff_id)
+                raise KeyError(authorized_job_id)
+            ledger = SessionHandoffLedger(authorized_sqlite_path)
+            state = ledger.get(authorized_job_id, handoff_id)
             if state is None:
                 raise KeyError(handoff_id)
-            canonical = json.loads(ledger.canonical(job_id, handoff_id))
+            canonical = json.loads(ledger.canonical(authorized_job_id, handoff_id))
             if (
                 str(canonical.get("repository", "")).strip()
                 != str(job.repository_identity).strip()
@@ -749,9 +1134,13 @@ class DurableLaneService:
                 raise HandoffIdentityMismatch(
                     "reconciliation requires current durable job repository and frozen SHA identity"
                 )
-            with ledger.effect_owner_guard(job_id, handoff_id, effect_name) as guard:
-                return ledger._reconcile_effect(
-                    job_id=job_id,
+            with ledger.effect_owner_guard(
+                authorized_job_id, handoff_id, effect_name
+            ) as guard:
+                return _mutate_handoff(
+                    operation_token,
+                    "_reconcile_effect",
+                    job_id=authorized_job_id,
                     handoff_id=handoff_id,
                     effect_name=effect_name,
                     outcome=outcome,
@@ -984,5 +1373,8 @@ class DurableLaneService:
 
 
 # Ticket issuance remains reachable only through the two decorated operations.
+_seal_handoff_lane_type(DurableLaneService)
+del _seal_handoff_lane_type
+del _handoff_lane_constructor
 del _handoff_operation
 del _build_handoff_operation_gate
