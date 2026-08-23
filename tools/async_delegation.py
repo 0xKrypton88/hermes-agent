@@ -94,6 +94,25 @@ _DELIVERY_CLAIM_TTL_SECONDS = 300.0
 DURABLE_PENDING_SCAN_INTERVAL = 5.0
 _DB_LOCK = threading.Lock()
 
+# Optional process wiring for explicitly activated ENG-118 authority.  The
+# callback must freshly read the authoritative datastore binding on each call.
+_legacy_writer_authority_check: Optional[Callable[[], Any]] = None
+
+
+def configure_legacy_writer_authority_check(
+    check: Optional[Callable[[], Any]],
+) -> None:
+    """Activate or reset legacy authority enforcement without caching rows."""
+
+    global _legacy_writer_authority_check
+    _legacy_writer_authority_check = check
+
+
+def _assert_legacy_writer_authority() -> None:
+    check = _legacy_writer_authority_check
+    if check is not None:
+        check()
+
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
 # ---------------------------------------------------------------------------
@@ -301,6 +320,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
+    _assert_legacy_writer_authority()
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
@@ -372,6 +392,7 @@ def restore_undelivered_completions(
     runtime/durable lineage are restored. Without selectors, startup behavior
     remains unchanged and all pending completions are rehydrated.
     """
+    _assert_legacy_writer_authority()
     owner_ui = str(origin_ui_session_id or "")
     owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
     targeted = bool(owner_ui or owner_keys)
@@ -1044,6 +1065,7 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    _assert_legacy_writer_authority()
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -1280,6 +1302,7 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    _assert_legacy_writer_authority()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)

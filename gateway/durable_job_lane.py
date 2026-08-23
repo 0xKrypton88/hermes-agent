@@ -395,6 +395,7 @@ def attach_durable_job_lane(
     cursor_transport: Any = None,
     slack_transport: Any = None,
     owner: Any = None,
+    writer_authority_check: Any = None,
 ) -> Optional[DurableJobLaneHandle]:
     """Construct the lane only when runtime capability is bound. Fail closed."""
     try:
@@ -434,6 +435,9 @@ def attach_durable_job_lane(
                 raise DurableJobLaneAlreadyAttached(
                     "durable job lane is already attached for this owner"
                 )
+        if writer_authority_check is not None:
+            # Fail before adapters or schema-owning stores are constructed.
+            writer_authority_check()
         try:
             cursor_adapter = cursor_adapter_from_config(
                 cfg, transport=cursor_transport
@@ -443,7 +447,9 @@ def attach_durable_job_lane(
             )
             handle = DurableJobLaneHandle(
                 config=cfg,
-                lane=DurableLaneService(config=cfg),
+                lane=DurableLaneService(
+                    config=cfg, writer_authority_check=writer_authority_check
+                ),
                 cursor_adapter=cursor_adapter,
                 slack_adapter=slack_adapter,
                 preflight=report,

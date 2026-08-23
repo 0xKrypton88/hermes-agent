@@ -71,6 +71,7 @@ from agent.durable_jobs.slack_contract import (
     resolve_provider_origin,
 )
 from agent.durable_jobs.store import DurableJobStore
+from agent.durable_jobs.writer_authority import WriterAuthorityCheck
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +89,11 @@ class DurableLaneService:
         self,
         config: DurableJobsConfig,
         store: Optional[DurableJobStore] = None,
+        writer_authority_check: Optional[WriterAuthorityCheck] = None,
     ) -> None:
         self.config = config
         self._store = store
+        self._writer_authority_check = writer_authority_check
         self._closed = False
         self._active_leases = 0
         self._leases_by_thread: dict[int, int] = {}
@@ -312,6 +315,9 @@ class DurableLaneService:
 
     def _checkout_for_mutation(self) -> DurableJobStore:
         self._require_enabled()
+        if self._writer_authority_check is not None:
+            # A successful attach is not durable authority for a later write.
+            self._writer_authority_check()
         self._after_admission()
         store = self._require_sqlite_path()
         self._after_store_checkout()

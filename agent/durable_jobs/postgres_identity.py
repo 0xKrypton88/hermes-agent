@@ -19,6 +19,82 @@ _LOOPBACK_HOSTS = frozenset(
     {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "0:0:0:0:0:0:0:1"}
 )
 
+TARGET_IDENTITY_KEYS = frozenset(
+    {
+        "identity_format_version",
+        "storage_id",
+        "environment_id",
+        "storage_domain",
+        "schema_version",
+    }
+)
+IDENTITY_FORMAT_VERSION = 1
+
+
+class TargetIdentityError(ValueError):
+    """Raised before setup/write when persisted target identity is not exact."""
+
+
+@dataclass(frozen=True)
+class PersistedTargetIdentity:
+    """Versioned logical identity persisted in each ENG-118 target meta table."""
+
+    storage_id: str
+    environment_id: str
+    storage_domain: str
+    schema_version: int
+
+    def __post_init__(self) -> None:
+        if not self.storage_id or not self.environment_id or not self.storage_domain:
+            raise TargetIdentityError("target identity fields must be non-empty")
+        if self.schema_version < 1:
+            raise TargetIdentityError("target schema version must be positive")
+
+    def as_markers(self) -> dict[str, str]:
+        return {
+            "identity_format_version": str(IDENTITY_FORMAT_VERSION),
+            "storage_id": self.storage_id,
+            "environment_id": self.environment_id,
+            "storage_domain": self.storage_domain,
+            "schema_version": str(self.schema_version),
+        }
+
+
+def verify_persisted_target_identity(
+    markers: Mapping[str, str], *, expected: PersistedTargetIdentity
+) -> PersistedTargetIdentity:
+    """Return the expected identity only for a complete, exact persisted tuple."""
+
+    present = TARGET_IDENTITY_KEYS.intersection(markers)
+    if present != TARGET_IDENTITY_KEYS:
+        missing = sorted(TARGET_IDENTITY_KEYS - present)
+        raise TargetIdentityError(
+            "persisted target identity is missing required markers: " + ", ".join(missing)
+        )
+    actual = {key: str(markers[key]).strip() for key in TARGET_IDENTITY_KEYS}
+    if actual != expected.as_markers():
+        raise TargetIdentityError("persisted target identity does not match expected target")
+    return expected
+
+
+def verify_shared_target_identities(
+    durable_jobs_meta: Mapping[str, str],
+    durable_checkpoint_meta: Mapping[str, str],
+    *,
+    expected: PersistedTargetIdentity,
+) -> PersistedTargetIdentity:
+    """Verify both persistence domains before either schema setup or write."""
+
+    verify_persisted_target_identity(durable_jobs_meta, expected=expected)
+    verify_persisted_target_identity(durable_checkpoint_meta, expected=expected)
+    if {
+        key: str(durable_jobs_meta[key]).strip() for key in TARGET_IDENTITY_KEYS
+    } != {
+        key: str(durable_checkpoint_meta[key]).strip() for key in TARGET_IDENTITY_KEYS
+    }:
+        raise TargetIdentityError("job and checkpoint target identities diverge")
+    return expected
+
 
 @dataclass(frozen=True)
 class PostgresStorageIdentity:
