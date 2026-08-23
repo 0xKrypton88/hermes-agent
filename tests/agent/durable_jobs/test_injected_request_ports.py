@@ -1887,6 +1887,9 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
         def set(self):
             self._event.set()
 
+        def is_set(self):
+            return self._event.is_set()
+
         def wait(self, _timeout=None):
             return self._event.wait(1)
 
