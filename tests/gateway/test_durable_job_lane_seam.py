@@ -226,31 +226,17 @@ def test_shutdown_clears_active_handle_and_allows_restart(tmp_path, monkeypatch)
     assert recovered.idempotency_key == "idem-restart"
 
 
-def test_explicit_injected_transports_are_wired_behind_existing_ports(
-    tmp_path, monkeypatch
-):
+def test_explicit_injected_transports_are_wired_behind_existing_ports(tmp_path):
     from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
-    from agent.durable_jobs.injected_transports import (
-        CursorCloudInjectedTransport,
-        SlackInjectedTransport,
-    )
     from agent.durable_jobs.slack_bridge import SlackClientBridge
     from gateway.durable_job_lane import attach_durable_job_lane
-    from tests.agent.durable_jobs.package2_support import bind_runtime_secret_env
+    from tests.agent.durable_jobs.package2_support import idle_injected_transports
 
-    bind_runtime_secret_env(monkeypatch)
-
-    def request(**_k):
-        raise AssertionError("transport must stay idle during attach")
-
+    cursor_transport, slack_transport = idle_injected_transports()
     handle = attach_durable_job_lane(
         raw_config=_complete(tmp_path),
-        cursor_transport=CursorCloudInjectedTransport(
-            request=request, secret_ref="CURSOR_API_KEY"
-        ),
-        slack_transport=SlackInjectedTransport(
-            request=request, secret_ref="SLACK_BOT_TOKEN"
-        ),
+        cursor_transport=cursor_transport,
+        slack_transport=slack_transport,
     )
     assert handle is not None
     assert isinstance(handle.cursor_adapter, CursorCloudAdapter)

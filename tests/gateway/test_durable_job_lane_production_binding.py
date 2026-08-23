@@ -1384,7 +1384,7 @@ def test_startup_runtime_identity_dict_colliding_key_hooks_are_not_executed(
 
 
 def test_startup_does_not_expose_environ_backing_as_authority(tmp_path, monkeypatch):
-    from agent.durable_jobs.preflight import _process_environ_dict
+    from agent.durable_jobs.preflight import _secret_ref_present
     from agent.durable_jobs.production_binding import production_attach_kwargs
 
     calls: list = []
@@ -1392,7 +1392,7 @@ def test_startup_does_not_expose_environ_backing_as_authority(tmp_path, monkeypa
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     _install_request_ports(runner, _idle_request(calls), _idle_request(calls))
-    assert _process_environ_dict() is None
+    assert _secret_ref_present("CURSOR_API_KEY") is False
     assert production_attach_kwargs(owner=runner)
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is not None
@@ -1429,7 +1429,7 @@ sys.stdout.write(" present=" + ("1" if present else "0"))
 
 
 def test_startup_does_not_eq_hostile_environ_data_key(tmp_path, monkeypatch):
-    from agent.durable_jobs.preflight import _process_environ_dict
+    from agent.durable_jobs.preflight import _secret_ref_present
 
     calls: list = []
     _, runner = _prepare_startup(tmp_path, monkeypatch)
@@ -1437,7 +1437,7 @@ def test_startup_does_not_eq_hostile_environ_data_key(tmp_path, monkeypatch):
     probes: list = []
     hostile = _ArmedCollidingKey("HERMES_ENG50_V6_HOSTILE_REF", probes, "env_key")
     hostile.arm()
-    assert _process_environ_dict() is None
+    assert _secret_ref_present(hostile) is False
     runner._maybe_attach_durable_job_lane()
     handle = getattr(runner, "_durable_job_lane", None)
     assert handle is not None

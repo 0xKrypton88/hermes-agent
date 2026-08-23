@@ -76,11 +76,15 @@ def _live_looking_slack_adapter():
 
 
 def _install_injected_ports(runner, ports, cursor_client, slack_client):
+    def _resolve_at_request_boundary(secret_ref: str) -> str:
+        return f"test-only:{secret_ref}"
+
     runner._durable_job_cursor_request = ports.CursorCloudInjectedRequestPort(
         client=cursor_client,
         secret_ref=_SECRET_CURSOR,
         workspace_id=WORKSPACE,
         repository_identity=REPO,
+        credential_resolver=_resolve_at_request_boundary,
     )
     runner._durable_job_slack_request = ports.SlackInjectedRequestPort(
         client=slack_client,
@@ -89,6 +93,7 @@ def _install_injected_ports(runner, ports, cursor_client, slack_client):
         channel_id=CHANNEL,
         repository_identity=REPO,
         root_thread_ts=THREAD,
+        credential_resolver=_resolve_at_request_boundary,
     )
     runner._durable_job_slack_channel_id = CHANNEL
     runner._durable_job_slack_root_thread_ts = THREAD
