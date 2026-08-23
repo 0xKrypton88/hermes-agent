@@ -427,7 +427,7 @@ def restore_undelivered_completions(
     owner_ui = str(origin_ui_session_id or "")
     owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
     targeted = bool(owner_ui or owner_keys)
-    restored = 0
+    validated: List[Dict[str, Any]] = []
 
     recover_abandoned_delegations()
     with _DB_LOCK, _transaction() as conn:
@@ -463,9 +463,11 @@ def restore_undelivered_completions(
                     continue
             if isinstance(evt, dict):
                 evt["restored"] = True
-            target_queue.put(evt)
-            restored += 1
-    return restored
+            validated.append(evt)
+
+    for evt in validated:
+        target_queue.put(evt)
+    return len(validated)
 
 
 def discover_pending_completions(
@@ -492,16 +494,13 @@ def discover_pending_completions(
     """
     binding = _assert_legacy_writer_authority()
     skip = {str(x) for x in (exclude_ids or set()) if str(x)}
-    enqueued: List[str] = []
+    validated: List[tuple[str, Dict[str, Any]]] = []
     now = time.time()
     claim_floor = now - _DELIVERY_CLAIM_TTL_SECONDS
 
     # Abandoned running rows become pending terminal events with event_json;
     # pick those up on the same periodic cadence as cross-process completions.
-    try:
-        recover_abandoned_delegations()
-    except Exception:
-        logger.debug("discover_pending_completions: recover failed", exc_info=True)
+    recover_abandoned_delegations()
 
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
@@ -529,10 +528,12 @@ def discover_pending_completions(
                 continue
             _verify_event_writer_authority(evt, binding)
             evt["restored"] = True
-            target_queue.put(evt)
-            enqueued.append(did)
+            validated.append((did, evt))
             skip.add(did)
-    return enqueued
+
+    for _did, evt in validated:
+        target_queue.put(evt)
+    return [did for did, _evt in validated]
 
 
 def handoff_completion_to_outbox(

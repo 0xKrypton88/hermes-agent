@@ -230,13 +230,17 @@ def test_explicit_injected_transports_are_wired_behind_existing_ports(tmp_path):
     from agent.durable_jobs.cursor_cloud import CursorCloudAdapter
     from agent.durable_jobs.slack_bridge import SlackClientBridge
     from gateway.durable_job_lane import attach_durable_job_lane
-    from tests.agent.durable_jobs.package2_support import idle_injected_transports
+    from tests.agent.durable_jobs.package2_support import (
+        idle_injected_transports,
+        make_test_writer_authority,
+    )
 
     cursor_transport, slack_transport = idle_injected_transports()
     handle = attach_durable_job_lane(
         raw_config=_complete(tmp_path),
         cursor_transport=cursor_transport,
         slack_transport=slack_transport,
+        writer_authority_check=make_test_writer_authority(),
     )
     assert handle is not None
     assert isinstance(handle.cursor_adapter, CursorCloudAdapter)

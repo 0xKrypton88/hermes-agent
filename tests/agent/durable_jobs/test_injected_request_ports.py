@@ -20,6 +20,7 @@ passes an owner with matching identity rather than weakening that gate.
 """
 
 from __future__ import annotations
+import contextlib
 
 import inspect
 import sys
@@ -180,6 +181,9 @@ def _matching_identity(**overrides) -> dict:
 def _owner_with_matching_identity(**attrs):
     owner = type("Owner", (), {})()
     owner.__dict__["_durable_job_runtime_identity"] = _matching_identity()
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    owner.__dict__["durable_job_writer_authority_check"] = _authority
     for name, value in attrs.items():
         owner.__dict__[name] = value
     return owner
@@ -1508,6 +1512,9 @@ def test_injected_clients_on_class_or_descriptor_do_not_bind(tmp_path, monkeypat
 
     owner = Owner()
     owner.__dict__["_durable_job_runtime_identity"] = _matching_identity()
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    owner.__dict__["durable_job_writer_authority_check"] = _authority
     bound = bind_production_transports(_complete(tmp_path), owner=owner)
     assert bound == {}
     assert cursor_client.calls == []
@@ -1526,6 +1533,9 @@ def test_wrapped_clients_without_matching_identity_do_not_bind(tmp_path, monkeyp
     owner.__dict__["_durable_job_runtime_identity"] = _matching_identity(
         workspace_id="T-FOREIGN"
     )
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    owner.__dict__["durable_job_writer_authority_check"] = _authority
     bound = bind_production_transports(_complete(tmp_path), owner=owner)
     assert bound == {}
     assert ports.SlackInjectedRequestPort is not None

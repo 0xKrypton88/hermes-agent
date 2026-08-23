@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Mapping
 
 
@@ -64,10 +65,27 @@ def idle_injected_transports():
     )
 
 
+class _TestWriterAuthority:
+    def __call__(self):
+        return None
+
+    @contextmanager
+    def effect_lease(self, _effect_key: str):
+        yield
+
+
+def make_test_writer_authority():
+    return _TestWriterAuthority()
+
+
 def runtime_ready_transport_kwargs(monkeypatch) -> dict[str, Any]:
     bind_runtime_secret_env(monkeypatch)
     cursor, slack = idle_injected_transports()
-    return {"cursor_transport": cursor, "slack_transport": slack}
+    return {
+        "cursor_transport": cursor,
+        "slack_transport": slack,
+        "writer_authority_check": make_test_writer_authority(),
+    }
 
 
 def attach_runtime_ready_lane(

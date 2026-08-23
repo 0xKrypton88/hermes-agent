@@ -19,6 +19,9 @@ FORMAT_VERSION = 1
 _UNSAFE_STATUSES = frozenset({"running", "unknown"})
 _LOCK_TABLES = frozenset({"compression_locks", "session_turn_leases"})
 
+_LEGACY_TABLE_ALLOWLIST = frozenset({"async_delegations", "compression_locks", "delivery_obligations", "gateway_hygiene_state", "gateway_routing", "messages", "schema_version", "session_model_usage", "session_turn_leases", "sessions", "state_meta", "system_prompts"})
+_SECRET_COLUMN_FRAGMENTS = ("token", "api_key", "password", "secret", "credential", "private_key", "dsn")
+
 
 class LegacyMigrationError(RuntimeError):
     """Fail-closed offline migration contract violation."""
@@ -162,7 +165,7 @@ def _table_names(conn: sqlite3.Connection) -> list[str]:
         WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%'
         """
     ).fetchall()
-    return sorted(str(row[0]) for row in rows)
+    return sorted(str(row[0]) for row in rows if str(row[0]) in _LEGACY_TABLE_ALLOWLIST)
 
 
 def _quoted(identifier: str) -> str:
@@ -213,15 +216,23 @@ def plan_legacy_adoption(snapshot: FrozenSQLiteSnapshot) -> AdoptionPlan:
         table_hashes: dict[str, str] = {}
         table_counts: dict[str, int] = {}
         for table in tables:
+            columns = {
+                str(row[1])
+                for row in conn.execute(
+                    f"PRAGMA table_info({_quoted(table)})"
+                ).fetchall()
+            }
+            forbidden = sorted(
+                column for column in columns
+                if any(fragment in column.lower() for fragment in _SECRET_COLUMN_FRAGMENTS)
+            )
+            if forbidden:
+                raise LegacyMigrationError(
+                    f"credential-bearing columns are not migratable: {table}.{','.join(forbidden)}"
+                )
             primary = _pk_columns(conn, table)
             projection = "*"
             if not primary:
-                columns = {
-                    str(row[1])
-                    for row in conn.execute(
-                        f"PRAGMA table_info({_quoted(table)})"
-                    ).fetchall()
-                }
                 if "$rowid" in columns:
                     raise LegacyMigrationError(
                         f"source table {table!r} has ambiguous $rowid column"

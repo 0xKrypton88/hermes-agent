@@ -9,7 +9,7 @@ schema)`` plus required distinct ``postgres_storage_id`` values.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 from urllib.parse import unquote
 
@@ -43,6 +43,10 @@ class PersistedTargetIdentity:
     environment_id: str
     storage_domain: str
     schema_version: int
+    system_identifier: int | None = None
+    database_oid: int | None = None
+    database_name: str | None = None
+    schema_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.storage_id or not self.environment_id or not self.storage_domain:
@@ -51,13 +55,21 @@ class PersistedTargetIdentity:
             raise TargetIdentityError("target schema version must be positive")
 
     def as_markers(self) -> dict[str, str]:
-        return {
+        markers = {
             "identity_format_version": str(IDENTITY_FORMAT_VERSION),
             "storage_id": self.storage_id,
             "environment_id": self.environment_id,
             "storage_domain": self.storage_domain,
             "schema_version": str(self.schema_version),
         }
+        physical = {
+            "system_identifier": self.system_identifier,
+            "database_oid": self.database_oid,
+            "database_name": self.database_name,
+            "schema_name": self.schema_name,
+        }
+        markers.update({key: str(value) for key, value in physical.items() if value is not None})
+        return markers
 
 
 def verify_persisted_target_identity(
@@ -65,13 +77,14 @@ def verify_persisted_target_identity(
 ) -> PersistedTargetIdentity:
     """Return the expected identity only for a complete, exact persisted tuple."""
 
-    present = TARGET_IDENTITY_KEYS.intersection(markers)
-    if present != TARGET_IDENTITY_KEYS:
-        missing = sorted(TARGET_IDENTITY_KEYS - present)
+    required_keys = frozenset(expected.as_markers())
+    present = required_keys.intersection(markers)
+    if present != required_keys:
+        missing = sorted(required_keys - present)
         raise TargetIdentityError(
             "persisted target identity is missing required markers: " + ", ".join(missing)
         )
-    actual = {key: str(markers[key]).strip() for key in TARGET_IDENTITY_KEYS}
+    actual = {key: str(markers[key]).strip() for key in required_keys}
     if actual != expected.as_markers():
         raise TargetIdentityError("persisted target identity does not match expected target")
     return expected
@@ -101,6 +114,7 @@ class PostgresStorageIdentity:
     system_identifier: int
     database: str
     schema: str
+    database_oid: int | None = None
 
 
 def identities_share_schema(
@@ -185,7 +199,9 @@ def probe_live_storage_identity(dsn: str, schema: str) -> PostgresStorageIdentit
         sys_row = conn.execute(
             "SELECT system_identifier FROM pg_control_system()"
         ).fetchone()
-        db_row = conn.execute("SELECT current_database()").fetchone()
+        db_row = conn.execute(
+            "SELECT oid, datname FROM pg_database WHERE datname = current_database()"
+        ).fetchone()
     finally:
         conn.close()
     if sys_row is None or db_row is None:
@@ -193,11 +209,17 @@ def probe_live_storage_identity(dsn: str, schema: str) -> PostgresStorageIdentit
             "PostgreSQL live storage identity probe returned no rows"
         )
     system_identifier = int(sys_row[0] if not isinstance(sys_row, Mapping) else next(iter(sys_row.values())))
-    database = str(db_row[0] if not isinstance(db_row, Mapping) else next(iter(db_row.values())))
+    if isinstance(db_row, Mapping):
+        database_oid = int(db_row["oid"])
+        database = str(db_row["datname"])
+    else:
+        database_oid = int(db_row[0])
+        database = str(db_row[1])
     return PostgresStorageIdentity(
         system_identifier=system_identifier,
         database=database.lower(),
         schema=schema,
+        database_oid=database_oid,
     )
 
 
@@ -362,7 +384,26 @@ def verify_configured_target_identities(config) -> tuple[PersistedTargetIdentity
     except ImportError as exc:  # pragma: no cover - dependency gate
         raise TargetIdentityError("psycopg is required for target identity verification") from exc
 
-    app_expected, checkpoint_expected = configured_target_identities(config)
+    app_live = probe_live_storage_identity(config.postgres_dsn, config.postgres_schema)
+    checkpoint_live = probe_live_storage_identity(
+        config.checkpoint_postgres_dsn, config.checkpoint_postgres_schema
+    )
+    assert_distinct_live_identities(app_live, checkpoint_live)
+    app_logical, checkpoint_logical = configured_target_identities(config)
+    app_expected = replace(
+        app_logical,
+        system_identifier=app_live.system_identifier,
+        database_oid=app_live.database_oid,
+        database_name=app_live.database,
+        schema_name=app_live.schema,
+    )
+    checkpoint_expected = replace(
+        checkpoint_logical,
+        system_identifier=checkpoint_live.system_identifier,
+        database_oid=checkpoint_live.database_oid,
+        database_name=checkpoint_live.database,
+        schema_name=checkpoint_live.schema,
+    )
     targets = (
         (config.postgres_dsn, config.postgres_schema, app_expected),
         (

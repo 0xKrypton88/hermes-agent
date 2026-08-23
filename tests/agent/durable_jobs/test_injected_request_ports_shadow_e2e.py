@@ -86,7 +86,10 @@ def _attach_shadow_lane(tmp_path: Path, monkeypatch, cursor_port, slack_port):
         cursor_request=cursor_port,
         slack_request=slack_port,
     )
-    handle = attach_durable_job_lane(raw_config=raw, **bound)
+    from tests.agent.durable_jobs.package2_support import make_test_writer_authority
+    handle = attach_durable_job_lane(
+        raw_config=raw, writer_authority_check=make_test_writer_authority(), **bound
+    )
     return raw, bound, handle
 
 

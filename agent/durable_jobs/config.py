@@ -71,6 +71,8 @@ DEFAULT_DURABLE_JOBS_CONFIG: dict[str, Any] = {
     "postgres_storage_id": None,
     "checkpoint_postgres_storage_id": None,
     "postgres_environment_id": None,
+    "writer_id": None,
+    "writer_authority_epoch": 0,
     "cursor_adapter_mode": None,
     "slack_adapter_mode": None,
     "cursor_secret_ref": None,
@@ -113,6 +115,8 @@ class DurableJobsConfig:
     postgres_storage_id: Optional[str] = None
     checkpoint_postgres_storage_id: Optional[str] = None
     postgres_environment_id: Optional[str] = None
+    writer_id: Optional[str] = None
+    writer_authority_epoch: int = 0
     cursor_adapter_mode: Optional[str] = None
     slack_adapter_mode: Optional[str] = None
     cursor_secret_ref: Optional[str] = None
@@ -473,6 +477,13 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
                 "must be distinct"
             )
 
+    writer_id = _optional_text(merged.get("writer_id"))
+    writer_authority_epoch = merged.get("writer_authority_epoch")
+    if type(writer_authority_epoch) is not int or writer_authority_epoch < 0:
+        raise DurableJobsConfigError(
+            "durable_jobs.writer_authority_epoch must be a non-negative integer"
+        )
+
     cursor_adapter_mode = _parse_adapter_mode(
         "cursor_adapter_mode", merged.get("cursor_adapter_mode")
     )
@@ -503,6 +514,8 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
         postgres_storage_id=postgres_storage_id,
         checkpoint_postgres_storage_id=checkpoint_postgres_storage_id,
         postgres_environment_id=postgres_environment_id,
+        writer_id=writer_id,
+        writer_authority_epoch=writer_authority_epoch,
         cursor_adapter_mode=cursor_adapter_mode,
         slack_adapter_mode=slack_adapter_mode,
         cursor_secret_ref=cursor_secret_ref,

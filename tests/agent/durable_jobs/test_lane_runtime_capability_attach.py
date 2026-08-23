@@ -10,6 +10,7 @@ No live Slack/Cursor/network. PostgreSQL is not imported.
 """
 
 from __future__ import annotations
+from tests.agent.durable_jobs.package2_support import make_test_writer_authority
 
 import socket
 import sys
@@ -232,7 +233,10 @@ def test_attach_missing_secret_env_does_not_wire_matching_transports(
     assert report.constructible is True
     assert report.runtime_ready is False
     handle = attach_durable_job_lane(
-        raw_config=raw, cursor_transport=cursor, slack_transport=slack
+        raw_config=raw,
+        cursor_transport=cursor,
+        slack_transport=slack,
+        writer_authority_check=make_test_writer_authority(),
     )
     _assert_unattached(handle, transport_calls, cursor_calls, slack_calls)
     _assert_no_secrets(report)
@@ -272,7 +276,7 @@ def test_attach_mismatched_transport_secret_refs_does_not_wire(
     assert report.runtime_ready is False
     assert "transport_secret_ref_mismatch" in report.reasons
     handle = attach_durable_job_lane(
-        raw_config=raw, cursor_transport=cursor, slack_transport=slack
+        raw_config=raw, cursor_transport=cursor, slack_transport=slack, writer_authority_check=make_test_writer_authority()
     )
     _assert_unattached(handle, transport_calls, cursor_calls, slack_calls)
     _assert_no_secrets(report)
@@ -324,7 +328,7 @@ def test_attach_missing_request_resolver_does_not_wire(tmp_path, monkeypatch):
     assert report.constructible is True
     assert report.runtime_ready is False
     handle = attach_durable_job_lane(
-        raw_config=raw, cursor_transport=cursor, slack_transport=slack
+        raw_config=raw, cursor_transport=cursor, slack_transport=slack, writer_authority_check=make_test_writer_authority()
     )
     _assert_unattached(handle, transport_calls, cursor_calls, slack_calls)
 
@@ -434,7 +438,7 @@ def test_attach_self_attested_subclass_does_not_wire(tmp_path, monkeypatch):
     assert report.constructible is True
     assert report.runtime_ready is False
     handle = attach_durable_job_lane(
-        raw_config=raw, cursor_transport=cursor, slack_transport=slack
+        raw_config=raw, cursor_transport=cursor, slack_transport=slack, writer_authority_check=make_test_writer_authority()
     )
     _assert_unattached(handle, transport_calls, cursor_calls, slack_calls)
 
@@ -463,7 +467,7 @@ def test_attach_matching_approved_concrete_transports_wires_without_calling(
     )
     assert report.runtime_ready is True
     handle = attach_durable_job_lane(
-        raw_config=raw, cursor_transport=cursor, slack_transport=slack
+        raw_config=raw, cursor_transport=cursor, slack_transport=slack, writer_authority_check=make_test_writer_authority()
     )
     assert handle is not None
     assert get_active_durable_job_lane() is handle
@@ -504,6 +508,7 @@ def test_failed_attach_does_not_occupy_owner_slot(tmp_path, monkeypatch):
         raw_config=raw,
         cursor_transport=cursor,
         slack_transport=slack,
+        writer_authority_check=make_test_writer_authority(),
     )
     assert handle is not None
     assert calls == []

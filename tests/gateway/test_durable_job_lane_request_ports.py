@@ -11,6 +11,7 @@ refusal is the port gate rather than a weakened identity check.
 """
 
 from __future__ import annotations
+import contextlib
 
 import socket
 from pathlib import Path
@@ -98,6 +99,9 @@ def _install_injected_ports(runner, ports, cursor_client, slack_client):
     runner._durable_job_slack_channel_id = CHANNEL
     runner._durable_job_slack_root_thread_ts = THREAD
     runner._durable_job_runtime_identity = _matching_identity()
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    runner.durable_job_writer_authority_check = _authority
 
 
 def test_gateway_seam_does_not_attach_from_live_looking_slack_adapter(
@@ -191,6 +195,9 @@ def test_gateway_missing_or_wrong_port_has_zero_effect(tmp_path, monkeypatch):
     ports = _load_ports()
     _raw, runner = _prepare(tmp_path, monkeypatch)
     runner._durable_job_runtime_identity = _matching_identity()
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    runner.durable_job_writer_authority_check = _authority
     slack_client = FakeSlackClient()
     runner._durable_job_slack_request = ports.SlackInjectedRequestPort(
         client=slack_client,
@@ -225,6 +232,9 @@ def test_gateway_identity_mismatch_does_not_attach_injected_ports(
         "workspace_id": "T-FOREIGN",
         "repository_identity": REPO,
     }
+    _authority = lambda: None
+    _authority.effect_lease = lambda _effect_key: contextlib.nullcontext()
+    runner.durable_job_writer_authority_check = _authority
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
     assert cursor_client.calls == []

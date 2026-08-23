@@ -142,6 +142,7 @@ def _install_request_ports(
     owner._durable_job_slack_root_thread_ts = "1700000000.000001"
     if install_identity:
         owner._durable_job_runtime_identity = bound_identity
+    owner.durable_job_writer_authority_check = _TestWriterAuthority()
 
 
 def _matching_identity(**overrides) -> dict:
@@ -151,6 +152,15 @@ def _matching_identity(**overrides) -> dict:
     }
     identity.update(overrides)
     return identity
+
+
+class _TestWriterAuthority:
+    def __call__(self):
+        return None
+
+    @contextmanager
+    def effect_lease(self, _effect_key):
+        yield
 
 
 class _SeamDescriptor:
@@ -582,7 +592,9 @@ def _prepare_startup(tmp_path: Path, monkeypatch, **overrides):
     bind_runtime_secret_env(monkeypatch)
     raw = _complete(tmp_path, **overrides)
     _write_active_config(tmp_path, raw)
-    return raw, _make_runner(tmp_path)
+    runner = _make_runner(tmp_path)
+    runner.durable_job_writer_authority_check = _TestWriterAuthority()
+    return raw, runner
 
 
 def test_startup_without_production_ports_does_not_attach_valid_candidate_config(
@@ -889,6 +901,7 @@ def test_startup_old_runner_stop_does_not_retire_new_runner_lane(
     attach_to_gateway_runner(
         old,
         raw_config=old_raw,
+        writer_authority_check=old.durable_job_writer_authority_check,
         **bind_production_transports(
             old_raw,
             owner=old,
@@ -899,6 +912,7 @@ def test_startup_old_runner_stop_does_not_retire_new_runner_lane(
     attach_to_gateway_runner(
         new,
         raw_config=new_raw,
+        writer_authority_check=new.durable_job_writer_authority_check,
         **bind_production_transports(
             new_raw,
             owner=new,
@@ -1099,6 +1113,9 @@ def test_startup_concrete_instance_storage_ignores_class_descriptors(
     storage["_durable_job_slack_root_thread_ts"] = approved_storage[
         "_durable_job_slack_root_thread_ts"
     ]
+    storage["durable_job_writer_authority_check"] = approved_storage[
+        "durable_job_writer_authority_check"
+    ]
     runner._maybe_attach_durable_job_lane()
     handle = getattr(runner, "_durable_job_lane", None)
     assert handle is not None
@@ -1184,6 +1201,9 @@ def test_startup_owner_metaclass_hooks_are_not_executed(tmp_path, monkeypatch):
     ]
     storage["_durable_job_slack_root_thread_ts"] = approved_storage[
         "_durable_job_slack_root_thread_ts"
+    ]
+    storage["durable_job_writer_authority_check"] = approved_storage[
+        "durable_job_writer_authority_check"
     ]
     armed["on"] = True
     runner._maybe_attach_durable_job_lane()

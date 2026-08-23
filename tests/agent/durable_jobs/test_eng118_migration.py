@@ -378,12 +378,10 @@ def test_new_lane_attach_and_dispatch_recheck_authoritative_binding(
     def deny():
         raise failure
 
+    transport_kwargs = runtime_ready_transport_kwargs(monkeypatch)
+    transport_kwargs["writer_authority_check"] = deny
     with pytest.raises(RuntimeError, match="authority denied"):
-        attach_durable_job_lane(
-            raw_config=raw,
-            **runtime_ready_transport_kwargs(monkeypatch),
-            writer_authority_check=deny,
-        )
+        attach_durable_job_lane(raw_config=raw, **transport_kwargs)
     assert not (tmp_path / "jobs.sqlite").exists()
 
     lane = DurableLaneService(
@@ -499,13 +497,18 @@ def test_session_handoff_rechecks_writer_authority_at_effect_boundary(tmp_path):
     lane, job = _lane(tmp_path)
     checks = 0
 
-    def lose_before_linear():
-        nonlocal checks
-        checks += 1
-        if checks == 5:
-            raise WriterAuthorityError("writer authority lost before effect")
+    class LosingAuthority:
+        def __call__(self):
+            nonlocal checks
+            checks += 1
+            if checks == 5:
+                raise WriterAuthorityError("writer authority lost before effect")
 
-    lane._writer_authority_check = lose_before_linear
+        def effect_lease(self, _effect_key):
+            from contextlib import nullcontext
+            return nullcontext()
+
+    lane._writer_authority_check = LosingAuthority()
     linear, slack, sessions = _Linear(), _Slack(), _Sessions()
     with pytest.raises(WriterAuthorityError, match="before effect"):
         lane.resume_session_handoff(
@@ -590,3 +593,60 @@ def test_restore_accepts_completion_from_current_writer_epoch(monkeypatch):
     finally:
         module.configure_legacy_writer_authority_check(None)
     assert queued[0]["restored"] is True
+
+def test_persisted_effect_lease_fences_authority_handover(tmp_path):
+    import sqlite3
+    from agent.durable_jobs.writer_authority import (
+        AuthorityTarget, DatastoreWriterAuthorityCheck, WRITER_AUTHORITY_DDL,
+        WriterAuthorityBinding, WriterAuthorityError, activate_writer_authority,
+    )
+
+    path = tmp_path / "authority.db"
+    setup = sqlite3.connect(path)
+    setup.execute(WRITER_AUTHORITY_DDL)
+    current = WriterAuthorityBinding("storage", "env", 1, "writer-a", "new")
+    activate_writer_authority(setup, current)
+    setup.commit()
+    setup.close()
+
+    provider = lambda: sqlite3.connect(path)
+    check = DatastoreWriterAuthorityCheck.from_connection_provider(
+        provider, expected=AuthorityTarget("storage", "env"), requested_mode="new",
+        writer_id="writer-a", minimum_epoch=1,
+    )
+    replacement = WriterAuthorityBinding("storage", "env", 2, "writer-b", "new")
+    with check.effect_lease("linear:job-1"):
+        connection = provider()
+        with pytest.raises(WriterAuthorityError, match="live external-effect lease"):
+            activate_writer_authority(connection, replacement)
+        connection.close()
+
+    connection = provider()
+    activate_writer_authority(connection, replacement)
+    connection.commit()
+    connection.close()
+
+def test_shadow_excludes_unclassified_secret_tables_and_rejects_secret_columns(tmp_path):
+    import sqlite3
+    from agent.durable_jobs import legacy_migration as migration
+
+    unknown = tmp_path / "unknown.sqlite"
+    with sqlite3.connect(unknown) as conn:
+        conn.execute("CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY, refresh_token TEXT)")
+        conn.execute("INSERT INTO oauth_tokens VALUES (1, 'do-not-copy')")
+    snapshot = migration.FrozenSQLiteSnapshot(
+        path=unknown, file_sha256=hashlib.sha256(unknown.read_bytes()).hexdigest()
+    )
+    plan = migration.plan_legacy_adoption(snapshot)
+    assert plan.entries == ()
+    assert "do-not-copy" not in repr(plan)
+
+    classified = tmp_path / "classified.sqlite"
+    with sqlite3.connect(classified) as conn:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, api_token TEXT)")
+        conn.execute("INSERT INTO messages VALUES (1, 'do-not-copy')")
+    snapshot = migration.FrozenSQLiteSnapshot(
+        path=classified, file_sha256=hashlib.sha256(classified.read_bytes()).hexdigest()
+    )
+    with pytest.raises(migration.LegacyMigrationError, match="credential-bearing columns"):
+        migration.plan_legacy_adoption(snapshot)

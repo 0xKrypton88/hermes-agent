@@ -320,6 +320,22 @@ class DurableLaneService:
         if self._writer_authority_check is not None:
             self._writer_authority_check()
 
+    @contextmanager
+    def _effect_authority_lease(self, effect_key: str):
+        check = self._writer_authority_check
+        if check is None:
+            yield
+            return
+        lease = getattr(check, "effect_lease", None)
+        if not callable(lease):
+            raise WriterAuthorityError(
+                "datastore-backed effect lease is required for external effects"
+            )
+        with lease(effect_key):
+            self._assert_fresh_writer_authority()
+            yield
+            self._assert_fresh_writer_authority()
+
     def _checkout_for_mutation(self) -> DurableJobStore:
         self._require_enabled()
         # A successful attach is not durable authority for a later write.
@@ -400,12 +416,14 @@ class DurableLaneService:
                 slack: SlackHandoffProjection,
                 sessions: ChildSessionPort,
                 require_writer_authority: Any,
+                effect_authority_lease: Any,
             ) -> None:
                 self.ledger = ledger
                 self.linear = linear
                 self.slack = slack
                 self.sessions = sessions
                 self.require_writer_authority = require_writer_authority
+                self.effect_authority_lease = effect_authority_lease
 
             def _claim_effect(
                 self, job_id: str, handoff_id: str, effect_name: str
@@ -505,87 +523,88 @@ class DurableLaneService:
                 active_claim: EffectClaim | None = None
                 active_guard: _EffectOwnerGuard | None = None
                 try:
-                    if _STAGE_INDEX[state.stage] < _STAGE_INDEX["LINEAR_VERIFIED"]:
-                        active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "LINEAR_UPSERT"
-                        )
-                        self.require_writer_authority()
-                        receipt = self.linear.upsert_handoff(
-                            issue=handoff.issue,
-                            canonical=canonical,
-                            idempotency_key=f"{key}:linear",
-                        )
-                        if self.linear.read_handoff(issue=handoff.issue) != canonical:
-                            raise ProjectionVerificationError(
-                                "Linear readback mismatch"
+                    with self.effect_authority_lease(f"{key}:handoff"):
+                        if _STAGE_INDEX[state.stage] < _STAGE_INDEX["LINEAR_VERIFIED"]:
+                            active_claim, active_guard = self._claim_effect(
+                                job_id, handoff.handoff_id, "LINEAR_UPSERT"
                             )
-                        state = self._complete_effect(
-                            active_claim, active_guard, receipt=receipt
-                        )
-                        active_guard = None
-                    if _STAGE_INDEX[state.stage] < _STAGE_INDEX["SLACK_RECEIPTED"]:
-                        active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "SLACK_RECEIPT"
-                        )
-                        self.require_writer_authority()
-                        receipt = self.slack.post_handoff_receipt(
-                            handoff_id=handoff.handoff_id,
-                            resume_pointer=safe_resume_pointer,
-                            idempotency_key=f"{key}:slack",
-                        )
-                        state = self._complete_effect(
-                            active_claim, active_guard, receipt=receipt
-                        )
-                        active_guard = None
-                    if _STAGE_INDEX[state.stage] < _STAGE_INDEX["CHILD_CREATED"]:
-                        active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "CHILD_CREATE"
-                        )
-                        self.require_writer_authority()
-                        child = self.sessions.find_or_create_child(
-                            parent_session_id=parent_session_id,
-                            handoff_id=handoff.handoff_id,
-                            idempotency_key=f"{key}:child",
-                        )
-                        state = self._complete_effect(
-                            active_claim, active_guard, receipt=child
-                        )
-                        active_guard = None
-                    child_id = state.child_session_id
-                    if not child_id:
-                        raise ProjectionVerificationError(
-                            "child session receipt missing"
-                        )
-                    if _STAGE_INDEX[state.stage] < _STAGE_INDEX["HANDOFF_INJECTED"]:
-                        active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "HANDOFF_INJECT"
-                        )
-                        self.require_writer_authority()
-                        self.sessions.inject_handoff(
-                            child_session_id=child_id,
-                            canonical=canonical,
-                            idempotency_key=f"{key}:inject",
-                        )
-                        state = self._complete_effect(active_claim, active_guard)
-                        active_guard = None
-                    if _STAGE_INDEX[state.stage] < _STAGE_INDEX["FIRST_TURN_STARTED"]:
-                        active_claim, active_guard = self._claim_effect(
-                            job_id, handoff.handoff_id, "FIRST_TURN_START"
-                        )
-                        self.require_writer_authority()
-                        self.sessions.start_first_turn(
-                            child_session_id=child_id,
-                            next_action=safe_next_action,
-                            idempotency_key=f"{key}:first-turn",
-                        )
-                        state = self._complete_effect(active_claim, active_guard)
-                        active_guard = None
-                    if state.stage != "COMPLETE":
-                        self.require_writer_authority()
-                        state = self.ledger._advance(
-                            job_id, handoff.handoff_id, "COMPLETE"
-                        )
-                    return state
+                            self.require_writer_authority()
+                            receipt = self.linear.upsert_handoff(
+                                issue=handoff.issue,
+                                canonical=canonical,
+                                idempotency_key=f"{key}:linear",
+                            )
+                            if self.linear.read_handoff(issue=handoff.issue) != canonical:
+                                raise ProjectionVerificationError(
+                                    "Linear readback mismatch"
+                                )
+                            state = self._complete_effect(
+                                active_claim, active_guard, receipt=receipt
+                            )
+                            active_guard = None
+                        if _STAGE_INDEX[state.stage] < _STAGE_INDEX["SLACK_RECEIPTED"]:
+                            active_claim, active_guard = self._claim_effect(
+                                job_id, handoff.handoff_id, "SLACK_RECEIPT"
+                            )
+                            self.require_writer_authority()
+                            receipt = self.slack.post_handoff_receipt(
+                                handoff_id=handoff.handoff_id,
+                                resume_pointer=safe_resume_pointer,
+                                idempotency_key=f"{key}:slack",
+                            )
+                            state = self._complete_effect(
+                                active_claim, active_guard, receipt=receipt
+                            )
+                            active_guard = None
+                        if _STAGE_INDEX[state.stage] < _STAGE_INDEX["CHILD_CREATED"]:
+                            active_claim, active_guard = self._claim_effect(
+                                job_id, handoff.handoff_id, "CHILD_CREATE"
+                            )
+                            self.require_writer_authority()
+                            child = self.sessions.find_or_create_child(
+                                parent_session_id=parent_session_id,
+                                handoff_id=handoff.handoff_id,
+                                idempotency_key=f"{key}:child",
+                            )
+                            state = self._complete_effect(
+                                active_claim, active_guard, receipt=child
+                            )
+                            active_guard = None
+                        child_id = state.child_session_id
+                        if not child_id:
+                            raise ProjectionVerificationError(
+                                "child session receipt missing"
+                            )
+                        if _STAGE_INDEX[state.stage] < _STAGE_INDEX["HANDOFF_INJECTED"]:
+                            active_claim, active_guard = self._claim_effect(
+                                job_id, handoff.handoff_id, "HANDOFF_INJECT"
+                            )
+                            self.require_writer_authority()
+                            self.sessions.inject_handoff(
+                                child_session_id=child_id,
+                                canonical=canonical,
+                                idempotency_key=f"{key}:inject",
+                            )
+                            state = self._complete_effect(active_claim, active_guard)
+                            active_guard = None
+                        if _STAGE_INDEX[state.stage] < _STAGE_INDEX["FIRST_TURN_STARTED"]:
+                            active_claim, active_guard = self._claim_effect(
+                                job_id, handoff.handoff_id, "FIRST_TURN_START"
+                            )
+                            self.require_writer_authority()
+                            self.sessions.start_first_turn(
+                                child_session_id=child_id,
+                                next_action=safe_next_action,
+                                idempotency_key=f"{key}:first-turn",
+                            )
+                            state = self._complete_effect(active_claim, active_guard)
+                            active_guard = None
+                        if state.stage != "COMPLETE":
+                            self.require_writer_authority()
+                            state = self.ledger._advance(
+                                job_id, handoff.handoff_id, "COMPLETE"
+                            )
+                        return state
                 except (EffectReconciliationRequired, WriterAuthorityError):
                     raise
                 except Exception as exc:
@@ -630,6 +649,7 @@ class DurableLaneService:
                 slack=slack,
                 sessions=sessions,
                 require_writer_authority=self._assert_fresh_writer_authority,
+                effect_authority_lease=self._effect_authority_lease,
             ).resume(
                 job_id=job_id,
                 parent_session_id=parent_session_id,

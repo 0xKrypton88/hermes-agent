@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from dataclasses import replace
 from types import SimpleNamespace
 
 SECRET = "supersecret"
@@ -130,11 +131,30 @@ def test_production_target_identity_verification_reads_both_declared_stores(monk
     from agent.durable_jobs.config import load_durable_jobs_config
     from agent.durable_jobs.postgres_identity import (
         configured_target_identities,
+        PostgresStorageIdentity,
         verify_configured_target_identities,
     )
 
     config = load_durable_jobs_config(_pg())
     app, checkpoint = configured_target_identities(config)
+    live = [
+        PostgresStorageIdentity(
+            system_identifier="cluster-a", database="appdb", schema="durable_jobs_app", database_oid=101
+        ),
+        PostgresStorageIdentity(
+            system_identifier="cluster-b", database="checkpointdb", schema="durable_jobs_checkpoint", database_oid=202
+        ),
+    ]
+    monkeypatch.setattr(
+        "agent.durable_jobs.postgres_identity.probe_live_storage_identity",
+        lambda _dsn, _schema: live.pop(0),
+    )
+    app = replace(
+        app, system_identifier="cluster-a", database_oid=101, database_name="appdb", schema_name="durable_jobs_app"
+    )
+    checkpoint = replace(
+        checkpoint, system_identifier="cluster-b", database_oid=202, database_name="checkpointdb", schema_name="durable_jobs_checkpoint"
+    )
     rows = [list(app.as_markers().items()), list(checkpoint.as_markers().items())]
     connections = []
 

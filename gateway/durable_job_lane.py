@@ -435,9 +435,11 @@ def attach_durable_job_lane(
                 raise DurableJobLaneAlreadyAttached(
                     "durable job lane is already attached for this owner"
                 )
-        if writer_authority_check is not None:
-            # Fail before adapters or schema-owning stores are constructed.
-            writer_authority_check()
+        if writer_authority_check is None:
+            logger.debug("durable job lane refusing attach; writer authority unbound")
+            return None
+        # Fail before adapters or schema-owning stores are constructed.
+        writer_authority_check()
         try:
             cursor_adapter = cursor_adapter_from_config(
                 cfg, transport=cursor_transport

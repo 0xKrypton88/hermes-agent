@@ -509,5 +509,39 @@ def production_attach_kwargs(
     raw_config: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Lifecycle helper: bind production transports for Gateway attach."""
-    return bind_production_transports(raw_config, owner=owner, **kwargs)
+    """Lifecycle helper: bind transports and mandatory datastore authority."""
+    authority_check = _owner_attr(owner, "durable_job_writer_authority_check")
+    if not callable(authority_check):
+        connection_provider = _owner_attr(
+            owner, "durable_job_writer_authority_connection_provider"
+        )
+        if not callable(connection_provider):
+            return {}
+        try:
+            from agent.durable_jobs.config import load_durable_jobs_config
+            from agent.durable_jobs.writer_authority import (
+                AuthorityTarget,
+                DatastoreWriterAuthorityCheck,
+            )
+
+            config = load_durable_jobs_config(raw_config or {})
+            if not config.writer_id or config.writer_authority_epoch <= 0:
+                return {}
+            authority_check = DatastoreWriterAuthorityCheck.from_connection_provider(
+                connection_provider,
+                expected=AuthorityTarget(
+                    config.postgres_storage_id, config.postgres_environment_id
+                ),
+                requested_mode="new",
+                writer_id=config.writer_id,
+                minimum_epoch=config.writer_authority_epoch,
+            )
+        except (TypeError, ValueError, DurableJobsConfigError):
+            return {}
+    if not callable(getattr(authority_check, "effect_lease", None)):
+        return {}
+    bound = bind_production_transports(raw_config, owner=owner, **kwargs)
+    if not bound:
+        return {}
+    bound["writer_authority_check"] = authority_check
+    return bound
