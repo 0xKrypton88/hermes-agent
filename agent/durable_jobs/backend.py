@@ -26,6 +26,11 @@ def open_application_store(config: DurableJobsConfig) -> Any:
             raise DurableJobsConfigError(
                 "durable_jobs.postgres_dsn and postgres_schema are required"
             )
+        from agent.durable_jobs.postgres_identity import (
+            verify_configured_target_identities,
+        )
+
+        verify_configured_target_identities(config)
         return PostgresDurableJobStore(
             dsn=config.postgres_dsn,
             schema=config.postgres_schema,
@@ -54,6 +59,11 @@ def open_langgraph_checkpointer(config: DurableJobsConfig) -> tuple[Any, Any]:
                 "durable_jobs.checkpoint_postgres_dsn and "
                 "checkpoint_postgres_schema are required"
             )
+        from agent.durable_jobs.postgres_identity import (
+            verify_configured_target_identities,
+        )
+
+        verify_configured_target_identities(config)
         return open_postgres_checkpointer(
             dsn=config.checkpoint_postgres_dsn,
             schema=config.checkpoint_postgres_schema,

@@ -50,6 +50,7 @@ _POSTGRES_KEYS = (
     "checkpoint_postgres_schema",
     "postgres_storage_id",
     "checkpoint_postgres_storage_id",
+    "postgres_environment_id",
 )
 
 ADAPTER_MODE_NULL = "null"
@@ -69,6 +70,7 @@ DEFAULT_DURABLE_JOBS_CONFIG: dict[str, Any] = {
     "checkpoint_postgres_schema": None,
     "postgres_storage_id": None,
     "checkpoint_postgres_storage_id": None,
+    "postgres_environment_id": None,
     "cursor_adapter_mode": None,
     "slack_adapter_mode": None,
     "cursor_secret_ref": None,
@@ -110,6 +112,7 @@ class DurableJobsConfig:
     checkpoint_postgres_schema: Optional[str] = None
     postgres_storage_id: Optional[str] = None
     checkpoint_postgres_storage_id: Optional[str] = None
+    postgres_environment_id: Optional[str] = None
     cursor_adapter_mode: Optional[str] = None
     slack_adapter_mode: Optional[str] = None
     cursor_secret_ref: Optional[str] = None
@@ -415,6 +418,7 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
     checkpoint_postgres_schema: Optional[str] = None
     postgres_storage_id: Optional[str] = None
     checkpoint_postgres_storage_id: Optional[str] = None
+    postgres_environment_id: Optional[str] = None
     if backend == BACKEND_POSTGRESQL:
         if postgres_dsn is None:
             raise DurableJobsConfigError("durable_jobs.postgres_dsn is required")
@@ -449,6 +453,10 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
         checkpoint_postgres_storage_id = validate_storage_id(
             merged.get("checkpoint_postgres_storage_id"),
             "checkpoint_postgres_storage_id",
+        )
+        postgres_environment_id = validate_storage_id(
+            merged.get("postgres_environment_id"),
+            "postgres_environment_id",
         )
         if postgres_storage_id == checkpoint_postgres_storage_id:
             raise DurableJobsConfigError(
@@ -494,6 +502,7 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
         checkpoint_postgres_schema=checkpoint_postgres_schema,
         postgres_storage_id=postgres_storage_id,
         checkpoint_postgres_storage_id=checkpoint_postgres_storage_id,
+        postgres_environment_id=postgres_environment_id,
         cursor_adapter_mode=cursor_adapter_mode,
         slack_adapter_mode=slack_adapter_mode,
         cursor_secret_ref=cursor_secret_ref,

@@ -71,7 +71,10 @@ from agent.durable_jobs.slack_contract import (
     resolve_provider_origin,
 )
 from agent.durable_jobs.store import DurableJobStore
-from agent.durable_jobs.writer_authority import WriterAuthorityCheck
+from agent.durable_jobs.writer_authority import (
+    WriterAuthorityCheck,
+    WriterAuthorityError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -313,11 +316,14 @@ class DurableLaneService:
             return True
         return False
 
+    def _assert_fresh_writer_authority(self) -> None:
+        if self._writer_authority_check is not None:
+            self._writer_authority_check()
+
     def _checkout_for_mutation(self) -> DurableJobStore:
         self._require_enabled()
-        if self._writer_authority_check is not None:
-            # A successful attach is not durable authority for a later write.
-            self._writer_authority_check()
+        # A successful attach is not durable authority for a later write.
+        self._assert_fresh_writer_authority()
         self._after_admission()
         store = self._require_sqlite_path()
         self._after_store_checkout()
@@ -393,18 +399,22 @@ class DurableLaneService:
                 linear: LinearHandoffProjection,
                 slack: SlackHandoffProjection,
                 sessions: ChildSessionPort,
+                require_writer_authority: Any,
             ) -> None:
                 self.ledger = ledger
                 self.linear = linear
                 self.slack = slack
                 self.sessions = sessions
+                self.require_writer_authority = require_writer_authority
 
             def _claim_effect(
                 self, job_id: str, handoff_id: str, effect_name: str
             ) -> tuple[EffectClaim, _EffectOwnerGuard]:
+                self.require_writer_authority()
                 guard = self.ledger.effect_owner_guard(job_id, handoff_id, effect_name)
                 try:
                     guard.acquire()
+                    self.require_writer_authority()
                 except EffectOwnershipLost as exc:
                     raise EffectReconciliationRequired(
                         f"{effect_name} has a live effect owner"
@@ -434,6 +444,7 @@ class DurableLaneService:
                 receipt: str | None = None,
             ) -> HandoffState:
                 try:
+                    self.require_writer_authority()
                     return self.ledger._complete_effect(
                         claim.job_id,
                         claim.handoff_id,
@@ -478,12 +489,14 @@ class DurableLaneService:
                     raise HandoffIdentityMismatch(
                         "issue must be a secret-free Linear identifier"
                     )
+                self.require_writer_authority()
                 state = self.ledger._stage(job_id, parent_session_id, handoff)
                 if state.failure_reason and not manual_resume:
                     raise ManualResumeRequired(
                         state.manual_resume_action or _MANUAL_RESUME
                     )
                 if state.failure_reason:
+                    self.require_writer_authority()
                     state = self.ledger._resume_failed(job_id, handoff.handoff_id)
                 canonical = self.ledger.canonical(job_id, handoff.handoff_id)
                 canonical_payload = json.loads(canonical)
@@ -496,6 +509,7 @@ class DurableLaneService:
                         active_claim, active_guard = self._claim_effect(
                             job_id, handoff.handoff_id, "LINEAR_UPSERT"
                         )
+                        self.require_writer_authority()
                         receipt = self.linear.upsert_handoff(
                             issue=handoff.issue,
                             canonical=canonical,
@@ -513,6 +527,7 @@ class DurableLaneService:
                         active_claim, active_guard = self._claim_effect(
                             job_id, handoff.handoff_id, "SLACK_RECEIPT"
                         )
+                        self.require_writer_authority()
                         receipt = self.slack.post_handoff_receipt(
                             handoff_id=handoff.handoff_id,
                             resume_pointer=safe_resume_pointer,
@@ -526,6 +541,7 @@ class DurableLaneService:
                         active_claim, active_guard = self._claim_effect(
                             job_id, handoff.handoff_id, "CHILD_CREATE"
                         )
+                        self.require_writer_authority()
                         child = self.sessions.find_or_create_child(
                             parent_session_id=parent_session_id,
                             handoff_id=handoff.handoff_id,
@@ -544,6 +560,7 @@ class DurableLaneService:
                         active_claim, active_guard = self._claim_effect(
                             job_id, handoff.handoff_id, "HANDOFF_INJECT"
                         )
+                        self.require_writer_authority()
                         self.sessions.inject_handoff(
                             child_session_id=child_id,
                             canonical=canonical,
@@ -555,6 +572,7 @@ class DurableLaneService:
                         active_claim, active_guard = self._claim_effect(
                             job_id, handoff.handoff_id, "FIRST_TURN_START"
                         )
+                        self.require_writer_authority()
                         self.sessions.start_first_turn(
                             child_session_id=child_id,
                             next_action=safe_next_action,
@@ -563,11 +581,12 @@ class DurableLaneService:
                         state = self._complete_effect(active_claim, active_guard)
                         active_guard = None
                     if state.stage != "COMPLETE":
+                        self.require_writer_authority()
                         state = self.ledger._advance(
                             job_id, handoff.handoff_id, "COMPLETE"
                         )
                     return state
-                except EffectReconciliationRequired:
+                except (EffectReconciliationRequired, WriterAuthorityError):
                     raise
                 except Exception as exc:
                     if active_claim is None:
@@ -610,6 +629,7 @@ class DurableLaneService:
                 linear=linear,
                 slack=slack,
                 sessions=sessions,
+                require_writer_authority=self._assert_fresh_writer_authority,
             ).resume(
                 job_id=job_id,
                 parent_session_id=parent_session_id,

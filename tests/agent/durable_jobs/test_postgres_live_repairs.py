@@ -118,6 +118,7 @@ def test_live_setup_rejects_aliased_same_schema_even_with_distinct_storage_ids(
                     "checkpoint_postgres_schema": schema,
                     "postgres_storage_id": "app_one",
                     "checkpoint_postgres_storage_id": "ckpt_two",
+                    "postgres_environment_id": "test",
                 }
             }
         )
@@ -225,6 +226,7 @@ def _advance_in_process(dsn: str, app_schema: str, ckpt_schema: str, key: str, q
                 "checkpoint_postgres_schema": ckpt_schema,
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
             }
         }
     )

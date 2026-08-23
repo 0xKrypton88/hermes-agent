@@ -182,6 +182,7 @@ def test_postgresql_complete_config_does_not_allow_lane_dispatch(tmp_path):
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
                 "cursor_adapter_mode": "injected",
                 "slack_adapter_mode": "injected",
                 "cursor_secret_ref": "CURSOR_API_KEY",

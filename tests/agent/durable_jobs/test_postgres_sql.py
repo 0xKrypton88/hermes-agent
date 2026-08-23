@@ -200,8 +200,13 @@ def test_checkpointer_factory_does_not_use_sqlite_or_memory_for_postgresql(
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
             }
         }
+    )
+    monkeypatch.setattr(
+        "agent.durable_jobs.postgres_identity.verify_configured_target_identities",
+        lambda _config: None,
     )
     saver, conn = open_langgraph_checkpointer(cfg)
     assert saver == "pg-saver"

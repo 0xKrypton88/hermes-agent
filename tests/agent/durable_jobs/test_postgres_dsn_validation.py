@@ -18,6 +18,7 @@ def _base(**overrides):
         "checkpoint_postgres_schema": "durable_jobs_ckpt",
         "postgres_storage_id": "durable_app",
         "checkpoint_postgres_storage_id": "durable_ckpt",
+        "postgres_environment_id": "test",
     }
     section.update(overrides)
     return {"durable_jobs": section}

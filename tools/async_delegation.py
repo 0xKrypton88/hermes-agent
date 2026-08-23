@@ -108,10 +108,34 @@ def configure_legacy_writer_authority_check(
     _legacy_writer_authority_check = check
 
 
-def _assert_legacy_writer_authority() -> None:
+def _assert_legacy_writer_authority() -> Any:
     check = _legacy_writer_authority_check
-    if check is not None:
-        check()
+    if check is None:
+        return None
+    return check()
+
+
+def _stamp_event_writer_authority(event: Dict[str, Any], binding: Any) -> Dict[str, Any]:
+    stamped = dict(event)
+    if binding is not None:
+        stamped["writer_id"] = str(binding.writer_id)
+        stamped["writer_epoch"] = int(binding.authority_epoch)
+    return stamped
+
+
+def _verify_event_writer_authority(event: Dict[str, Any], binding: Any) -> None:
+    if binding is None:
+        return
+    writer_id = event.get("writer_id")
+    writer_epoch = event.get("writer_epoch")
+    if writer_id is None or writer_epoch is None:
+        raise RuntimeError("durable completion is missing writer authority metadata")
+    try:
+        epoch = int(writer_epoch)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("durable completion has invalid writer authority metadata") from exc
+    if str(writer_id) != str(binding.writer_id) or epoch != int(binding.authority_epoch):
+        raise RuntimeError("durable completion writer authority does not match current binding")
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -226,6 +250,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
+    _assert_legacy_writer_authority()
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -255,12 +280,14 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
+    _assert_legacy_writer_authority()
     with _DB_LOCK, _transaction() as conn:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
 def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
+    _assert_legacy_writer_authority()
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
@@ -299,6 +326,8 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    binding = _assert_legacy_writer_authority()
+    event = _stamp_event_writer_authority(event, binding)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -311,6 +340,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
+    _assert_legacy_writer_authority()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
@@ -320,7 +350,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
-    _assert_legacy_writer_authority()
+    binding = _assert_legacy_writer_authority()
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
@@ -359,6 +389,7 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            event = _stamp_event_writer_authority(event, binding)
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -392,7 +423,7 @@ def restore_undelivered_completions(
     runtime/durable lineage are restored. Without selectors, startup behavior
     remains unchanged and all pending completions are rehydrated.
     """
-    _assert_legacy_writer_authority()
+    binding = _assert_legacy_writer_authority()
     owner_ui = str(origin_ui_session_id or "")
     owner_keys = {str(key) for key in (session_keys or set()) if str(key)}
     targeted = bool(owner_ui or owner_keys)
@@ -407,6 +438,9 @@ def restore_undelivered_completions(
         ).fetchall()
         for _delegation_id, payload in rows:
             evt = json.loads(payload)
+            if not isinstance(evt, dict):
+                raise RuntimeError("durable completion event must be an object")
+            _verify_event_writer_authority(evt, binding)
             if targeted:
                 event_ui = str(evt.get("origin_ui_session_id") or "")
                 event_keys = {
@@ -456,6 +490,7 @@ def discover_pending_completions(
     Returns the list of newly-enqueued ``delegation_id`` values so the caller
     can extend its in-memory queued-id guard.
     """
+    binding = _assert_legacy_writer_authority()
     skip = {str(x) for x in (exclude_ids or set()) if str(x)}
     enqueued: List[str] = []
     now = time.time()
@@ -492,6 +527,7 @@ def discover_pending_completions(
                 continue
             if not isinstance(evt, dict):
                 continue
+            _verify_event_writer_authority(evt, binding)
             evt["restored"] = True
             target_queue.put(evt)
             enqueued.append(did)
@@ -655,6 +691,7 @@ def handoff_cursor_run_completion(
 
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
+    _assert_legacy_writer_authority()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
@@ -667,6 +704,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
+    _assert_legacy_writer_authority()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
@@ -709,6 +747,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     gateway restart forever (restore_undelivered_completions only restores
     pending rows).
     """
+    _assert_legacy_writer_authority()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute(
@@ -744,6 +783,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     honest, and (not ``pending``) keeps restart recovery from replaying a
     completion that will be fail-closed dropped again every time.
     """
+    _assert_legacy_writer_authority()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
@@ -759,6 +799,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
+    _assert_legacy_writer_authority()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(

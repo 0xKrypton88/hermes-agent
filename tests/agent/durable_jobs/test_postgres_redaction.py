@@ -79,6 +79,7 @@ def test_config_error_redacts_realistic_passwords():
                     "checkpoint_postgres_schema": "durable_jobs_ckpt",
                     "postgres_storage_id": "app",
                     "checkpoint_postgres_storage_id": "ckpt",
+                    "postgres_environment_id": "test",
                 }
             }
         )

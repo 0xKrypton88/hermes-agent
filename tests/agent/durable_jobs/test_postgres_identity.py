@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 SECRET = "supersecret"
 APP_DSN_LOCALHOST = f"postgresql://hermes:{SECRET}@localhost:5432/durable_jobs"
@@ -20,6 +21,7 @@ def _pg(**overrides):
         "checkpoint_postgres_schema": "durable_jobs_ckpt",
         "postgres_storage_id": "durable_app",
         "checkpoint_postgres_storage_id": "durable_ckpt",
+        "postgres_environment_id": "test",
     }
     section.update(overrides)
     return {"durable_jobs": section}
@@ -123,3 +125,75 @@ def test_assert_distinct_live_identities_fail_closed():
         PostgresStorageIdentity(1, "db", "app"),
         PostgresStorageIdentity(1, "db", "ckpt"),
     )
+
+def test_production_target_identity_verification_reads_both_declared_stores(monkeypatch):
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.postgres_identity import (
+        configured_target_identities,
+        verify_configured_target_identities,
+    )
+
+    config = load_durable_jobs_config(_pg())
+    app, checkpoint = configured_target_identities(config)
+    rows = [list(app.as_markers().items()), list(checkpoint.as_markers().items())]
+    connections = []
+
+    class Cursor:
+        def __init__(self, result):
+            self.result = result
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement):
+            assert "durable_target_identity" in statement
+
+        def fetchall(self):
+            return self.result
+
+    class Connection:
+        def __init__(self, result):
+            self.result = result
+            self.closed = False
+
+        def cursor(self):
+            return Cursor(self.result)
+
+        def close(self):
+            self.closed = True
+
+    def connect(_dsn, *, autocommit):
+        assert autocommit is True
+        connection = Connection(rows[len(connections)])
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", SimpleNamespace(connect=connect))
+    assert verify_configured_target_identities(config) == (app, checkpoint)
+    assert len(connections) == 2
+    assert all(connection.closed for connection in connections)
+
+
+def test_backend_refuses_store_setup_before_persisted_identity_proof(monkeypatch):
+    from agent.durable_jobs import backend, postgres_identity
+    from agent.durable_jobs.config import load_durable_jobs_config
+
+    config = load_durable_jobs_config(_pg())
+    calls = []
+
+    def deny(_config):
+        calls.append("verify")
+        raise postgres_identity.TargetIdentityError("identity mismatch")
+
+    monkeypatch.setattr(postgres_identity, "verify_configured_target_identities", deny)
+    monkeypatch.setattr(
+        backend,
+        "PostgresDurableJobStore",
+        lambda **_kwargs: pytest.fail("store setup must not run before identity proof"),
+    )
+    with pytest.raises(postgres_identity.TargetIdentityError, match="identity mismatch"):
+        backend.open_application_store(config)
+    assert calls == ["verify"]

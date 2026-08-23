@@ -311,3 +311,84 @@ def _libpq_target(dsn: str) -> tuple[str, int, str]:
         port = 5432
     database = kv.get("dbname") or kv.get("database") or ""
     return (host, port, database)
+
+PERSISTED_TARGET_SCHEMA_VERSION = 1
+APPLICATION_STORAGE_DOMAIN = "hermes.durable_jobs.application"
+CHECKPOINT_STORAGE_DOMAIN = "hermes.durable_jobs.checkpointer"
+
+
+def _read_target_identity_markers(connection, *, schema: str) -> dict[str, str]:
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'SELECT identity_key, identity_value FROM "{schema}".durable_target_identity'
+            )
+            return {str(key): str(value) for key, value in cursor.fetchall()}
+    except Exception as exc:
+        raise TargetIdentityError(
+            f"persisted target identity is missing or unreadable for schema {schema!r}"
+        ) from exc
+
+
+def configured_target_identities(config) -> tuple[PersistedTargetIdentity, PersistedTargetIdentity]:
+    required = (
+        config.postgres_storage_id,
+        config.checkpoint_postgres_storage_id,
+        config.postgres_environment_id,
+    )
+    if not all(required):
+        raise TargetIdentityError("configured PostgreSQL target identity is incomplete")
+    environment_id = str(config.postgres_environment_id)
+    return (
+        PersistedTargetIdentity(
+            storage_id=str(config.postgres_storage_id),
+            environment_id=environment_id,
+            storage_domain=APPLICATION_STORAGE_DOMAIN,
+            schema_version=PERSISTED_TARGET_SCHEMA_VERSION,
+        ),
+        PersistedTargetIdentity(
+            storage_id=str(config.checkpoint_postgres_storage_id),
+            environment_id=environment_id,
+            storage_domain=CHECKPOINT_STORAGE_DOMAIN,
+            schema_version=PERSISTED_TARGET_SCHEMA_VERSION,
+        ),
+    )
+
+
+def verify_configured_target_identities(config) -> tuple[PersistedTargetIdentity, PersistedTargetIdentity]:
+    """Read and verify both persisted targets before any production store setup/write."""
+    try:
+        import psycopg
+    except ImportError as exc:  # pragma: no cover - dependency gate
+        raise TargetIdentityError("psycopg is required for target identity verification") from exc
+
+    app_expected, checkpoint_expected = configured_target_identities(config)
+    targets = (
+        (config.postgres_dsn, config.postgres_schema, app_expected),
+        (
+            config.checkpoint_postgres_dsn,
+            config.checkpoint_postgres_schema,
+            checkpoint_expected,
+        ),
+    )
+    verified: list[PersistedTargetIdentity] = []
+    for dsn, schema, expected in targets:
+        if not dsn or not schema:
+            raise TargetIdentityError("configured PostgreSQL target is incomplete")
+        connection = None
+        try:
+            connection = psycopg.connect(dsn, autocommit=True)
+            markers = _read_target_identity_markers(connection, schema=str(schema))
+            verified.append(verify_persisted_target_identity(markers, expected=expected))
+        except TargetIdentityError:
+            raise
+        except Exception as exc:
+            raise TargetIdentityError(
+                f"persisted target identity verification failed for schema {schema!r}"
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+    if verified[0].environment_id != verified[1].environment_id:
+        raise TargetIdentityError("application and checkpointer environments differ")
+    return verified[0], verified[1]

@@ -28,6 +28,7 @@ def _pg_section() -> dict:
         "checkpoint_postgres_schema": "durable_jobs_ckpt",
         "postgres_storage_id": "durable_app",
         "checkpoint_postgres_storage_id": "durable_ckpt",
+        "postgres_environment_id": "test",
     }
 
 
@@ -186,6 +187,7 @@ def test_identical_application_and_checkpointer_schema_identity_rejected():
                     "checkpoint_postgres_schema": "shared_schema",
                     "postgres_storage_id": "durable_app",
                     "checkpoint_postgres_storage_id": "durable_ckpt",
+                    "postgres_environment_id": "test",
                 }
             }
         )
@@ -207,6 +209,7 @@ def test_same_schema_name_on_distinct_databases_is_allowed():
                 "checkpoint_postgres_schema": "durable_jobs",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
             }
         }
     )
@@ -244,6 +247,7 @@ def test_unsafe_schema_identifiers_rejected(schema):
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
                 }
             }
         )
@@ -266,6 +270,7 @@ def test_unqualified_or_default_schema_identifiers_rejected(schema):
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
                 }
             }
         )
@@ -319,6 +324,7 @@ def test_in_memory_postgres_dsn_rejected():
                 "checkpoint_postgres_schema": "durable_jobs_ckpt",
                 "postgres_storage_id": "durable_app",
                 "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
                 }
             }
         )
@@ -369,6 +375,10 @@ def test_open_application_store_postgresql_does_not_construct_sqlite(monkeypatch
 
     monkeypatch.setattr(DurableJobStore, "__init__", _boom)
     cfg = load_durable_jobs_config({"durable_jobs": _pg_section()})
+    monkeypatch.setattr(
+        "agent.durable_jobs.postgres_identity.verify_configured_target_identities",
+        lambda _config: None,
+    )
 
     created = {}
 

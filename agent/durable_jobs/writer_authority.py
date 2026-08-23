@@ -134,20 +134,14 @@ def load_writer_authority(connection, expected: AuthorityTarget) -> tuple[Writer
 def activate_writer_authority(connection, binding: WriterAuthorityBinding) -> None:
     """Persist an explicit monotonic handover; caller owns transaction scope."""
 
-    existing = connection.execute(
-        "SELECT authority_epoch FROM durable_writer_authority "
-        "WHERE storage_id = ? AND environment_id = ?",
-        (binding.storage_id, binding.environment_id),
-    ).fetchone()
-    if existing is not None and int(existing[0]) >= binding.authority_epoch:
-        raise WriterAuthorityError("authority epoch must increase monotonically")
-    connection.execute(
+    cursor = connection.execute(
         "INSERT INTO durable_writer_authority "
         "(storage_id, environment_id, authority_epoch, writer_id, mode) "
         "VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(storage_id, environment_id) DO UPDATE SET "
         "authority_epoch=excluded.authority_epoch, writer_id=excluded.writer_id, "
-        "mode=excluded.mode",
+        "mode=excluded.mode "
+        "WHERE durable_writer_authority.authority_epoch < excluded.authority_epoch",
         (
             binding.storage_id,
             binding.environment_id,
@@ -156,3 +150,5 @@ def activate_writer_authority(connection, binding: WriterAuthorityBinding) -> No
             binding.mode,
         ),
     )
+    if cursor.rowcount != 1:
+        raise WriterAuthorityError("authority epoch must increase monotonically")

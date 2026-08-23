@@ -174,7 +174,7 @@ def test_apply_is_idempotent_and_divergent_migration_key_fails_closed(tmp_path):
     assert first.inserted_count == len(plan.entries)
     assert second.inserted_count == 0
     assert second.duplicate_count == len(plan.entries)
-    assert migration.verify_legacy_adoption(plan, ledger).verified is True
+    assert migration.verify_legacy_adoption(plan, ledger, dispositions=dispositions).verified is True
 
     changed = plan.with_replaced_row_sha(plan.entries[0].migration_key, "0" * 64)
     with pytest.raises(migration.LegacyMigrationError, match="divergent"):
@@ -186,6 +186,31 @@ def test_apply_is_idempotent_and_divergent_migration_key_fails_closed(tmp_path):
         migration.apply_legacy_adoption(
             plan, ledger, dispositions=changed_dispositions
         )
+
+
+def test_verify_adoption_is_read_only_and_checks_dispositions(tmp_path):
+    migration = _legacy_api()
+    assert migration is not None
+    path, digest = _snapshot(tmp_path)
+    plan = migration.plan_legacy_adoption(
+        migration.FrozenSQLiteSnapshot(path=path, file_sha256=digest)
+    )
+    missing = tmp_path / "missing-ledger.sqlite3"
+    result = migration.verify_legacy_adoption(plan, missing, dispositions={})
+    assert result.verified is False
+    assert not missing.exists()
+
+    ledger = tmp_path / "adoption-ledger.sqlite3"
+    dispositions = {item.migration_key: "operator_quarantine" for item in plan.blockers}
+    migration.apply_legacy_adoption(plan, ledger, dispositions=dispositions)
+    wrong = dict(dispositions)
+    wrong[plan.blockers[0].migration_key] = "operator_discard"
+    assert migration.verify_legacy_adoption(
+        plan, ledger, dispositions=wrong
+    ).verified is False
+    assert migration.verify_legacy_adoption(
+        plan, ledger, dispositions={}
+    ).verified is False
 
 
 def test_snapshot_digest_mismatch_fails_before_inventory(tmp_path):
@@ -239,6 +264,28 @@ def test_writer_authority_explicit_activation_and_handover():
             (new,), expected=expected, requested_mode="legacy", writer_id="legacy-1",
             minimum_epoch=5, enforced=True,
         )
+
+
+def test_writer_authority_activation_rejects_non_monotonic_conflict_atomically():
+    authority = _authority_api()
+    assert authority is not None
+    conn = sqlite3.connect(":memory:")
+    conn.execute(authority.WRITER_AUTHORITY_DDL)
+    high = authority.WriterAuthorityBinding(
+        storage_id="durable_app", environment_id="staging", authority_epoch=9,
+        writer_id="new-9", mode="new",
+    )
+    low = authority.WriterAuthorityBinding(
+        storage_id="durable_app", environment_id="staging", authority_epoch=8,
+        writer_id="legacy-8", mode="legacy",
+    )
+    authority.activate_writer_authority(conn, high)
+    with pytest.raises(authority.WriterAuthorityError, match="monotonically"):
+        authority.activate_writer_authority(conn, low)
+    assert conn.execute(
+        "SELECT authority_epoch, writer_id, mode FROM durable_writer_authority"
+    ).fetchone() == (9, "new-9", "new")
+    conn.close()
 
 
 @pytest.mark.parametrize("fault", ["missing", "double", "stale", "target", "writer"])
@@ -419,3 +466,127 @@ def test_session_handoff_rechecks_writer_authority_before_effects(tmp_path):
     assert not sessions.children
     assert not sessions.injections
     assert not sessions.turns
+
+
+def test_legacy_completion_persistence_rechecks_writer_authority(monkeypatch):
+    module = importlib.import_module("tools.async_delegation")
+    calls: list[str] = []
+
+    def deny():
+        calls.append("checked")
+        raise RuntimeError("legacy authority lost")
+
+    module.configure_legacy_writer_authority_check(deny)
+    monkeypatch.setattr(module, "_connect", _FailIfCalled())
+    try:
+        with pytest.raises(RuntimeError, match="authority lost"):
+            module._persist_completion(
+                {"delegation_id": "d-1", "status": "completed"},
+                {"content": "done"},
+            )
+    finally:
+        module.configure_legacy_writer_authority_check(None)
+    assert calls == ["checked"]
+
+
+def test_session_handoff_rechecks_writer_authority_at_effect_boundary(tmp_path):
+    from agent.durable_jobs.session_handoff import SemanticWaypoint
+    from agent.durable_jobs.writer_authority import WriterAuthorityError
+    from tests.agent.durable_jobs.test_session_handoff import (
+        _Linear, _Sessions, _Slack, _armed, _enabled_handoff_config, _handoff, _lane,
+    )
+
+    lane, job = _lane(tmp_path)
+    checks = 0
+
+    def lose_before_linear():
+        nonlocal checks
+        checks += 1
+        if checks == 5:
+            raise WriterAuthorityError("writer authority lost before effect")
+
+    lane._writer_authority_check = lose_before_linear
+    linear, slack, sessions = _Linear(), _Slack(), _Sessions()
+    with pytest.raises(WriterAuthorityError, match="before effect"):
+        lane.resume_session_handoff(
+            job_id=job.job_id, parent_session_id="parent-1", handoff=_handoff(),
+            waypoint=SemanticWaypoint(verified=True), pressure=_armed(),
+            linear=linear, slack=slack, sessions=sessions,
+            handoff_config=_enabled_handoff_config(),
+        )
+    assert checks == 5
+    assert not linear.effects
+    assert not slack.effects
+    assert not sessions.children
+    assert not sessions.injections
+    assert not sessions.turns
+
+def test_restore_rejects_completion_without_exact_writer_metadata(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import tools.async_delegation as module
+
+    binding = SimpleNamespace(writer_id="target", authority_epoch=11)
+    module.configure_legacy_writer_authority_check(lambda: binding)
+    monkeypatch.setattr(module, "recover_abandoned_delegations", lambda: 0)
+
+    class Rows:
+        def fetchall(self):
+            return [("deleg-1", json.dumps({"type": "async_delegation"}))]
+
+    class Connection:
+        def execute(self, *_args, **_kwargs):
+            return Rows()
+
+    @contextmanager
+    def transaction():
+        yield Connection()
+
+    class Queue:
+        def put(self, _event):
+            pytest.fail("unfenced completion must not be restored")
+
+    monkeypatch.setattr(module, "_transaction", transaction)
+    try:
+        with pytest.raises(RuntimeError, match="missing writer authority metadata"):
+            module.restore_undelivered_completions(Queue())
+    finally:
+        module.configure_legacy_writer_authority_check(None)
+
+
+def test_restore_accepts_completion_from_current_writer_epoch(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import tools.async_delegation as module
+
+    binding = SimpleNamespace(writer_id="target", authority_epoch=11)
+    payload = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-1",
+        "writer_id": "target",
+        "writer_epoch": 11,
+    }
+    module.configure_legacy_writer_authority_check(lambda: binding)
+    monkeypatch.setattr(module, "recover_abandoned_delegations", lambda: 0)
+
+    class Rows:
+        def fetchall(self):
+            return [("deleg-1", json.dumps(payload))]
+
+    class Connection:
+        def execute(self, *_args, **_kwargs):
+            return Rows()
+
+    @contextmanager
+    def transaction():
+        yield Connection()
+
+    queued = []
+    monkeypatch.setattr(module, "_transaction", transaction)
+    try:
+        assert module.restore_undelivered_completions(SimpleNamespace(put=queued.append)) == 1
+    finally:
+        module.configure_legacy_writer_authority_check(None)
+    assert queued[0]["restored"] is True

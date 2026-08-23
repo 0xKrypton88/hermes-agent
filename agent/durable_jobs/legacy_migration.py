@@ -354,17 +354,30 @@ def apply_legacy_adoption(
     return ApplyResult(len(plan.entries), inserted, duplicates)
 
 
-def verify_legacy_adoption(plan: AdoptionPlan, ledger_path: Path) -> VerificationResult:
-    conn = sqlite3.connect(Path(ledger_path))
+def verify_legacy_adoption(
+    plan: AdoptionPlan,
+    ledger_path: Path,
+    *,
+    dispositions: Mapping[str, str],
+) -> VerificationResult:
+    path = Path(ledger_path)
+    if not path.is_file():
+        return VerificationResult(False, len(plan.entries), 0)
+    blocker_keys = {item.migration_key for item in plan.blockers}
+    if any(not str(dispositions.get(key) or "").strip() for key in blocker_keys):
+        return VerificationResult(False, len(plan.entries), 0)
     try:
-        _ensure_ledger(conn)
-        rows = conn.execute(
-            "SELECT migration_key, source_table, source_pk_json, row_sha256, "
-            "canonical_row_json, target_kind, snapshot_sha256, population_sha256 "
-            "FROM eng118_adoption_ledger ORDER BY migration_key"
-        ).fetchall()
-    finally:
-        conn.close()
+        conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT migration_key, source_table, source_pk_json, row_sha256, "
+                "canonical_row_json, target_kind, disposition, snapshot_sha256, "
+                "population_sha256 FROM eng118_adoption_ledger ORDER BY migration_key"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return VerificationResult(False, len(plan.entries), 0)
     actual = {key: tuple(values) for key, *values in rows}
     expected = {
         item.migration_key: (
@@ -373,6 +386,7 @@ def verify_legacy_adoption(plan: AdoptionPlan, ledger_path: Path) -> Verificatio
             item.row_sha256,
             item.canonical_row_json,
             item.target_kind,
+            dispositions.get(item.migration_key),
             plan.snapshot_sha256,
             plan.population_sha256,
         )
