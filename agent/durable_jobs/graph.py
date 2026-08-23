@@ -130,6 +130,29 @@ def run_pilot_graph(
         conn.close()
 
 
+def resume_pilot_graph(
+    *,
+    store: DurableJobStore,
+    checkpoint_sqlite_path: Path,
+    job_id: str,
+) -> dict[str, Any]:
+    """Continue an existing pilot graph thread from its SQLite checkpoint."""
+    checkpointer, conn = open_checkpointer(checkpoint_sqlite_path)
+    config = {"configurable": {"thread_id": job_id}}
+    try:
+        if checkpointer.get_tuple(config) is None:
+            raise KeyError(f"missing checkpoint for thread_id={job_id}")
+        graph = _build_graph(store).compile(checkpointer=checkpointer)
+        result = graph.invoke(None, config)
+        if is_dataclass(result) and not isinstance(result, type):
+            return asdict(result)
+        if isinstance(result, dict):
+            return dict(result)
+        return {"job_id": job_id, "result": result}
+    finally:
+        conn.close()
+
+
 def run_pilot_graph_postgres(
     *,
     store: DurableJobStore,
