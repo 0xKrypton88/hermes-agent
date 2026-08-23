@@ -596,9 +596,10 @@ def test_restore_accepts_completion_from_current_writer_epoch(monkeypatch):
 
 def test_persisted_effect_lease_fences_authority_handover(tmp_path):
     import sqlite3
+    import threading
     from agent.durable_jobs.writer_authority import (
         AuthorityTarget, DatastoreWriterAuthorityCheck, WRITER_AUTHORITY_DDL,
-        WriterAuthorityBinding, WriterAuthorityError, activate_writer_authority,
+        WriterAuthorityBinding, activate_writer_authority,
     )
 
     path = tmp_path / "authority.db"
@@ -606,25 +607,44 @@ def test_persisted_effect_lease_fences_authority_handover(tmp_path):
     setup.execute(WRITER_AUTHORITY_DDL)
     current = WriterAuthorityBinding("storage", "env", 1, "writer-a", "new")
     activate_writer_authority(setup, current)
-    setup.commit()
     setup.close()
 
-    provider = lambda: sqlite3.connect(path)
+    provider = lambda: sqlite3.connect(path, timeout=5)
     check = DatastoreWriterAuthorityCheck.from_connection_provider(
         provider, expected=AuthorityTarget("storage", "env"), requested_mode="new",
         writer_id="writer-a", minimum_epoch=1,
     )
     replacement = WriterAuthorityBinding("storage", "env", 2, "writer-b", "new")
-    with check.effect_lease("linear:job-1"):
-        connection = provider()
-        with pytest.raises(WriterAuthorityError, match="live external-effect lease"):
-            activate_writer_authority(connection, replacement)
-        connection.close()
+    started = threading.Event()
+    done = threading.Event()
+    errors = []
 
+    def handover():
+        started.set()
+        connection = provider()
+        try:
+            activate_writer_authority(connection, replacement)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            connection.close()
+            done.set()
+
+    with check.effect_lease("linear:job-1"):
+        worker = threading.Thread(target=handover)
+        worker.start()
+        assert started.wait(1)
+        assert done.wait(0.2) is False
+    assert done.wait(2)
+    worker.join(timeout=2)
+    assert errors == []
     connection = provider()
-    activate_writer_authority(connection, replacement)
-    connection.commit()
+    row = connection.execute(
+        "SELECT authority_epoch, writer_id FROM durable_writer_authority"
+    ).fetchone()
     connection.close()
+    assert row == (2, "writer-b")
+
 
 def test_shadow_excludes_unclassified_secret_tables_and_rejects_secret_columns(tmp_path):
     import sqlite3
@@ -648,5 +668,25 @@ def test_shadow_excludes_unclassified_secret_tables_and_rejects_secret_columns(t
     snapshot = migration.FrozenSQLiteSnapshot(
         path=classified, file_sha256=hashlib.sha256(classified.read_bytes()).hexdigest()
     )
-    with pytest.raises(migration.LegacyMigrationError, match="credential-bearing columns"):
+    with pytest.raises(migration.LegacyMigrationError, match="not export-allowlisted"):
         migration.plan_legacy_adoption(snapshot)
+
+def test_shadow_redacts_credential_shaped_values_in_allowlisted_content(tmp_path):
+    import hashlib
+
+    from agent.durable_jobs import legacy_migration as migration
+
+    source = tmp_path / "credential-content.db"
+    conn = sqlite3.connect(source)
+    conn.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, content TEXT)")
+    secret = "supersecretvalue123"
+    conn.execute("INSERT INTO messages VALUES (?, ?)", ("m1", f"api_key={secret}"))
+    conn.commit()
+    conn.close()
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    plan = migration.plan_legacy_adoption(
+        migration.FrozenSQLiteSnapshot(path=source, file_sha256=digest)
+    )
+    canonical = plan.entries[0].canonical_row_json
+    assert secret not in canonical
+    assert hashlib.sha256(secret.encode()).hexdigest() in canonical

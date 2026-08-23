@@ -73,6 +73,8 @@ DEFAULT_DURABLE_JOBS_CONFIG: dict[str, Any] = {
     "postgres_environment_id": None,
     "writer_id": None,
     "writer_authority_epoch": 0,
+    "authority_storage_id": None,
+    "authority_environment_id": None,
     "cursor_adapter_mode": None,
     "slack_adapter_mode": None,
     "cursor_secret_ref": None,
@@ -117,6 +119,8 @@ class DurableJobsConfig:
     postgres_environment_id: Optional[str] = None
     writer_id: Optional[str] = None
     writer_authority_epoch: int = 0
+    authority_storage_id: Optional[str] = None
+    authority_environment_id: Optional[str] = None
     cursor_adapter_mode: Optional[str] = None
     slack_adapter_mode: Optional[str] = None
     cursor_secret_ref: Optional[str] = None
@@ -479,6 +483,10 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
 
     writer_id = _optional_text(merged.get("writer_id"))
     writer_authority_epoch = merged.get("writer_authority_epoch")
+    authority_storage_id = _optional_text(merged.get("authority_storage_id"))
+    authority_environment_id = _optional_text(
+        merged.get("authority_environment_id")
+    )
     if type(writer_authority_epoch) is not int or writer_authority_epoch < 0:
         raise DurableJobsConfigError(
             "durable_jobs.writer_authority_epoch must be a non-negative integer"
@@ -516,6 +524,8 @@ def load_durable_jobs_config(raw: Mapping[str, Any] | None) -> DurableJobsConfig
         postgres_environment_id=postgres_environment_id,
         writer_id=writer_id,
         writer_authority_epoch=writer_authority_epoch,
+        authority_storage_id=authority_storage_id,
+        authority_environment_id=authority_environment_id,
         cursor_adapter_mode=cursor_adapter_mode,
         slack_adapter_mode=slack_adapter_mode,
         cursor_secret_ref=cursor_secret_ref,

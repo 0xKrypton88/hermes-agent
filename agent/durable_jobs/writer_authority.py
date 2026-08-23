@@ -174,6 +174,31 @@ class DatastoreWriterAuthorityCheck:
             self()
 
 
+def _is_postgres_connection(connection: object) -> bool:
+    module = type(connection).__module__.lower()
+    return "psycopg" in module or "postgres" in module
+
+
+def _execute_authority_sql(connection, sql: str, params: tuple = ()):
+    if _is_postgres_connection(connection):
+        sql = sql.replace("?", "%s")
+    return connection.execute(sql, params)
+
+
+def _begin_authority_transaction(connection, target: AuthorityTarget) -> None:
+    key = f"{target.storage_id}:{target.environment_id}"
+    if _is_postgres_connection(connection):
+        _execute_authority_sql(
+            connection,
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            (key,),
+        )
+    else:
+        if bool(getattr(connection, "in_transaction", False)):
+            connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+
+
 @contextmanager
 def datastore_writer_effect_lease(
     connection_provider: Callable[[], object],
@@ -182,42 +207,57 @@ def datastore_writer_effect_lease(
     *,
     ttl_seconds: float = 300.0,
 ) -> Iterator[None]:
-    """Acquire a persisted lease that fences authority transfer during an effect."""
+    """Hold one target lock and authority transaction across the effect."""
     if not effect_key or ttl_seconds <= 0:
         raise WriterAuthorityError("effect lease key and TTL must be valid")
     token = uuid4().hex
-    expires_at = time.time() + ttl_seconds
+    target = AuthorityTarget(binding.storage_id, binding.environment_id)
     connection = connection_provider()
+    committed = False
     try:
-        connection.execute(WRITER_EFFECT_LEASE_DDL)
-        cursor = connection.execute(
+        _begin_authority_transaction(connection, target)
+        _execute_authority_sql(connection, WRITER_EFFECT_LEASE_DDL)
+        current = load_writer_authority(connection, target)
+        assert_write_authority(
+            current,
+            expected=target,
+            requested_mode=binding.mode,
+            writer_id=binding.writer_id,
+            minimum_epoch=binding.authority_epoch,
+            enforced=True,
+        )
+        cursor = _execute_authority_sql(
+            connection,
             "INSERT INTO durable_writer_effect_leases "
             "(storage_id, environment_id, effect_key, authority_epoch, writer_id, lease_token, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(storage_id, environment_id, effect_key) DO UPDATE SET "
             "authority_epoch=excluded.authority_epoch, writer_id=excluded.writer_id, "
             "lease_token=excluded.lease_token, expires_at=excluded.expires_at "
-            "WHERE durable_writer_effect_leases.expires_at <= ? OR "
-            "(durable_writer_effect_leases.authority_epoch = excluded.authority_epoch AND "
-            "durable_writer_effect_leases.writer_id = excluded.writer_id)",
-            (binding.storage_id, binding.environment_id, effect_key, binding.authority_epoch, binding.writer_id, token, expires_at, time.time()),
+            "WHERE durable_writer_effect_leases.authority_epoch = excluded.authority_epoch AND "
+            "durable_writer_effect_leases.writer_id = excluded.writer_id",
+            (binding.storage_id, binding.environment_id, effect_key, binding.authority_epoch, binding.writer_id, token, time.time() + ttl_seconds),
         )
         if cursor.rowcount != 1:
-            raise WriterAuthorityError("effect already has a live authority lease")
-        connection.commit()
+            raise WriterAuthorityError("effect already has a foreign authority lease")
+        # The target transaction/advisory lock remains held while the effect runs.
         yield
+        _execute_authority_sql(
+            connection,
+            "DELETE FROM durable_writer_effect_leases WHERE storage_id = ? AND environment_id = ? "
+            "AND effect_key = ? AND lease_token = ?",
+            (binding.storage_id, binding.environment_id, effect_key, token),
+        )
+        connection.commit()
+        committed = True
     finally:
-        try:
-            connection.execute(
-                "DELETE FROM durable_writer_effect_leases WHERE storage_id = ? AND environment_id = ? "
-                "AND effect_key = ? AND lease_token = ?",
-                (binding.storage_id, binding.environment_id, effect_key, token),
-            )
-            connection.commit()
-        finally:
-            close = getattr(connection, "close", None)
-            if callable(close):
-                close()
+        if not committed:
+            rollback = getattr(connection, "rollback", None)
+            if callable(rollback):
+                rollback()
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
 
 
 def _load_bindings_from_provider(
@@ -234,8 +274,8 @@ def _load_bindings_from_provider(
 
 def load_writer_authority(connection, expected: AuthorityTarget) -> tuple[WriterAuthorityBinding, ...]:
     """Read authoritative bindings from a DB-API connection without caching."""
-
-    rows = connection.execute(
+    rows = _execute_authority_sql(
+        connection,
         "SELECT storage_id, environment_id, authority_epoch, writer_id, mode "
         "FROM durable_writer_authority WHERE storage_id = ? AND environment_id = ?",
         (expected.storage_id, expected.environment_id),
@@ -244,32 +284,36 @@ def load_writer_authority(connection, expected: AuthorityTarget) -> tuple[Writer
 
 
 def activate_writer_authority(connection, binding: WriterAuthorityBinding) -> None:
-    """Persist an explicit monotonic handover; caller owns transaction scope."""
-
-    connection.execute(WRITER_EFFECT_LEASE_DDL)
-    active_lease = connection.execute(
-        "SELECT 1 FROM durable_writer_effect_leases WHERE storage_id = ? AND environment_id = ? "
-        "AND expires_at > ? AND (authority_epoch <> ? OR writer_id <> ?) LIMIT 1",
-        (binding.storage_id, binding.environment_id, time.time(), binding.authority_epoch, binding.writer_id),
-    ).fetchone()
-    if active_lease is not None:
-        raise WriterAuthorityError("authority handover is fenced by a live external-effect lease")
-
-    cursor = connection.execute(
-        "INSERT INTO durable_writer_authority "
-        "(storage_id, environment_id, authority_epoch, writer_id, mode) "
-        "VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(storage_id, environment_id) DO UPDATE SET "
-        "authority_epoch=excluded.authority_epoch, writer_id=excluded.writer_id, "
-        "mode=excluded.mode "
-        "WHERE durable_writer_authority.authority_epoch < excluded.authority_epoch",
-        (
-            binding.storage_id,
-            binding.environment_id,
-            binding.authority_epoch,
-            binding.writer_id,
-            binding.mode,
-        ),
-    )
-    if cursor.rowcount != 1:
-        raise WriterAuthorityError("authority epoch must increase monotonically")
+    """Atomically lock the target, reject live effects, and install a newer epoch."""
+    target = AuthorityTarget(binding.storage_id, binding.environment_id)
+    committed = False
+    try:
+        _begin_authority_transaction(connection, target)
+        _execute_authority_sql(connection, WRITER_EFFECT_LEASE_DDL)
+        active_lease = _execute_authority_sql(
+            connection,
+            "SELECT 1 FROM durable_writer_effect_leases WHERE storage_id = ? AND environment_id = ? "
+            "AND (authority_epoch <> ? OR writer_id <> ?) LIMIT 1",
+            (binding.storage_id, binding.environment_id, binding.authority_epoch, binding.writer_id),
+        ).fetchone()
+        if active_lease is not None:
+            raise WriterAuthorityError("authority handover is fenced by a live external-effect lease")
+        cursor = _execute_authority_sql(
+            connection,
+            "INSERT INTO durable_writer_authority "
+            "(storage_id, environment_id, authority_epoch, writer_id, mode) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(storage_id, environment_id) DO UPDATE SET "
+            "authority_epoch=excluded.authority_epoch, writer_id=excluded.writer_id, mode=excluded.mode "
+            "WHERE durable_writer_authority.authority_epoch < excluded.authority_epoch",
+            (binding.storage_id, binding.environment_id, binding.authority_epoch, binding.writer_id, binding.mode),
+        )
+        if cursor.rowcount != 1:
+            raise WriterAuthorityError("authority epoch must increase monotonically")
+        connection.commit()
+        committed = True
+    finally:
+        if not committed:
+            rollback = getattr(connection, "rollback", None)
+            if callable(rollback):
+                rollback()

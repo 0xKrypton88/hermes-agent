@@ -44,7 +44,7 @@ import json
 import logging
 import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator, Optional, Sequence
 
 from agent.durable_jobs.config import DurableJobsConfig, DurableJobsConfigError
@@ -205,15 +205,19 @@ class DurableLaneService:
 
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:
-        self._acquire_mutation_lease()
-        body_failed = False
-        try:
-            yield
-        except BaseException:
-            body_failed = True
-            raise
-        finally:
-            self._release_mutation_lease(preserve_primary=body_failed)
+        # The datastore authority lease is acquired after admission/identity reads but
+        # before any mutation. Its atomic authority check serializes handover with
+        # every durable write performed under this process-local mutation lease.
+        with self._effect_authority_lease("lane-mutation"):
+            self._acquire_mutation_lease()
+            body_failed = False
+            try:
+                yield
+            except BaseException:
+                body_failed = True
+                raise
+            finally:
+                self._release_mutation_lease(preserve_primary=body_failed)
 
     def _require_enabled(self) -> None:
         if not self.config.enabled:
@@ -649,7 +653,7 @@ class DurableLaneService:
                 slack=slack,
                 sessions=sessions,
                 require_writer_authority=self._assert_fresh_writer_authority,
-                effect_authority_lease=self._effect_authority_lease,
+                effect_authority_lease=lambda _key: nullcontext(),
             ).resume(
                 job_id=job_id,
                 parent_session_id=parent_session_id,
