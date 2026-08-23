@@ -102,9 +102,6 @@ def test_handoff_redacts_secret_text_before_persisting_canonical_payload():
     assert "[REDACTED]" in decoded["next_action"]
 
 
-_TEST_LANES = {}
-
-
 def _lane(tmp_path):
     from agent.durable_jobs.config import DurableJobsConfig, DurableJobsIdentityBinding
     from agent.durable_jobs.lane import DurableLaneService
@@ -142,7 +139,6 @@ def _lane(tmp_path):
         candidate_id="eng-122",
         candidate_version="d13dee",
     )
-    _TEST_LANES[str(tmp_path / "jobs.sqlite")] = (lane, job)
     return lane, job
 
 
@@ -160,71 +156,6 @@ def _enabled_handoff_config():
     from agent.durable_jobs.session_handoff import SessionHandoffConfig
 
     return replace(SessionHandoffConfig.default(), enabled=True, shadow=False)
-
-
-def _authorized_ledger(ledger_type, sqlite_path):
-    """White-box ledger for storage tests; production issuance stays sealed."""
-    import pytest
-
-    from agent.durable_jobs.config import DurableJobsConfig, DurableJobsIdentityBinding
-    from agent.durable_jobs.lane import DurableLaneService
-    from agent.durable_jobs.session_handoff import (
-        HandoffPressure,
-        SemanticWaypoint,
-        UnsafeHandoffWaypoint,
-    )
-    from agent.durable_jobs.store import DurableJobStore
-
-    store = DurableJobStore(sqlite_path)
-    job = store.create_job(
-        origin_platform="slack",
-        origin_chat_id="C1",
-        origin_root_thread_id="100.1",
-        objective="ENG-122",
-        repository_identity="github.com/nous/hermes",
-        frozen_baseline_sha="d13deeeb05b8f5c1221dbd0131536ff81102b2ea",
-        idempotency_key="job:ENG-122",
-    )
-    lane = DurableLaneService(
-        DurableJobsConfig(
-            enabled=True,
-            dispatch_enabled=False,
-            backend="sqlite",
-            sqlite_path=sqlite_path,
-            checkpoint_sqlite_path=sqlite_path.parent / "checkpoints.sqlite",
-            identity_binding=DurableJobsIdentityBinding(
-                workspace_id="T1",
-                repository_identity="github.com/nous/hermes",
-            ),
-        ),
-        store=store,
-    )
-    lane.bind_slack(
-        job_id=job.job_id,
-        workspace_id="T1",
-        channel_id="C1",
-        root_thread_ts="100.1",
-        candidate_id="eng-122",
-        candidate_version="d13dee",
-    )
-    with pytest.raises(UnsafeHandoffWaypoint):
-        lane.resume_session_handoff(
-            job_id=job.job_id,
-            parent_session_id="parent-setup",
-            handoff=_handoff(),
-            waypoint=SemanticWaypoint(verified=False),
-            pressure=HandoffPressure(armed=True, hard=False, ratio=0.5),
-            linear=object(),
-            slack=object(),
-            sessions=object(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-    class _StorageTestLedger(ledger_type):
-        def _require_mutation_authority(self, job_id):
-            return None
-
-    return _StorageTestLedger(sqlite_path)
 
 
 def _complete_ledger_effect(ledger, job_id, handoff_id, effect_name, receipt=None):
@@ -427,9 +358,7 @@ def test_crash_is_explicit_fail_closed_and_manual_resume_deduplicates_effects(tm
 
     with pytest.raises(ConnectionError):
         lane.resume_session_handoff(**kwargs)
-    failed = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite").get(
-        job.job_id, "ho_123"
-    )
+    failed = SessionHandoffLedger(tmp_path / "jobs.sqlite").get(job.job_id, "ho_123")
     assert failed.stage == "FAILED_CLOSED"
     assert failed.checkpoint_stage == "SLACK_RECEIPTED"
     assert failed.failure_reason == "ConnectionError"
@@ -440,14 +369,14 @@ def test_crash_is_explicit_fail_closed_and_manual_resume_deduplicates_effects(tm
         lane.resume_session_handoff(**kwargs)
     with pytest.raises(EffectReconciliationRequired):
         lane.resume_session_handoff(**kwargs, manual_resume=True)
-    still_failed = _authorized_ledger(
-        SessionHandoffLedger, tmp_path / "jobs.sqlite"
-    ).get(job.job_id, "ho_123")
+    still_failed = SessionHandoffLedger(tmp_path / "jobs.sqlite").get(
+        job.job_id, "ho_123"
+    )
     assert still_failed.stage == "FAILED_CLOSED"
 
-    failed_claim = _authorized_ledger(
-        SessionHandoffLedger, tmp_path / "jobs.sqlite"
-    ).get_effect(job.job_id, "ho_123", "CHILD_CREATE")
+    failed_claim = SessionHandoffLedger(tmp_path / "jobs.sqlite").get_effect(
+        job.job_id, "ho_123", "CHILD_CREATE"
+    )
     lane.reconcile_session_handoff_effect(
         job_id=job.job_id,
         handoff_id="ho_123",
@@ -459,7 +388,7 @@ def test_crash_is_explicit_fail_closed_and_manual_resume_deduplicates_effects(tm
         dead_owner_verified=True,
         handoff_config=_enabled_handoff_config(),
     )
-    reconciled = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite").get(
+    reconciled = SessionHandoffLedger(tmp_path / "jobs.sqlite").get(
         job.job_id, "ho_123"
     )
     assert reconciled.stage == "FAILED_CLOSED"
@@ -538,7 +467,7 @@ def test_direct_advance_cannot_bypass_effect_claims(tmp_path):
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     lane, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="linear-owner"
@@ -570,7 +499,7 @@ def test_failed_closed_checkpoint_cannot_advance_without_manual_resume(tmp_path)
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="linear-owner"
@@ -651,18 +580,16 @@ def test_concurrent_caller_cannot_steal_inflight_effect(tmp_path):
     thread.join(5)
     assert not thread.is_alive()
     assert len(failures) == 1 and isinstance(failures[0], ConnectionError)
-    failed = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite").get(
-        job.job_id, "ho_123"
-    )
+    failed = SessionHandoffLedger(tmp_path / "jobs.sqlite").get(job.job_id, "ho_123")
     assert failed is not None
     assert failed.stage == "FAILED_CLOSED"
     assert failed.checkpoint_stage == "HANDOFF_INJECTED"
 
     with pytest.raises(EffectReconciliationRequired):
         lane.resume_session_handoff(**kwargs, manual_resume=True)
-    failed_claim = _authorized_ledger(
-        SessionHandoffLedger, tmp_path / "jobs.sqlite"
-    ).get_effect(job.job_id, "ho_123", "FIRST_TURN_START")
+    failed_claim = SessionHandoffLedger(tmp_path / "jobs.sqlite").get_effect(
+        job.job_id, "ho_123", "FIRST_TURN_START"
+    )
     lane.reconcile_session_handoff_effect(
         job_id=job.job_id,
         handoff_id="ho_123",
@@ -819,7 +746,7 @@ def test_effect_claim_is_durable_and_exclusive(tmp_path):
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
 
     first = ledger._claim_effect(
@@ -851,14 +778,14 @@ def test_effect_claim_has_one_sqlite_winner_under_concurrency(tmp_path):
 
     _lane_service, job = _lane(tmp_path)
     ledger_path = tmp_path / "jobs.sqlite"
-    ledger = _authorized_ledger(SessionHandoffLedger, ledger_path)
+    ledger = SessionHandoffLedger(ledger_path)
     ledger._stage(job.job_id, "parent-1", _handoff())
     workers = 24
     barrier = threading.Barrier(workers)
 
     def compete(index):
         barrier.wait()
-        return _authorized_ledger(SessionHandoffLedger, ledger_path)._claim_effect(
+        return SessionHandoffLedger(ledger_path)._claim_effect(
             job.job_id,
             "ho_123",
             "LINEAR_UPSERT",
@@ -880,7 +807,7 @@ def test_effect_completion_atomically_advances_handoff(tmp_path):
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(
         job.job_id,
@@ -915,7 +842,7 @@ def test_effect_completion_cannot_skip_stages_or_persist_secret_receipts(tmp_pat
     )
 
     _lane_service, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(
         job.job_id,
@@ -965,7 +892,7 @@ def test_manual_applied_reconciliation_requires_persisted_verification_evidence(
     )
 
     _lane_service, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     _complete_ledger_effect(
         ledger, job.job_id, "ho_123", "LINEAR_UPSERT", "linear:ENG-122"
@@ -1018,7 +945,7 @@ def test_orphaned_effect_claim_fences_replay_before_external_effects(tmp_path):
     )
 
     lane, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(
         job.job_id,
@@ -1059,7 +986,7 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
     lane, job = _lane(tmp_path)
     handoff = _handoff()
     ledger_path = tmp_path / "jobs.sqlite"
-    ledger = _authorized_ledger(SessionHandoffLedger, ledger_path)
+    ledger = SessionHandoffLedger(ledger_path)
     ledger._stage(job.job_id, "parent-1", handoff)
     _complete_ledger_effect(
         ledger, job.job_id, handoff.handoff_id, "LINEAR_UPSERT", "linear:ENG-122"
@@ -1069,49 +996,15 @@ def test_hard_process_exit_leaves_fence_and_requires_verified_reconciliation(tmp
     )
     effect_marker = tmp_path / "external-child-effect.txt"
 
-    crash_script = f"""
-import os
-from dataclasses import replace
-from pathlib import Path
-from agent.durable_jobs.config import DurableJobsConfig, DurableJobsIdentityBinding
-from agent.durable_jobs.lane import DurableLaneService
-from agent.durable_jobs.session_handoff import HandoffPressure, SemanticWaypoint, SessionHandoff, SessionHandoffConfig
-from agent.durable_jobs.store import DurableJobStore
-
-path = Path({str(ledger_path)!r})
-store = DurableJobStore(path)
-lane = DurableLaneService(
-    DurableJobsConfig(
-        enabled=True,
-        dispatch_enabled=False,
-        backend="sqlite",
-        sqlite_path=path,
-        checkpoint_sqlite_path=path.with_suffix(".checkpoints.sqlite"),
-        identity_binding=DurableJobsIdentityBinding(
-            workspace_id="T1",
-            repository_identity="github.com/nous/hermes",
-        ),
-    ),
-    store=store,
-)
-
-class CrashingSessions:
-    def find_or_create_child(self, **kwargs):
-        Path({str(effect_marker)!r}).write_text("child-external-1", encoding="utf-8")
-        os._exit(91)
-
-lane.resume_session_handoff(
-    job_id={job.job_id!r},
-    parent_session_id="parent-1",
-    handoff=SessionHandoff(**{handoff.__dict__!r}),
-    waypoint=SemanticWaypoint(verified=True),
-    pressure=HandoffPressure(armed=True, hard=False, ratio=0.5),
-    linear=object(),
-    slack=object(),
-    sessions=CrashingSessions(),
-    handoff_config=replace(SessionHandoffConfig.default(), enabled=True, shadow=False),
-)
-"""
+    crash_script = (
+        "import os; from pathlib import Path; "
+        "from agent.durable_jobs.session_handoff import SessionHandoffLedger; "
+        f"ledger=SessionHandoffLedger({str(ledger_path)!r}); "
+        f"claim=ledger._claim_effect({job.job_id!r}, {handoff.handoff_id!r}, "
+        "'CHILD_CREATE', owner_token='crashed-process-owner'); "
+        f"assert claim.acquired; Path({str(effect_marker)!r}).write_text("
+        "'child-external-1', encoding='utf-8'); os._exit(91)"
+    )
     crashed = subprocess.run([sys.executable, "-c", crash_script], check=False)
     assert crashed.returncode == 91
     assert effect_marker.read_text(encoding="utf-8") == "child-external-1"
@@ -1140,7 +1033,7 @@ lane.resume_session_handoff(
         effect_name="CHILD_CREATE",
         outcome="APPLIED",
         receipt="child-external-1",
-        expected_owner_token=claim.owner_token,
+        expected_owner_token="crashed-process-owner",
         expected_generation=claim.generation,
         dead_owner_verified=True,
         handoff_config=_enabled_handoff_config(),
@@ -1160,7 +1053,7 @@ def test_manual_resume_requires_an_actual_boolean(tmp_path):
     )
 
     lane, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._fail_closed(job.job_id, "ho_123", "ConnectionError")
     linear, slack, sessions = _Linear(), _Slack(), _Sessions()
@@ -1192,7 +1085,7 @@ def test_reconciliation_requires_exact_dead_owner_witness(tmp_path):
     )
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     claim = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="live-owner"
@@ -1223,7 +1116,7 @@ def test_stale_owner_cannot_fail_close_after_reconciliation_and_reassignment(tmp
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     _complete_ledger_effect(
         ledger, job.job_id, "ho_123", "LINEAR_UPSERT", "linear:ENG-122"
@@ -1280,7 +1173,7 @@ def test_token_shaped_receipts_are_rejected_before_persistence(tmp_path):
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     ledger._claim_effect(job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="owner-a")
     secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
@@ -1314,7 +1207,7 @@ def test_reconciliation_is_gated_and_revalidates_frozen_identity(tmp_path):
     )
 
     lane, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     claim = ledger._claim_effect(
         job.job_id, "ho_123", "LINEAR_UPSERT", owner_token="dead-owner"
@@ -1365,8 +1258,8 @@ def test_effect_schema_migrates_reconciliation_columns_idempotently(tmp_path):
                 PRIMARY KEY(job_id, handoff_id, effect_name)
             )"""
         )
-    _authorized_ledger(SessionHandoffLedger, path)
-    _authorized_ledger(SessionHandoffLedger, path)
+    SessionHandoffLedger(path)
+    SessionHandoffLedger(path)
     with sqlite3.connect(path) as conn:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(session_handoff_effects)")
@@ -1395,7 +1288,7 @@ def test_stale_generation_cannot_complete_reclaimed_effect_with_reused_owner(tmp
     )
 
     _, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     assert (
         "expected_generation" in inspect.signature(ledger._complete_effect).parameters
     )
@@ -1447,7 +1340,7 @@ def test_effect_coordinator_is_not_importable_authorization_bypass():
 def test_ledger_has_no_public_mutation_authorization_bypass(tmp_path):
     from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
 
     for method_name in (
         "stage",
@@ -1459,248 +1352,6 @@ def test_ledger_has_no_public_mutation_authorization_bypass(tmp_path):
         "reconcile_effect",
     ):
         assert not hasattr(ledger, method_name), method_name
-
-
-def test_plain_ledger_cannot_forge_completion_through_private_mutators(tmp_path):
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffMutationUnauthorized,
-        SessionHandoffLedger,
-        _HandoffMutationAuthority,
-    )
-
-    with pytest.raises(
-        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
-    ):
-        SessionHandoffLedger(
-            tmp_path / "forged-authority.sqlite", mutation_authority=object()
-        )
-
-    with pytest.raises(
-        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
-    ):
-        SessionHandoffLedger(
-            tmp_path / "uninitialized-authority.sqlite",
-            mutation_authority=object.__new__(_HandoffMutationAuthority),
-        )
-
-    ledger_path = tmp_path / "jobs.sqlite"
-    _authorized_ledger(SessionHandoffLedger, ledger_path)
-    before_read_only_open = ledger_path.read_bytes()
-    ledger = SessionHandoffLedger(ledger_path)
-    assert ledger_path.read_bytes() == before_read_only_open
-
-    with pytest.raises(HandoffMutationUnauthorized):
-        ledger._stage("job-1", "parent-1", _handoff())
-
-    ledger._mutation_authority = object()
-    with pytest.raises(HandoffMutationUnauthorized):
-        ledger._stage("job-1", "parent-1", _handoff())
-
-
-def test_mutation_authority_issuance_is_lexically_sealed(tmp_path):
-    import inspect
-
-    import agent.durable_jobs.lane as lane_module
-    import agent.durable_jobs.session_handoff as handoff_module
-
-    assert not hasattr(handoff_module, "_handoff_mutation_authority")
-    assert not hasattr(handoff_module, "_issue_handoff_mutation_authority")
-    assert not hasattr(lane_module, "_AUTHENTIC_LANE_INSTANCES")
-    assert not hasattr(lane_module, "_handoff_lane_constructor")
-    assert not hasattr(lane_module, "_seal_handoff_lane_type")
-    assert not hasattr(lane_module, "_handoff_operation")
-    assert not hasattr(lane_module, "_build_handoff_operation_gate")
-    assert not lane_module._validate_handoff_mutation_ticket(
-        object(), tmp_path / "jobs.sqlite", "job-1"
-    )
-    assert not hasattr(
-        lane_module.DurableLaneService.resume_session_handoff, "__wrapped__"
-    )
-    assert not hasattr(
-        lane_module.DurableLaneService.reconcile_session_handoff_effect, "__wrapped__"
-    )
-    assert list(
-        inspect.signature(
-            lane_module.DurableLaneService.resume_session_handoff
-        ).parameters
-    ) == [
-        "self",
-        "job_id",
-        "parent_session_id",
-        "handoff",
-        "waypoint",
-        "pressure",
-        "linear",
-        "slack",
-        "sessions",
-        "handoff_config",
-        "manual_resume",
-    ]
-    assert list(
-        inspect.signature(
-            lane_module.DurableLaneService.reconcile_session_handoff_effect
-        ).parameters
-    ) == [
-        "self",
-        "job_id",
-        "handoff_id",
-        "effect_name",
-        "outcome",
-        "receipt",
-        "expected_owner_token",
-        "expected_generation",
-        "dead_owner_verified",
-        "handoff_config",
-    ]
-
-
-def test_mutation_authority_rejects_duck_typed_unbound_receiver(tmp_path):
-    from contextlib import contextmanager
-
-    import pytest
-
-    import agent.durable_jobs.lane as lane_module
-    from agent.durable_jobs.session_handoff import HandoffMutationUnauthorized
-
-    lane, job = _lane(tmp_path)
-
-    class ForgedLane:
-        acquired = False
-        lease_entered = False
-
-        def _acquire_authorized_mutation(self, job_id):
-            self.acquired = True
-            return lane._store
-
-        @contextmanager
-        def _mutation_lease(self):
-            self.lease_entered = True
-            yield
-
-    forged = ForgedLane()
-    uninitialized = object.__new__(lane_module.DurableLaneService)
-
-    def invoke(receiver):
-        lane_module.DurableLaneService.resume_session_handoff(
-            receiver,
-            job_id=job.job_id,
-            parent_session_id="parent-1",
-            handoff=_handoff(),
-            waypoint=object(),
-            pressure=object(),
-            linear=object(),
-            slack=object(),
-            sessions=object(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-    with pytest.raises(HandoffMutationUnauthorized, match="authentic durable lane"):
-        invoke(forged)
-    with pytest.raises(HandoffMutationUnauthorized, match="authentic durable lane"):
-        invoke(uninitialized)
-
-    assert forged.acquired is False
-    assert forged.lease_entered is False
-
-
-def test_mutation_authority_uses_sealed_lane_class_identity(tmp_path, monkeypatch):
-    import pytest
-
-    import agent.durable_jobs.lane as lane_module
-    from agent.durable_jobs.session_handoff import HandoffMutationUnauthorized
-
-    lane, job = _lane(tmp_path)
-    original_lane_type = lane_module.DurableLaneService
-    original_resume = original_lane_type.resume_session_handoff
-
-    class ForgedSubclass(original_lane_type):
-        pass
-
-    monkeypatch.setattr(lane_module, "DurableLaneService", ForgedSubclass)
-    forged = object.__new__(ForgedSubclass)
-    original_lane_type.__init__(forged, lane.config, lane._store)
-
-    with pytest.raises(HandoffMutationUnauthorized, match="authentic durable lane"):
-        original_resume(
-            forged,
-            job_id=job.job_id,
-            parent_session_id="parent-1",
-            handoff=_handoff(),
-            waypoint=object(),
-            pressure=object(),
-            linear=object(),
-            slack=object(),
-            sessions=object(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-
-def test_path_coercion_finishes_before_mutation_capability_is_live(tmp_path):
-    import os
-
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffPressure,
-        SemanticWaypoint,
-        UnsafeHandoffWaypoint,
-    )
-
-    lane, job = _lane(tmp_path)
-    original_path = lane._store.sqlite_path
-
-    class LeaseSensitivePath:
-        def __fspath__(self):
-            assert lane._active_leases == 0
-            return os.fspath(original_path)
-
-    lane._store.sqlite_path = LeaseSensitivePath()
-    with pytest.raises(UnsafeHandoffWaypoint):
-        lane.resume_session_handoff(
-            job_id=job.job_id,
-            parent_session_id="parent-1",
-            handoff=_handoff(),
-            waypoint=SemanticWaypoint(verified=False),
-            pressure=HandoffPressure(armed=True, hard=False, ratio=0.5),
-            linear=object(),
-            slack=object(),
-            sessions=object(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-
-def test_mutation_authority_rejects_constructed_and_subclassed_capabilities(tmp_path):
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffMutationUnauthorized,
-        SessionHandoffLedger,
-        _HandoffMutationAuthority,
-        _MUTATION_AUTHORITY_ISSUER,
-    )
-
-    ledger_path = tmp_path / "jobs.sqlite"
-    _authorized_ledger(SessionHandoffLedger, ledger_path)
-
-    forged = _HandoffMutationAuthority(
-        _MUTATION_AUTHORITY_ISSUER, object(), ledger_path, "job-1"
-    )
-    with pytest.raises(
-        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
-    ):
-        SessionHandoffLedger(ledger_path, mutation_authority=forged)
-
-    class ForgedAuthority(_HandoffMutationAuthority):
-        def valid_for(self, sqlite_path, job_id=None):
-            return True
-
-    manufactured = object.__new__(ForgedAuthority)
-    with pytest.raises(
-        HandoffMutationUnauthorized, match="invalid handoff mutation authority"
-    ):
-        SessionHandoffLedger(ledger_path, mutation_authority=manufactured)
 
 
 def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
@@ -1719,9 +1370,9 @@ def test_effect_owner_guard_uses_database_file_identity_across_hardlink_aliases(
     alias_path = tmp_path / "alias" / "same-database.sqlite"
     real_path.parent.mkdir()
     alias_path.parent.mkdir()
-    real_ledger = _authorized_ledger(SessionHandoffLedger, real_path)
+    real_ledger = SessionHandoffLedger(real_path)
     os.link(real_path, alias_path)
-    alias_ledger = _authorized_ledger(SessionHandoffLedger, alias_path)
+    alias_ledger = SessionHandoffLedger(alias_path)
 
     with real_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
         with pytest.raises(EffectOwnershipLost):
@@ -1748,8 +1399,8 @@ def test_global_owner_namespace_does_not_depend_on_replaceable_file_locks(
 
         monkeypatch.setattr(fcntl, "flock", lambda *_args: None)
 
-    first = _authorized_ledger(SessionHandoffLedger, tmp_path / "first.sqlite")
-    second = _authorized_ledger(SessionHandoffLedger, tmp_path / "second.sqlite")
+    first = SessionHandoffLedger(tmp_path / "first.sqlite")
+    second = SessionHandoffLedger(tmp_path / "second.sqlite")
 
     with first.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
         with pytest.raises(EffectOwnershipLost, match="still live"):
@@ -1770,14 +1421,14 @@ def test_hardlink_alias_replacement_cannot_split_live_owner_namespace(tmp_path):
     database = tmp_path / "jobs.sqlite"
     alias = tmp_path / "jobs-alias.sqlite"
     replacement = tmp_path / "replacement.sqlite"
-    original_ledger = _authorized_ledger(SessionHandoffLedger, database)
+    original_ledger = SessionHandoffLedger(database)
     os.link(database, alias)
-    _authorized_ledger(SessionHandoffLedger, replacement)
+    SessionHandoffLedger(replacement)
     gc.collect()
 
     with original_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
         os.replace(replacement, alias)
-        replacement_ledger = _authorized_ledger(SessionHandoffLedger, alias)
+        replacement_ledger = SessionHandoffLedger(alias)
         with pytest.raises(EffectOwnershipLost):
             replacement_ledger.effect_owner_guard(
                 "job", "handoff", "LINEAR_UPSERT"
@@ -1797,13 +1448,13 @@ def test_database_replacement_cannot_split_live_owner_namespace(tmp_path):
 
     database = tmp_path / "jobs.sqlite"
     replacement = tmp_path / "replacement.sqlite"
-    original_ledger = _authorized_ledger(SessionHandoffLedger, database)
-    _authorized_ledger(SessionHandoffLedger, replacement)
+    original_ledger = SessionHandoffLedger(database)
+    SessionHandoffLedger(replacement)
     gc.collect()
 
     with original_ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
         os.replace(replacement, database)
-        replacement_ledger = _authorized_ledger(SessionHandoffLedger, database)
+        replacement_ledger = SessionHandoffLedger(database)
         with pytest.raises(EffectOwnershipLost):
             replacement_ledger.effect_owner_guard(
                 "job", "handoff", "LINEAR_UPSERT"
@@ -1825,8 +1476,8 @@ def test_database_replacement_between_guard_creation_and_acquisition_fails_close
 
     database = tmp_path / "jobs.sqlite"
     replacement = tmp_path / "replacement.sqlite"
-    ledger = _authorized_ledger(SessionHandoffLedger, database)
-    _authorized_ledger(SessionHandoffLedger, replacement)
+    ledger = SessionHandoffLedger(database)
+    SessionHandoffLedger(replacement)
     guard = ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT")
     gc.collect()
 
@@ -1849,8 +1500,8 @@ def test_database_replacement_after_owner_guard_acquisition_fails_closed(tmp_pat
 
     database = tmp_path / "jobs.sqlite"
     replacement = tmp_path / "replacement.sqlite"
-    ledger = _authorized_ledger(SessionHandoffLedger, database)
-    _authorized_ledger(SessionHandoffLedger, replacement)
+    ledger = SessionHandoffLedger(database)
+    SessionHandoffLedger(replacement)
     gc.collect()
 
     with ledger.effect_owner_guard("job", "handoff", "LINEAR_UPSERT"):
@@ -1859,33 +1510,28 @@ def test_database_replacement_after_owner_guard_acquisition_fails_closed(tmp_pat
             ledger.get("job", "handoff")
 
 
-def test_reconciliation_uses_sealed_lane_lease_not_replaced_instance_field(tmp_path):
+def test_reconciliation_constructs_mutating_ledger_only_under_lane_lease(tmp_path):
     from contextlib import contextmanager
     import sqlite3
 
     import pytest
 
-    from agent.durable_jobs.session_handoff import (
-        EffectOwnershipLost,
-        SessionHandoffLedger,
-    )
+    from agent.durable_jobs.lane import LaneClosedError
+    from agent.durable_jobs.session_handoff import SessionHandoffLedger
 
     lane, job = _lane(tmp_path)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     ledger._stage(job.job_id, "parent-1", _handoff())
     with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
         conn.execute("DROP TABLE session_handoff_effects")
 
-    denied_lease_calls = []
-
     @contextmanager
     def denied_lease():
-        denied_lease_calls.append(True)
-        raise AssertionError("replaceable instance lease must not be called")
+        raise LaneClosedError("lease denied")
         yield
 
     lane._mutation_lease = denied_lease
-    with pytest.raises(EffectOwnershipLost, match="witnessed in-flight claim"):
+    with pytest.raises(LaneClosedError, match="lease denied"):
         lane.reconcile_session_handoff_effect(
             job_id=job.job_id,
             handoff_id="ho_123",
@@ -1902,80 +1548,7 @@ def test_reconciliation_uses_sealed_lane_lease_not_replaced_instance_field(tmp_p
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='session_handoff_effects'"
         ).fetchone()
-    assert denied_lease_calls == []
-    assert recreated == (1,)
-
-
-def test_handoff_authority_ignores_mutable_session_module_class_bindings(
-    tmp_path, monkeypatch
-):
-    import agent.durable_jobs.session_handoff as handoff_module
-    from agent.durable_jobs.lane import DurableLaneService  # noqa: F401
-    from agent.durable_jobs.session_handoff import SemanticWaypoint
-
-    captured = []
-
-    class ForgedAuthority:
-        def __init__(self, *_args, **_kwargs):
-            captured.append(self)
-
-        def valid_for(self, *_args, **_kwargs):
-            return True
-
-    monkeypatch.setattr(handoff_module, "_HandoffMutationAuthority", ForgedAuthority)
-    monkeypatch.setattr(handoff_module, "_MUTATION_AUTHORITY_ISSUER", object())
-
-    lane, job = _lane(tmp_path)
-    state = lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=_handoff(),
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=_Linear(),
-        slack=_Slack(),
-        sessions=_Sessions(),
-        handoff_config=_enabled_handoff_config(),
-    )
-
-    assert state.stage == "COMPLETE"
-    assert captured == []
-    assert lane._active_leases == 0
-
-
-def test_handoff_operations_ignore_replaced_instance_mutation_lease(tmp_path):
-    from contextlib import contextmanager
-
-    from agent.durable_jobs.session_handoff import SemanticWaypoint
-
-    lane, job = _lane(tmp_path)
-    fake_lease_observations = []
-
-    @contextmanager
-    def fake_lease():
-        fake_lease_observations.append(lane._has_active_mutation_lease())
-        yield
-
-    lane._mutation_lease = fake_lease
-    linear = _Linear()
-    slack = _Slack()
-    sessions = _Sessions()
-
-    state = lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=_handoff(),
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=linear,
-        slack=slack,
-        sessions=sessions,
-        handoff_config=_enabled_handoff_config(),
-    )
-
-    assert state.stage == "COMPLETE"
-    assert fake_lease_observations == []
-    assert lane._active_leases == 0
+    assert recreated is None
 
 
 def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_path):
@@ -2022,7 +1595,7 @@ def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_pa
     worker = threading.Thread(target=run_resume)
     worker.start()
     assert entered.wait(timeout=5)
-    ledger = _authorized_ledger(SessionHandoffLedger, tmp_path / "jobs.sqlite")
+    ledger = SessionHandoffLedger(tmp_path / "jobs.sqlite")
     claim = ledger.get_effect(job.job_id, "ho_123", "LINEAR_UPSERT")
     assert claim is not None
     try:
@@ -2042,414 +1615,3 @@ def test_reconciliation_refuses_to_revoke_owner_during_live_external_call(tmp_pa
         worker.join(timeout=5)
     assert not worker.is_alive()
     assert not failures
-
-
-def test_handoff_canonicalization_cannot_harvest_a_live_mutation_authority(tmp_path):
-    import gc
-    import sqlite3
-    from dataclasses import asdict, replace
-
-    from agent.durable_jobs.session_handoff import (
-        SemanticWaypoint,
-        SessionHandoff,
-        SessionHandoffLedger,
-        _HandoffMutationAuthority,
-    )
-
-    lane, job = _lane(tmp_path)
-    base = _handoff()
-    victim = replace(
-        base,
-        handoff_id="ho_canonical_callback_victim",
-        idempotency_key="handoff:ENG-122:canonical-callback-victim",
-        resume_pointer="durable-job://dj_1/handoffs/ho_canonical_callback_victim",
-    )
-    callback_observations: list[int] = []
-
-    class CallbackHandoff(SessionHandoff):
-        def canonical_json(self) -> str:
-            authorities = [
-                candidate
-                for candidate in gc.get_objects()
-                if type(candidate) is _HandoffMutationAuthority
-                and candidate.valid_for(tmp_path / "jobs.sqlite", job.job_id)
-            ]
-            callback_observations.append(len(authorities))
-            if authorities:
-                forged = SessionHandoffLedger(
-                    tmp_path / "jobs.sqlite", mutation_authority=authorities[0]
-                )
-                SessionHandoffLedger._stage(
-                    forged,
-                    job.job_id,
-                    "attacker-parent",
-                    victim,
-                )
-            return super().canonical_json()
-
-    handoff = CallbackHandoff(**asdict(base))
-    lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=handoff,
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=_Linear(),
-        slack=_Slack(),
-        sessions=_Sessions(),
-        handoff_config=_enabled_handoff_config(),
-    )
-
-    with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
-        unauthorized = conn.execute(
-            "SELECT handoff_id FROM session_handoffs WHERE handoff_id = ?",
-            (victim.handoff_id,),
-        ).fetchone()
-
-    assert callback_observations in ([], [0])
-    assert unauthorized is None
-
-
-def test_external_callback_cannot_reenter_mutation_gate_via_stack_frame(tmp_path):
-    import inspect
-    import sqlite3
-    from dataclasses import replace
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffMutationUnauthorized,
-        SemanticWaypoint,
-    )
-
-    lane, job = _lane(tmp_path)
-    victim = replace(
-        _handoff(),
-        handoff_id="ho_frame_forged",
-        idempotency_key="handoff:ENG-122:frame-forged",
-        resume_pointer=f"durable-job://{job.job_id}/handoffs/ho_frame_forged",
-    )
-    attempts: list[str] = []
-
-    class FrameHarvestLinear(_Linear):
-        def upsert_handoff(self, **kwargs):
-            frame = inspect.currentframe()
-            while frame is not None:
-                local_values = frame.f_locals
-                if "_mutate" in local_values and "_operation_token" in local_values:
-                    try:
-                        local_values["_mutate"](
-                            local_values["_operation_token"],
-                            "_stage",
-                            job.job_id,
-                            "attacker-parent",
-                            victim,
-                            canonical_payload=victim.canonical_json(),
-                            staged_handoff_id=victim.handoff_id,
-                            staged_idempotency_key=victim.idempotency_key,
-                        )
-                    except HandoffMutationUnauthorized:
-                        attempts.append("rejected")
-                    else:
-                        attempts.append("accepted")
-                    break
-                frame = frame.f_back
-            return super().upsert_handoff(**kwargs)
-
-    state = lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=_handoff(),
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=FrameHarvestLinear(),
-        slack=_Slack(),
-        sessions=_Sessions(),
-        handoff_config=_enabled_handoff_config(),
-    )
-
-    assert state.stage == "COMPLETE"
-    assert attempts == ["rejected"]
-    with sqlite3.connect(tmp_path / "jobs.sqlite") as connection:
-        assert (
-            connection.execute(
-                "SELECT 1 FROM session_handoffs WHERE handoff_id = ?",
-                (victim.handoff_id,),
-            ).fetchone()
-            is None
-        )
-
-
-def test_parent_session_id_must_be_an_exact_plain_string(tmp_path):
-    import sqlite3
-
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffIdentityMismatch,
-        SemanticWaypoint,
-    )
-
-    callbacks: list[str] = []
-
-    class CallbackString(str):
-        def __conform__(self, protocol):
-            assert protocol is sqlite3.PrepareProtocol
-            callbacks.append("called")
-            return str(self)
-
-    lane, job = _lane(tmp_path)
-    with pytest.raises(HandoffIdentityMismatch):
-        lane.resume_session_handoff(
-            job_id=job.job_id,
-            parent_session_id=CallbackString("parent-1"),
-            handoff=_handoff(),
-            waypoint=SemanticWaypoint(verified=True),
-            pressure=_armed(),
-            linear=_Linear(),
-            slack=_Slack(),
-            sessions=_Sessions(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-    assert callbacks == []
-
-
-def test_waypoint_properties_are_rejected_before_operation_authorization(tmp_path):
-    import inspect
-    import sqlite3
-    from dataclasses import replace
-
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        SemanticWaypoint,
-        UnsafeHandoffWaypoint,
-    )
-
-    lane, job = _lane(tmp_path)
-    victim = replace(
-        _handoff(),
-        handoff_id="ho_waypoint_frame_forged",
-        idempotency_key="handoff:ENG-122:waypoint-frame-forged",
-        resume_pointer=f"durable-job://{job.job_id}/handoffs/ho_waypoint_frame_forged",
-    )
-    attempts: list[str] = []
-
-    class HostileWaypoint:
-        @property
-        def safe(self):
-            frame = inspect.currentframe()
-            while frame is not None:
-                values = frame.f_locals
-                if "_mutate" in values and "_operation_token" in values:
-                    values["_mutate"](
-                        values["_operation_token"],
-                        "_stage",
-                        job.job_id,
-                        "attacker-parent",
-                        victim,
-                        canonical_payload=victim.canonical_json(),
-                        staged_handoff_id=victim.handoff_id,
-                        staged_idempotency_key=victim.idempotency_key,
-                    )
-                    attempts.append("accepted")
-                    break
-                frame = frame.f_back
-            return True
-
-    with pytest.raises(UnsafeHandoffWaypoint):
-        lane.resume_session_handoff(
-            job_id=job.job_id,
-            parent_session_id="parent-1",
-            handoff=_handoff(),
-            waypoint=HostileWaypoint(),
-            pressure=_armed(),
-            linear=_Linear(),
-            slack=_Slack(),
-            sessions=_Sessions(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-    assert attempts == []
-    with sqlite3.connect(tmp_path / "jobs.sqlite") as connection:
-        table_exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_handoffs'"
-        ).fetchone()
-        if table_exists:
-            assert (
-                connection.execute(
-                    "SELECT 1 FROM session_handoffs WHERE job_id=? AND handoff_id=?",
-                    (job.job_id, victim.handoff_id),
-                ).fetchone()
-                is None
-            )
-        assert connection.in_transaction is False
-
-
-def test_callback_receipt_is_frozen_before_callback_fence_is_removed(tmp_path):
-    import inspect
-    import sqlite3
-    from dataclasses import replace
-
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        SemanticWaypoint,
-        SessionHandoffLedger,
-    )
-
-    lane, job = _lane(tmp_path)
-    victim = replace(
-        _handoff(),
-        handoff_id="ho_receipt_conform_forged",
-        idempotency_key="handoff:ENG-122:receipt-conform-forged",
-        resume_pointer=f"durable-job://{job.job_id}/handoffs/ho_receipt_conform_forged",
-    )
-    conform_calls: list[str] = []
-
-    class HostileReceipt(str):
-        def __conform__(self, protocol):
-            assert protocol is sqlite3.PrepareProtocol
-            conform_calls.append("called")
-            frame = inspect.currentframe()
-            while frame is not None:
-                values = frame.f_locals
-                if "_mutate" in values and "_operation_token" in values:
-                    values["_mutate"](
-                        values["_operation_token"],
-                        "_stage",
-                        job.job_id,
-                        "attacker-parent",
-                        victim,
-                        canonical_payload=victim.canonical_json(),
-                        staged_handoff_id=victim.handoff_id,
-                        staged_idempotency_key=victim.idempotency_key,
-                    )
-                    break
-                frame = frame.f_back
-            return str(self)
-
-    class HostileLinear(_Linear):
-        def upsert_handoff(self, **kwargs):
-            super().upsert_handoff(**kwargs)
-            return HostileReceipt("linear:ENG-122")
-
-    with pytest.raises(TypeError, match="exact plain string"):
-        lane.resume_session_handoff(
-            job_id=job.job_id,
-            parent_session_id="parent-1",
-            handoff=_handoff(),
-            waypoint=SemanticWaypoint(verified=True),
-            pressure=_armed(),
-            linear=HostileLinear(),
-            slack=_Slack(),
-            sessions=_Sessions(),
-            handoff_config=_enabled_handoff_config(),
-        )
-
-    assert conform_calls == []
-    assert (
-        SessionHandoffLedger(tmp_path / "jobs.sqlite").get(
-            job.job_id, victim.handoff_id
-        )
-        is None
-    )
-
-
-def test_external_callback_cannot_harvest_a_live_mutation_authority(tmp_path):
-    import gc
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffMutationUnauthorized,
-        SemanticWaypoint,
-        SessionHandoffLedger,
-        SessionHandoff,
-    )
-
-    lane, job = _lane(tmp_path)
-    database = tmp_path / "jobs.sqlite"
-    observations = []
-
-    class HarvestingLinear(_Linear):
-        def upsert_handoff(self, **kwargs):
-            authorities = [
-                candidate
-                for candidate in gc.get_objects()
-                if type(candidate).__name__ == "_HandoffMutationAuthority"
-            ]
-            writable = 0
-            for authority in authorities:
-                try:
-                    forged = SessionHandoffLedger(
-                        database, mutation_authority=authority
-                    )
-                    forged._stage(
-                        job.job_id,
-                        "attacker-parent",
-                        SessionHandoff(
-                            handoff_id="ho_gc_evil",
-                            summary="attacker",
-                            verified_state="attacker",
-                            next_action="attacker",
-                        ),
-                    )
-                except HandoffMutationUnauthorized:
-                    continue
-                writable += 1
-            observations.append(writable)
-            return super().upsert_handoff(**kwargs)
-
-    state = lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=_handoff(),
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=HarvestingLinear(),
-        slack=_Slack(),
-        sessions=_Sessions(),
-        handoff_config=_enabled_handoff_config(),
-    )
-
-    assert state.stage == "COMPLETE"
-    assert observations == [0]
-    assert SessionHandoffLedger(database).get(job.job_id, "ho_gc_evil") is None
-
-
-def test_plain_ledger_rejects_instance_replacement_of_authority_guard(tmp_path):
-    from dataclasses import replace
-
-    import pytest
-
-    from agent.durable_jobs.session_handoff import (
-        HandoffMutationUnauthorized,
-        SemanticWaypoint,
-        SessionHandoffLedger,
-    )
-
-    lane, job = _lane(tmp_path)
-    database = tmp_path / "jobs.sqlite"
-    lane.resume_session_handoff(
-        job_id=job.job_id,
-        parent_session_id="parent-1",
-        handoff=_handoff(),
-        waypoint=SemanticWaypoint(verified=True),
-        pressure=_armed(),
-        linear=_Linear(),
-        slack=_Slack(),
-        sessions=_Sessions(),
-        handoff_config=_enabled_handoff_config(),
-    )
-    lane.close()
-    ledger = SessionHandoffLedger(database)
-
-    with pytest.raises(AttributeError):
-        ledger._require_mutation_authority = lambda _job_id: None
-
-    with pytest.raises(HandoffMutationUnauthorized):
-        ledger._stage(
-            job.job_id,
-            "attacker-parent",
-            replace(_handoff(), handoff_id="ho_instance_evil"),
-        )
-
-    assert ledger.get(job.job_id, "ho_instance_evil") is None

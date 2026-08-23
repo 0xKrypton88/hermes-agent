@@ -6,65 +6,20 @@ Slack, child-session, or provider client. Those boundaries are injected ports.
 External effects require the exact boolean pair `enabled is True` and
 `shadow is False`; non-boolean truthy/falsy values are rejected before the
 coordinator is constructed. The effectful coordinator exists only in the
-authorized lane method's local scope, so it cannot be imported and called
-around activation, identity, or mutation-lease checks. A normally constructed
-ledger is read-only: every durable mutation helper also requires an opaque,
-identity-checked mutation authority bound to the exact SQLite database, the
-authorized durable job, and an exact live ticket in closure-owned lane state.
-Only the two legitimate lane entrypoints, invoked on the exact
-`DurableLaneService` class identity sealed into the closure after class
-construction, can issue a ticket. The completed constructor registers only
-instances of that sealed class identity in the same closure-owned gate;
-module rebinding, duck-typed, subclass, and uninitialized exact-type receivers
-fail before store acquisition or lease entry. Database paths and job IDs are
-canonicalized before the ticket and mutation lease become live, and only those
-immutable canonical values are used by the authority, ledger, and validator.
-Thus attacker-controlled path coercion cannot run while capability state is
-live. The parent session ID is likewise required to be an exact plain string
-before operation authorization, preventing SQLite adapter callbacks from string
-subclasses while a narrow authority exists. Handoff fields are likewise copied
-into plain immutable values and
-canonicalized through the closure-captured base serializer before an operation
-token or mutation authority exists. The staged SQL mutator receives that
-canonical payload and the frozen identity strings, so an overridden
-`canonical_json()` callback never runs while an authority is live. Waypoint
-and pressure inputs must be exact sealed dataclasses with exact plain scalar
-fields; they are reduced to booleans before operation authorization, so
-caller-defined properties cannot inspect a live mutation frame. Every external
-adapter return is checked as an exact plain `str` or `None` before the callback
-fence is removed. SQLite therefore never receives a caller-defined return-value
-string subclass or protocol adapter while capability state is live.
-Reconciliation identities, outcomes, receipts, and fencing values are likewise
-required to be exact plain scalar types before operation authorization. The
-authority class, issuer, ticket validator, exact ledger type and
-unbound mutator implementations, plus the authentic unbound mutation-lease
-implementation are captured in closure state during module/class
-initialization. Later module rebinding cannot substitute them. A lane operation
-is represented by an exact built-in object token that is held only in the
-operation frame and registered by `id`; the token itself is not retained in a
-GC-visible registry. Each SQL mutation creates a fresh ledger and authority for
-the duration of that single sealed unbound mutator call, then revokes and drops
-them before returning. No mutation authority or authority-bearing ledger
-remains live while Linear, Slack, or child-session adapters run, so a callback
-cannot harvest one with `gc.get_objects()` or reanimate a stale authority from
-current fields. Adapter lookup and invocation also run behind a closure-owned
-same-thread callback fence. Reentrant use of a stack-frame-harvested operation
-token and mutator is rejected before a narrow authority is issued. Plain
-ledgers are slotted, so replacing the instance's authority
-guard is rejected rather than turning it into a writer. The builder,
-class-sealer, and decorator bindings are deleted after class construction,
-while the importable diagnostic validator is read-only. Operation admission
-re-runs enabled/identity/owner authorization and holds the authentic mutation
-lease; every narrow mutation ticket additionally revalidates thread, job,
-database, operation token, and the closure-sealed authority class. Replacing a
-stored authority field, constructing or subclassing the slotted authority,
-importing a direct issuer, reusing a ticket after the narrow call, or crossing
-job/database/thread boundaries fails closed before SQL. Plain-ledger
-construction never initializes or migrates schema. Renaming helpers private is
-not treated as authorization. This prevents
-a caller that merely constructs a ledger from forging completed effects without
-invoking adapters. Shadow mode refuses the coordinator call rather than invoking
-injected ports.
+authorized lane method's local scope. The ledger exposes only read and
+owner-guard operations as public methods; durable mutation helpers are private
+and normal product code invokes them only through that lane-local coordinator
+or the lane's authorized reconciliation path. Shadow mode refuses the
+coordinator call rather than invoking injected ports.
+
+The trust boundary is explicit: installed Hermes product code and adapters in
+the same Python process are trusted, while job/handoff data, external responses,
+and persisted crash/restart state are not. Those values are redacted, checked,
+fenced, and handled fail-closed at their product boundaries. This design does
+not treat Python frames, closures, function objects, or module bindings as a
+security boundary against hostile in-process code. Truly untrusted plugins need
+separate process/OS isolation; interpreter-introspection resistance is outside
+this pilot.
 
 ## Policy
 
