@@ -348,3 +348,48 @@ def test_legacy_dispatch_batch_recovery_and_restore_fail_before_side_effects(mon
     finally:
         module.configure_legacy_writer_authority_check(None)
     assert calls == 4
+
+def test_session_handoff_rechecks_writer_authority_before_effects(tmp_path):
+    import pytest
+
+    from agent.durable_jobs.writer_authority import WriterAuthorityError
+    from tests.agent.durable_jobs.test_session_handoff import (
+        _Linear,
+        _Sessions,
+        _Slack,
+        _armed,
+        _enabled_handoff_config,
+        _handoff,
+        _lane,
+    )
+    from agent.durable_jobs.session_handoff import SemanticWaypoint
+
+    lane, job = _lane(tmp_path)
+    checks: list[str] = []
+
+    def denied_writer() -> None:
+        checks.append("checked")
+        raise WriterAuthorityError("writer authority lost")
+
+    lane._writer_authority_check = denied_writer
+    linear, slack, sessions = _Linear(), _Slack(), _Sessions()
+
+    with pytest.raises(WriterAuthorityError, match="authority lost"):
+        lane.resume_session_handoff(
+            job_id=job.job_id,
+            parent_session_id="parent-1",
+            handoff=_handoff(),
+            waypoint=SemanticWaypoint(verified=True),
+            pressure=_armed(),
+            linear=linear,
+            slack=slack,
+            sessions=sessions,
+            handoff_config=_enabled_handoff_config(),
+        )
+
+    assert checks == ["checked"]
+    assert not linear.effects
+    assert not slack.effects
+    assert not sessions.children
+    assert not sessions.injections
+    assert not sessions.turns
