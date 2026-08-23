@@ -156,7 +156,11 @@ def _open_read_only(snapshot: FrozenSQLiteSnapshot) -> sqlite3.Connection:
 
 def _table_names(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        """
+        SELECT name
+        FROM pragma_table_list
+        WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%'
+        """
     ).fetchall()
     return sorted(str(row[0]) for row in rows)
 
@@ -171,8 +175,6 @@ def _pk_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
         ((int(row[5]), str(row[1])) for row in rows if int(row[5]) > 0),
         key=lambda item: item[0],
     )
-    if not primary:
-        raise LegacyMigrationError(f"source table {table!r} has no primary key")
     return tuple(name for _, name in primary)
 
 
@@ -212,7 +214,23 @@ def plan_legacy_adoption(snapshot: FrozenSQLiteSnapshot) -> AdoptionPlan:
         table_counts: dict[str, int] = {}
         for table in tables:
             primary = _pk_columns(conn, table)
-            rows = conn.execute(f"SELECT * FROM {_quoted(table)}").fetchall()
+            projection = "*"
+            if not primary:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        f"PRAGMA table_info({_quoted(table)})"
+                    ).fetchall()
+                }
+                if "$rowid" in columns:
+                    raise LegacyMigrationError(
+                        f"source table {table!r} has ambiguous $rowid column"
+                    )
+                primary = ("$rowid",)
+                projection = 'rowid AS "$rowid", *'
+            rows = conn.execute(
+                f"SELECT {projection} FROM {_quoted(table)}"
+            ).fetchall()
             table_entries: list[AdoptionEntry] = []
             for raw in rows:
                 row = {key: _normalize(raw[key]) for key in sorted(raw.keys())}

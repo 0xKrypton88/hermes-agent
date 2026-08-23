@@ -133,6 +133,32 @@ def test_offline_plan_is_deterministic_and_quarantines_unsafe_rows(tmp_path):
     assert parsed["format_version"] == 1
 
 
+def test_plan_skips_virtual_shadow_tables_and_keys_rowid_tables(tmp_path):
+    migration = _legacy_api()
+    assert migration is not None
+    path = tmp_path / "legacy-with-fts.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (9);
+        CREATE VIRTUAL TABLE messages_fts USING fts5(body);
+        INSERT INTO messages_fts VALUES ('indexed only');
+        """
+    )
+    conn.commit()
+    conn.close()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    plan = migration.plan_legacy_adoption(
+        migration.FrozenSQLiteSnapshot(path=path, file_sha256=digest)
+    )
+
+    assert plan.table_counts == {"schema_version": 1}
+    assert {entry.source_table for entry in plan.entries} == {"schema_version"}
+    assert json.loads(plan.entries[0].source_pk_json) == {"$rowid": 1}
+
+
 def test_apply_is_idempotent_and_divergent_migration_key_fails_closed(tmp_path):
     migration = _legacy_api()
     assert migration is not None

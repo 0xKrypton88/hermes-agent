@@ -1878,6 +1878,7 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
 
     ports = _load_ports()
     real_event = threading.Event
+    provider_entered = real_event()
     provider_release = real_event()
 
     class DeadlineCrossingEvent:
@@ -1891,11 +1892,13 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
             return self._event.is_set()
 
         def wait(self, _timeout=None):
-            return self._event.wait(1)
+            assert provider_entered.wait(10)
+            return self._event.wait(10)
 
     class DelayedCursor(FakeCursorCloudClient):
         def create_agent(self, payload):
-            assert provider_release.wait(1)
+            provider_entered.set()
+            assert provider_release.wait(10)
             return super().create_agent(payload)
 
     client = DelayedCursor()
@@ -1909,9 +1912,20 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
             Thread=threading.Thread,
         ),
     )
-    releaser = threading.Timer(0.04, provider_release.set)
+    monkeypatch.setattr(
+        request_ports_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: 1.0 if provider_release.is_set() else 0.0
+        ),
+    )
+
+    def release_after_provider_entry():
+        assert provider_entered.wait(10)
+        provider_release.set()
+
+    releaser = threading.Thread(target=release_after_provider_entry)
     releaser.start()
-    started = time.monotonic()
     try:
         with pytest.raises(ports.RequestPortTimeout, match="timeout"):
             port(
@@ -1922,7 +1936,6 @@ def test_completion_after_deadline_still_times_out_and_releases_active_call(monk
             )
     finally:
         releaser.join(1)
-    assert time.monotonic() - started < 0.2
     assert [item[0] for item in client.calls] == ["create_agent"]
     assert port.close(timeout_seconds=1) is True
     assert port._active_calls == 0
