@@ -9,6 +9,7 @@ hard-disabled (never invokes adapters).
 
 from __future__ import annotations
 
+from agent.durable_jobs import legacy_migration, writer_authority
 from agent.durable_jobs.config import (
     DEFAULT_DURABLE_JOBS_CONFIG,
     DurableJobsConfig,
@@ -22,5 +23,7 @@ __all__ = [
     "DEFAULT_DURABLE_JOBS_CONFIG",
     "DurableJobsConfig",
     "JobPhase",
+    "legacy_migration",
     "load_durable_jobs_config",
+    "writer_authority",
 ]
