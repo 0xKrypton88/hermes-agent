@@ -169,23 +169,37 @@ def test_apply_is_idempotent_and_divergent_migration_key_fails_closed(tmp_path):
     )
     ledger = tmp_path / "adoption-ledger.sqlite3"
     dispositions = {item.migration_key: "operator_quarantine" for item in plan.blockers}
-    first = migration.apply_legacy_adoption(plan, ledger, dispositions=dispositions)
-    second = migration.apply_legacy_adoption(plan, ledger, dispositions=dispositions)
+    first = migration.apply_legacy_adoption(
+        plan, ledger, dispositions=dispositions, expected_source_snapshot=plan.source_snapshot
+    )
+    second = migration.apply_legacy_adoption(
+        plan, ledger, dispositions=dispositions, expected_source_snapshot=plan.source_snapshot
+    )
     assert first.total_count == second.total_count == len(plan.entries)
     assert first.inserted_count == len(plan.entries)
     assert second.inserted_count == 0
     assert second.duplicate_count == len(plan.entries)
-    assert migration.verify_legacy_adoption(plan, ledger, dispositions=dispositions).verified is True
+    assert migration.verify_legacy_adoption(
+        plan, ledger, dispositions=dispositions, expected_source_snapshot=plan.source_snapshot
+    ).verified is True
 
     changed = plan.with_replaced_row_sha(plan.entries[0].migration_key, "0" * 64)
     with pytest.raises(migration.LegacyMigrationError, match="divergent"):
-        migration.apply_legacy_adoption(changed, ledger, dispositions=dispositions)
+        migration.apply_legacy_adoption(
+            changed,
+            ledger,
+            dispositions=dispositions,
+            expected_source_snapshot=plan.source_snapshot,
+        )
 
     changed_dispositions = dict(dispositions)
     changed_dispositions[plan.blockers[0].migration_key] = "operator_discard"
     with pytest.raises(migration.LegacyMigrationError, match="divergent"):
         migration.apply_legacy_adoption(
-            plan, ledger, dispositions=changed_dispositions
+            plan,
+            ledger,
+            dispositions=changed_dispositions,
+            expected_source_snapshot=plan.source_snapshot,
         )
 
 
@@ -197,20 +211,30 @@ def test_verify_adoption_is_read_only_and_checks_dispositions(tmp_path):
         migration.FrozenSQLiteSnapshot(path=path, file_sha256=digest)
     )
     missing = tmp_path / "missing-ledger.sqlite3"
-    result = migration.verify_legacy_adoption(plan, missing, dispositions={})
+    result = migration.verify_legacy_adoption(
+        plan, missing, dispositions={}, expected_source_snapshot=plan.source_snapshot
+    )
     assert result.verified is False
     assert not missing.exists()
 
     ledger = tmp_path / "adoption-ledger.sqlite3"
     dispositions = {item.migration_key: "operator_quarantine" for item in plan.blockers}
-    migration.apply_legacy_adoption(plan, ledger, dispositions=dispositions)
+    migration.apply_legacy_adoption(
+        plan, ledger, dispositions=dispositions, expected_source_snapshot=plan.source_snapshot
+    )
     wrong = dict(dispositions)
     wrong[plan.blockers[0].migration_key] = "operator_discard"
     assert migration.verify_legacy_adoption(
-        plan, ledger, dispositions=wrong
+        plan,
+        ledger,
+        dispositions=wrong,
+        expected_source_snapshot=plan.source_snapshot,
     ).verified is False
     assert migration.verify_legacy_adoption(
-        plan, ledger, dispositions={}
+        plan,
+        ledger,
+        dispositions={},
+        expected_source_snapshot=plan.source_snapshot,
     ).verified is False
 
 
@@ -743,6 +767,82 @@ def test_nested_secret_keys_are_redacted_before_all_exports_and_hashes(tmp_path)
     ).hexdigest()
 
 
+def test_nested_secret_in_text_primary_key_is_redacted_before_identity_and_exports(
+    tmp_path, monkeypatch
+):
+    migration = _legacy_api()
+    assert migration is not None
+    raw_secret = "fabricated-pk-secret-123456789"
+    source = tmp_path / "credential-primary-key.sqlite3"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, origin_json TEXT)")
+        primary_key = json.dumps(
+            {"tenant": "safe", "nested": {"access_token": raw_secret}}
+        )
+        conn.execute("INSERT INTO sessions VALUES (?, ?)", (primary_key, "{}"))
+
+    serialized_hash_inputs = []
+    original_sha = migration._sha
+
+    def capture_sha(value):
+        if isinstance(value, str):
+            serialized_hash_inputs.append(value)
+        return original_sha(value)
+
+    monkeypatch.setattr(migration, "_sha", capture_sha)
+    snapshot = migration.FrozenSQLiteSnapshot(
+        path=source, file_sha256=hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+    plan = migration.plan_legacy_adoption(snapshot)
+    entry = plan.entries[0]
+    visible_outputs = "".join(
+        (
+            entry.source_pk_json,
+            entry.canonical_row_json,
+            plan.manifest_json(),
+            plan.reconciliation_json(),
+        )
+    )
+
+    assert raw_secret not in visible_outputs
+    # The raw value may be hashed only to construct its redaction marker. It must
+    # not reach any later migration-key, row, table, or population hash input.
+    assert [value for value in serialized_hash_inputs if raw_secret in value] == [
+        json.dumps(raw_secret, sort_keys=True, separators=(",", ":"))
+    ]
+    assert json.loads(entry.source_pk_json)["id"]["nested"]["access_token"].startswith(
+        "<redacted:sha256="
+    )
+    assert entry.migration_key == original_sha(
+        json.dumps(
+            {
+                "source_table": "sessions",
+                "primary_key": json.loads(entry.source_pk_json),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+    collision_source = tmp_path / "redaction-collision.sqlite3"
+    with sqlite3.connect(collision_source) as conn:
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY)")
+        conn.executemany(
+            "INSERT INTO sessions VALUES (?)",
+            [
+                (json.dumps({"access_token": "fabricated-first-123456789"}),),
+                (json.dumps({"access_token": "fabricated-second-123456789"}),),
+            ],
+        )
+    monkeypatch.setattr(migration, "_redacted_marker", lambda _value: "<redacted>")
+    collision_snapshot = migration.FrozenSQLiteSnapshot(
+        path=collision_source,
+        file_sha256=hashlib.sha256(collision_source.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(migration.LegacyMigrationError, match="collide after credential redaction"):
+        migration.plan_legacy_adoption(collision_snapshot)
+
+
 def test_verify_recomputes_snapshot_and_rejects_self_consistent_forged_plan(tmp_path):
     migration = _legacy_api()
     assert migration is not None
@@ -769,10 +869,13 @@ def test_verify_recomputes_snapshot_and_rejects_self_consistent_forged_plan(tmp_
     }
     with pytest.raises(
         migration.LegacyMigrationError,
-        match="does not match independently recomputed source snapshot",
+        match="expected source provenance",
     ):
         migration.apply_legacy_adoption(
-            forged_plan, ledger, dispositions=dispositions
+            forged_plan,
+            ledger,
+            dispositions=dispositions,
+            expected_source_snapshot=plan.source_snapshot,
         )
     assert not ledger.exists()
 
@@ -802,5 +905,62 @@ def test_verify_recomputes_snapshot_and_rejects_self_consistent_forged_plan(tmp_
         conn.close()
 
     assert not migration.verify_legacy_adoption(
-        forged_plan, ledger, dispositions=dispositions
+        forged_plan,
+        ledger,
+        dispositions=dispositions,
+        expected_source_snapshot=plan.source_snapshot,
+    ).verified
+
+
+def test_apply_and_verify_bind_plan_to_independently_expected_source(tmp_path):
+    migration = _legacy_api()
+    assert migration is not None
+
+    def frozen(name, session_id):
+        path = tmp_path / name
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY)")
+            conn.execute("INSERT INTO sessions VALUES (?)", (session_id,))
+        return migration.FrozenSQLiteSnapshot(
+            path=path, file_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+
+    original = frozen("original.sqlite3", "operator-approved")
+    forged = frozen("forged.sqlite3", "attacker-controlled")
+    forged_plan = migration.plan_legacy_adoption(forged)
+    ledger = tmp_path / "forged-ledger.sqlite3"
+
+    with pytest.raises(migration.LegacyMigrationError, match="expected source provenance"):
+        migration.apply_legacy_adoption(
+            forged_plan,
+            ledger,
+            dispositions={},
+            expected_source_snapshot=original,
+        )
+    assert not ledger.exists()
+
+    migration.apply_legacy_adoption(
+        forged_plan,
+        ledger,
+        dispositions={},
+        expected_source_snapshot=forged,
+    )
+    assert not migration.verify_legacy_adoption(
+        forged_plan,
+        ledger,
+        dispositions={},
+        expected_source_snapshot=original,
+    ).verified
+    assert migration.verify_legacy_adoption(
+        forged_plan,
+        ledger,
+        dispositions={},
+        expected_source_snapshot=forged,
+    ).verified
+
+    missing = tmp_path / "missing-provenance-ledger.sqlite3"
+    with pytest.raises(migration.LegacyMigrationError, match="expected source provenance"):
+        migration.apply_legacy_adoption(forged_plan, missing, dispositions={})
+    assert not migration.verify_legacy_adoption(
+        forged_plan, ledger, dispositions={}
     ).verified

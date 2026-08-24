@@ -342,19 +342,27 @@ def plan_legacy_adoption(snapshot: FrozenSQLiteSnapshot) -> AdoptionPlan:
                 f"SELECT {projection} FROM {_quoted(table)}"
             ).fetchall()
             table_entries: list[AdoptionEntry] = []
+            source_identities: dict[str, Mapping[str, Any]] = {}
             for raw in rows:
                 row = {key: _normalize(raw[key]) for key in sorted(raw.keys())}
-                pk = {key: row[key] for key in primary}
                 sanitized_row = {
                     str(name): _sanitize_export_value(value) for name, value in row.items()
                 }
+                raw_pk = {key: row[key] for key in primary}
+                pk = {key: sanitized_row[key] for key in primary}
+                source_pk_json = _json(pk)
+                prior_identity = source_identities.setdefault(source_pk_json, raw_pk)
+                if prior_identity != raw_pk:
+                    raise LegacyMigrationError(
+                        "distinct source identities collide after credential redaction"
+                    )
                 canonical = _json(sanitized_row)
                 key = _sha(_json({"source_table": table, "primary_key": pk}))
                 reasons = _blocker_reasons(table=table, row=row, session_ids=session_ids)
                 entry = AdoptionEntry(
                     migration_key=key,
                     source_table=table,
-                    source_pk_json=_json(pk),
+                    source_pk_json=source_pk_json,
                     row_sha256=_sha(canonical),
                     canonical_row_json=canonical,
                     target_kind="quarantine" if reasons else "adoption_ledger",
@@ -383,11 +391,20 @@ def plan_legacy_adoption(snapshot: FrozenSQLiteSnapshot) -> AdoptionPlan:
     )
 
 
-def _plan_matches_source_snapshot(plan: AdoptionPlan) -> bool:
-    """Re-inventory source evidence instead of trusting plan-owned hashes."""
+def _plan_matches_source_snapshot(
+    plan: AdoptionPlan,
+    expected_source_snapshot: FrozenSQLiteSnapshot | None = None,
+) -> bool:
+    """Bind a plan to operator-pinned provenance and re-inventory that source."""
 
+    if expected_source_snapshot is None:
+        return False
+    if plan.source_snapshot != expected_source_snapshot:
+        return False
+    if plan.snapshot_sha256 != expected_source_snapshot.file_sha256.lower():
+        return False
     try:
-        expected = plan_legacy_adoption(plan.source_snapshot)
+        expected = plan_legacy_adoption(expected_source_snapshot)
     except (OSError, sqlite3.Error, LegacyMigrationError):
         return False
     return (
@@ -431,12 +448,13 @@ def apply_legacy_adoption(
     ledger_path: Path,
     *,
     dispositions: Mapping[str, str],
+    expected_source_snapshot: FrozenSQLiteSnapshot | None = None,
 ) -> ApplyResult:
     """Append immutable rows; exact duplicates are no-ops, divergence is fatal."""
 
-    if not _plan_matches_source_snapshot(plan):
+    if not _plan_matches_source_snapshot(plan, expected_source_snapshot):
         raise LegacyMigrationError(
-            "divergent adoption plan does not match independently recomputed source snapshot"
+            "divergent adoption plan does not match independently expected source provenance"
         )
     unresolved = {
         item.migration_key
@@ -494,8 +512,9 @@ def verify_legacy_adoption(
     ledger_path: Path,
     *,
     dispositions: Mapping[str, str],
+    expected_source_snapshot: FrozenSQLiteSnapshot | None = None,
 ) -> VerificationResult:
-    if not _plan_matches_source_snapshot(plan):
+    if not _plan_matches_source_snapshot(plan, expected_source_snapshot):
         return VerificationResult(False, len(plan.entries), 0)
     path = Path(ledger_path)
     if not path.is_file():
