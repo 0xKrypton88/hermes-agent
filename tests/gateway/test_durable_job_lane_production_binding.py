@@ -2394,3 +2394,88 @@ def test_copied_data_posix_triple_rebind_rejected_for_gateway_preflight():
         posix_triple=True,
         early_imports="from gateway.run import _capture_trusted_environ_startup\n",
     )
+
+
+
+def test_postgres_production_binding_builds_fresh_authority_provider_without_owner_injection(
+    tmp_path, monkeypatch
+):
+    """The real Gateway owner must not need a test-only authority-provider seam."""
+    from agent.durable_jobs.production_binding import production_attach_kwargs
+    from agent.durable_jobs.writer_authority import WriterAuthorityBinding
+
+    raw = _complete(
+        tmp_path,
+        backend="postgresql",
+        sqlite_path=None,
+        checkpoint_sqlite_path=None,
+        postgres_dsn="postgresql://durable:secret@127.0.0.1:5432/hermes_durable",
+        postgres_schema="durable_app",
+        checkpoint_postgres_dsn="postgresql://durable:secret@127.0.0.1:5432/hermes_durable",
+        checkpoint_postgres_schema="durable_checkpoint",
+        postgres_storage_id="hermes_durable_app",
+        checkpoint_postgres_storage_id="hermes_durable_checkpoint",
+        postgres_environment_id="glantz_default",
+        writer_id="hermes_orchestrator",
+        writer_authority_epoch=1,
+    )
+    class _GatewayOwner:
+        pass
+
+    owner = _GatewayOwner()
+    bind_runtime_secret_env(monkeypatch)
+    provider_calls = []
+    _install_request_ports(owner, _idle_request(provider_calls), _idle_request(provider_calls))
+    del owner.durable_job_writer_authority_check
+
+    class _Cursor:
+        def fetchall(self):
+            return [
+                (
+                    "hermes_durable_app",
+                    "glantz_default",
+                    1,
+                    "hermes_orchestrator",
+                    "new",
+                )
+            ]
+
+    class _Connection:
+        def __init__(self):
+            self.closed = False
+
+        def execute(self, sql, params=()):
+            if str(sql).startswith("SET search_path"):
+                assert '"durable_app"' in str(sql)
+                assert params == ()
+                return _Cursor()
+            assert "FROM durable_writer_authority" in str(sql)
+            assert params == ("hermes_durable_app", "glantz_default")
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connections = []
+
+    def _connect(dsn):
+        assert dsn == raw["durable_jobs"]["postgres_dsn"]
+        connection = _Connection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=_connect))
+
+    bound = production_attach_kwargs(owner=owner, raw_config=raw)
+    assert provider_calls == []
+    assert "writer_authority_check" in bound
+    assert connections == []
+    assert bound["writer_authority_check"]() == WriterAuthorityBinding(
+        storage_id="hermes_durable_app",
+        environment_id="glantz_default",
+        authority_epoch=1,
+        writer_id="hermes_orchestrator",
+        mode="new",
+    )
+    assert len(connections) == 1
+    assert connections[0].closed is True

@@ -503,6 +503,34 @@ def bind_production_transports(
         return {}
 
 
+def _postgres_authority_connection_provider(config: Any):
+    """Build a fresh, schema-bound connection for each authority read/lease."""
+    if (
+        getattr(config, "resolved_backend", None) != "postgresql"
+        or not config.postgres_dsn
+        or not config.postgres_schema
+    ):
+        return None
+    dsn = config.postgres_dsn
+    schema = config.postgres_schema
+
+    def connect():
+        import psycopg
+
+        connection = psycopg.connect(dsn)
+        try:
+            # ``postgres_schema`` has already passed the strict config identifier
+            # validator. Quote it again so authority tables cannot escape the
+            # application persistence boundary.
+            connection.execute(f'SET search_path TO "{schema}"')
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    return connect
+
+
 def production_attach_kwargs(
     *,
     owner: Any = None,
@@ -510,21 +538,28 @@ def production_attach_kwargs(
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Lifecycle helper: bind transports and mandatory datastore authority."""
+    try:
+        from agent.durable_jobs.config import load_durable_jobs_config
+
+        config = load_durable_jobs_config(raw_config or {})
+    except (TypeError, ValueError, DurableJobsConfigError):
+        return {}
+
     authority_check = _owner_attr(owner, "durable_job_writer_authority_check")
     if not callable(authority_check):
         connection_provider = _owner_attr(
             owner, "durable_job_writer_authority_connection_provider"
         )
         if not callable(connection_provider):
+            connection_provider = _postgres_authority_connection_provider(config)
+        if not callable(connection_provider):
             return {}
         try:
-            from agent.durable_jobs.config import load_durable_jobs_config
             from agent.durable_jobs.writer_authority import (
                 AuthorityTarget,
                 DatastoreWriterAuthorityCheck,
             )
 
-            config = load_durable_jobs_config(raw_config or {})
             if not config.writer_id or config.writer_authority_epoch <= 0:
                 return {}
             authority_check = DatastoreWriterAuthorityCheck.from_connection_provider(
