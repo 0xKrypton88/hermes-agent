@@ -905,10 +905,17 @@ def preflight_durable_jobs(
         reasons.append("disabled")
     storage_reasons = _storage_reasons(cfg)
     reasons.extend(storage_reasons)
-    if not cfg.adapter_modes_explicit():
-        reasons.append("adapter_modes_not_explicit")
-    if not cfg.bindings_complete():
-        reasons.append("bindings_incomplete")
+    postgres_storage_only = (
+        cfg.resolved_backend == BACKEND_POSTGRESQL and not cfg.dispatch_enabled
+    )
+    # A storage-only PostgreSQL lane has no provider transport boundary. Do not
+    # require or inspect adapter modes, provider identity bindings, or secret
+    # references merely to construct its persistence/authority runtime.
+    if not postgres_storage_only:
+        if not cfg.adapter_modes_explicit():
+            reasons.append("adapter_modes_not_explicit")
+        if not cfg.bindings_complete():
+            reasons.append("bindings_incomplete")
 
     secret_refs_configured = bool(cfg.cursor_secret_ref and cfg.slack_secret_ref)
     secret_refs_present = False
@@ -927,35 +934,42 @@ def preflight_durable_jobs(
     else:
         secret_refs_present = True
 
-    constructible = (
-        cfg.enabled
-        and not storage_reasons
-        and cfg.adapter_modes_explicit()
-        and cfg.bindings_complete()
+    constructible = cfg.enabled and not storage_reasons and (
+        postgres_storage_only
+        or (cfg.adapter_modes_explicit() and cfg.bindings_complete())
     )
-    if constructible and not secret_refs_present:
-        reasons.append("secret_refs_missing")
-    transport_capability = _injected_transport_capability(
-        cfg, cursor_transport, slack_transport
-    )
-    binding_reason = (
-        _injected_secret_ref_binding_reason(
+    if postgres_storage_only:
+        # ``runtime_ready`` denotes externally dispatch-capable provider
+        # bindings. Storage-only attachment is intentionally constructible but
+        # never provider-runtime-ready or dispatch-allowed.
+        secret_refs_present = False
+        transport_capability = False
+        binding_reason = None
+        runtime_ready = False
+    else:
+        if constructible and not secret_refs_present:
+            reasons.append("secret_refs_missing")
+        transport_capability = _injected_transport_capability(
             cfg, cursor_transport, slack_transport
         )
-        if transport_capability
-        else None
-    )
-    if constructible and not transport_capability:
-        reasons.append("transport_capability_missing")
-    if constructible and transport_capability and binding_reason:
-        if binding_reason not in reasons:
-            reasons.append(binding_reason)
-    runtime_ready = (
-        constructible
-        and secret_refs_present
-        and transport_capability
-        and binding_reason is None
-    )
+        binding_reason = (
+            _injected_secret_ref_binding_reason(
+                cfg, cursor_transport, slack_transport
+            )
+            if transport_capability
+            else None
+        )
+        if constructible and not transport_capability:
+            reasons.append("transport_capability_missing")
+        if constructible and transport_capability and binding_reason:
+            if binding_reason not in reasons:
+                reasons.append(binding_reason)
+        runtime_ready = (
+            constructible
+            and secret_refs_present
+            and transport_capability
+            and binding_reason is None
+        )
     return DurableJobsPreflight(
         constructible=constructible,
         dispatch_allowed=bool(cfg.dispatch_allowed and runtime_ready),

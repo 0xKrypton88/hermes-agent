@@ -2397,6 +2397,41 @@ def test_copied_data_posix_triple_rebind_rejected_for_gateway_preflight():
 
 
 
+def test_postgres_production_binding_rejects_unverified_target_identity(
+    tmp_path, monkeypatch
+):
+    """Attachment fails closed before publishing authority for an unproved target."""
+    from agent.durable_jobs import postgres_identity
+    from agent.durable_jobs.postgres_identity import TargetIdentityError
+    from agent.durable_jobs.production_binding import production_attach_kwargs
+
+    raw = _complete(
+        tmp_path,
+        backend="postgresql",
+        sqlite_path=None,
+        checkpoint_sqlite_path=None,
+        postgres_dsn="postgresql://durable:***@127.0.0.1:5432/hermes_durable",
+        postgres_schema="durable_app",
+        checkpoint_postgres_dsn="postgresql://durable:***@127.0.0.1:5432/hermes_durable",
+        checkpoint_postgres_schema="durable_checkpoint",
+        postgres_storage_id="hermes_durable_app",
+        checkpoint_postgres_storage_id="hermes_durable_checkpoint",
+        postgres_environment_id="glantz_default",
+        writer_id="hermes_orchestrator",
+        writer_authority_epoch=1,
+    )
+    checks = []
+
+    def _reject(config):
+        checks.append(config)
+        raise TargetIdentityError("persisted target identity is missing")
+
+    monkeypatch.setattr(postgres_identity, "verify_configured_target_identities", _reject)
+
+    assert production_attach_kwargs(owner=object(), raw_config=raw) == {}
+    assert len(checks) == 1
+
+
 def test_postgres_production_binding_builds_fresh_authority_provider_without_owner_injection(
     tmp_path, monkeypatch
 ):
@@ -2419,6 +2454,15 @@ def test_postgres_production_binding_builds_fresh_authority_provider_without_own
         writer_id="hermes_orchestrator",
         writer_authority_epoch=1,
     )
+    from agent.durable_jobs import postgres_identity
+
+    identity_checks = []
+    monkeypatch.setattr(
+        postgres_identity,
+        "verify_configured_target_identities",
+        lambda config: identity_checks.append(config),
+    )
+
     class _GatewayOwner:
         pass
 
@@ -2468,6 +2512,7 @@ def test_postgres_production_binding_builds_fresh_authority_provider_without_own
 
     bound = production_attach_kwargs(owner=owner, raw_config=raw)
     assert provider_calls == []
+    assert len(identity_checks) == 1
     assert "writer_authority_check" in bound
     assert connections == []
     assert bound["writer_authority_check"]() == WriterAuthorityBinding(
@@ -2507,6 +2552,15 @@ def test_real_gateway_attaches_postgres_storage_only_without_provider_seams(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_active_config(tmp_path, raw)
     _install_secret_value_traps(monkeypatch)
+
+    from agent.durable_jobs import postgres_identity
+
+    identity_checks = []
+    monkeypatch.setattr(
+        postgres_identity,
+        "verify_configured_target_identities",
+        lambda config: identity_checks.append(config),
+    )
 
     class _Cursor:
         def fetchall(self):
@@ -2577,6 +2631,7 @@ def test_real_gateway_attaches_postgres_storage_only_without_provider_seams(
 
     handle = runner._durable_job_lane
     assert handle is not None
+    assert len(identity_checks) == 2
     assert type(handle.cursor_adapter) is NullCursorProvider
     assert type(handle.slack_adapter) is NullSlackPort
     assert handle.config.dispatch_enabled is False

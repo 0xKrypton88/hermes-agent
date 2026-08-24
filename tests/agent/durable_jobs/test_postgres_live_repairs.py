@@ -84,23 +84,32 @@ def _persist_configured_target_identities(dsn: str, config) -> None:
                 )
 
 
+def _multiprocess_raw_config(dsn: str, app_schema: str, ckpt_schema: str):
+    return {
+        "durable_jobs": {
+            "enabled": True,
+            "dispatch_enabled": False,
+            "backend": "postgresql",
+            "postgres_dsn": dsn,
+            "postgres_schema": app_schema,
+            "checkpoint_postgres_dsn": dsn,
+            "checkpoint_postgres_schema": ckpt_schema,
+            "postgres_storage_id": "durable_app",
+            "checkpoint_postgres_storage_id": "durable_ckpt",
+            "postgres_environment_id": "test",
+            "writer_authority_enforced": True,
+            "writer_id": "hermes_live_test",
+            "writer_mode": "new",
+            "writer_authority_epoch": 1,
+        }
+    }
+
+
 def _multiprocess_config(dsn: str, app_schema: str, ckpt_schema: str):
     from agent.durable_jobs.config import load_durable_jobs_config
 
     return load_durable_jobs_config(
-        {
-            "durable_jobs": {
-                "enabled": True,
-                "backend": "postgresql",
-                "postgres_dsn": dsn,
-                "postgres_schema": app_schema,
-                "checkpoint_postgres_dsn": dsn,
-                "checkpoint_postgres_schema": ckpt_schema,
-                "postgres_storage_id": "durable_app",
-                "checkpoint_postgres_storage_id": "durable_ckpt",
-                "postgres_environment_id": "test",
-            }
-        }
+        _multiprocess_raw_config(dsn, app_schema, ckpt_schema)
     )
 
 
@@ -292,6 +301,8 @@ def _advance_in_process(dsn: str, app_schema: str, ckpt_schema: str, key: str, q
 
 
 def test_live_multiprocess_create_and_advance_converges(live_dsn):
+    import psycopg
+
     from agent.durable_jobs.models import JobPhase
     from agent.durable_jobs.postgres_store import PostgresDurableJobStore
 
@@ -304,9 +315,68 @@ def test_live_multiprocess_create_and_advance_converges(live_dsn):
 
     saver, conn = open_postgres_checkpointer(dsn=dsn, schema=ckpt_schema)
     conn.close()
+
+    from agent.durable_jobs.production_binding import production_attach_kwargs
+
+    raw = _multiprocess_raw_config(dsn, app_schema, ckpt_schema)
+    assert production_attach_kwargs(owner=object(), raw_config=raw) == {}
     _persist_configured_target_identities(
         dsn, _multiprocess_config(dsn, app_schema, ckpt_schema)
     )
+
+    from agent.durable_jobs.writer_authority import (
+        WRITER_AUTHORITY_DDL,
+        WriterAuthorityBinding,
+        activate_writer_authority,
+    )
+    from gateway.durable_job_lane import attach_durable_job_lane, detach_durable_job_lane
+
+    with psycopg.connect(dsn) as authority_conn:
+        authority_conn.execute(f'SET search_path TO "{app_schema}"')
+        authority_conn.execute(WRITER_AUTHORITY_DDL)
+        activate_writer_authority(
+            authority_conn,
+            WriterAuthorityBinding(
+                storage_id="durable_app",
+                environment_id="test",
+                authority_epoch=1,
+                writer_id="hermes_live_test",
+                mode="new",
+            ),
+        )
+
+    bound = production_attach_kwargs(owner=object(), raw_config=raw)
+    assert set(bound) == {"writer_authority_check"}
+
+    class _Owner:
+        pass
+
+    from agent.durable_jobs.lane import DurableLaneService
+
+    probe_lane = DurableLaneService(
+        config=_multiprocess_config(dsn, app_schema, ckpt_schema),
+        writer_authority_check=bound["writer_authority_check"],
+    )
+    probe_lane.close()
+
+    from agent.durable_jobs.cursor_cloud import adapter_from_config as cursor_adapter
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+    from agent.durable_jobs.slack_bridge import adapter_from_config as slack_adapter
+
+    report = preflight_durable_jobs(raw)
+    assert report.constructible, report.reasons
+    config = _multiprocess_config(dsn, app_schema, ckpt_schema)
+    cursor_adapter(config)
+    slack_adapter(config)
+
+    owner = _Owner()
+    handle = attach_durable_job_lane(
+        raw_config=raw,
+        owner=owner,
+        writer_authority_check=bound["writer_authority_check"],
+    )
+    assert handle is not None
+    detach_durable_job_lane(handle)
 
     key = f"idem-adv-{uuid.uuid4().hex[:8]}"
     queue: Queue = Queue()

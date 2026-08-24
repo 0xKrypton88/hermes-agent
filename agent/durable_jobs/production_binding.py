@@ -549,6 +549,20 @@ def production_attach_kwargs(
     if not config.enabled:
         return {}
 
+    if config.resolved_backend == "postgresql":
+        try:
+            from agent.durable_jobs.postgres_identity import (
+                TargetIdentityError,
+                verify_configured_target_identities,
+            )
+
+            # Attachment is a publication boundary: prove both configured
+            # physical PostgreSQL targets before exposing even a storage-only
+            # lane. Opening the stores verifies again at their write boundary.
+            verify_configured_target_identities(config)
+        except (TargetIdentityError, TypeError, ValueError, DurableJobsConfigError):
+            return {}
+
     authority_check = _owner_attr(owner, "durable_job_writer_authority_check")
     if not callable(authority_check):
         connection_provider = _owner_attr(

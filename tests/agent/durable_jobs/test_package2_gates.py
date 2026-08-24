@@ -199,6 +199,37 @@ def test_postgresql_complete_config_does_not_allow_lane_dispatch(tmp_path):
     assert "supersecret" not in repr(cfg)
 
 
+def test_preflight_postgres_storage_only_needs_no_provider_bindings():
+    from agent.durable_jobs.preflight import preflight_durable_jobs
+
+    report = preflight_durable_jobs(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "dispatch_enabled": False,
+                "backend": "postgresql",
+                "postgres_dsn": SECRET_DSN,
+                "postgres_schema": "durable_jobs_app",
+                "checkpoint_postgres_dsn": SECRET_DSN,
+                "checkpoint_postgres_schema": "durable_jobs_ckpt",
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
+            }
+        }
+    )
+
+    assert report.constructible is True
+    assert report.dispatch_allowed is False
+    assert report.runtime_ready is False
+    assert report.reasons == ()
+    assert report.cursor_adapter_mode is None
+    assert report.slack_adapter_mode is None
+    assert report.secret_refs_configured is False
+    assert report.secret_refs_present is False
+    assert report.transport_capability is False
+
+
 def test_preflight_default_off_has_no_external_effects(monkeypatch):
     from agent.durable_jobs.preflight import preflight_durable_jobs
 
