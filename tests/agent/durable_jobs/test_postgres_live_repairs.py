@@ -41,6 +41,69 @@ def _drop_schema(dsn: str, schema: str) -> None:
         conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
+def _persist_configured_target_identities(dsn: str, config) -> None:
+    """Provision test-owned identity proofs before runtime verification.
+
+    Production requires these markers to be provisioned out of band. Live tests
+    create disposable schemas themselves, so their fixture must install the same
+    proofs before child runtimes start; runtime code must never self-attest them.
+    """
+    from dataclasses import replace
+
+    import psycopg
+
+    from agent.durable_jobs.postgres_identity import (
+        configured_target_identities,
+        probe_live_storage_identity,
+    )
+
+    logical = configured_target_identities(config)
+    targets = (
+        (config.postgres_schema, logical[0]),
+        (config.checkpoint_postgres_schema, logical[1]),
+    )
+    for schema, configured in targets:
+        live = probe_live_storage_identity(dsn, schema)
+        expected = replace(
+            configured,
+            system_identifier=live.system_identifier,
+            database_oid=live.database_oid,
+            database_name=live.database,
+            schema_name=live.schema,
+        )
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(
+                f'CREATE TABLE "{schema}".durable_target_identity ('
+                "identity_key TEXT PRIMARY KEY, identity_value TEXT NOT NULL)"
+            )
+            for key, value in expected.as_markers().items():
+                conn.execute(
+                    f'INSERT INTO "{schema}".durable_target_identity '
+                    "(identity_key, identity_value) VALUES (%s, %s)",
+                    (key, value),
+                )
+
+
+def _multiprocess_config(dsn: str, app_schema: str, ckpt_schema: str):
+    from agent.durable_jobs.config import load_durable_jobs_config
+
+    return load_durable_jobs_config(
+        {
+            "durable_jobs": {
+                "enabled": True,
+                "backend": "postgresql",
+                "postgres_dsn": dsn,
+                "postgres_schema": app_schema,
+                "checkpoint_postgres_dsn": dsn,
+                "checkpoint_postgres_schema": ckpt_schema,
+                "postgres_storage_id": "durable_app",
+                "checkpoint_postgres_storage_id": "durable_ckpt",
+                "postgres_environment_id": "test",
+            }
+        }
+    )
+
+
 def _rewrite_host(dsn: str, host: str) -> str:
     from urllib.parse import urlparse, urlunparse
 
@@ -212,24 +275,9 @@ def test_live_wrong_marker_and_wrong_owner_fail_closed(live_dsn):
 
 
 def _advance_in_process(dsn: str, app_schema: str, ckpt_schema: str, key: str, queue: Queue) -> None:
-    from agent.durable_jobs.config import load_durable_jobs_config
     from agent.durable_jobs.service import DurableJobService
 
-    cfg = load_durable_jobs_config(
-        {
-            "durable_jobs": {
-                "enabled": True,
-                "backend": "postgresql",
-                "postgres_dsn": dsn,
-                "postgres_schema": app_schema,
-                "checkpoint_postgres_dsn": dsn,
-                "checkpoint_postgres_schema": ckpt_schema,
-                "postgres_storage_id": "durable_app",
-                "checkpoint_postgres_storage_id": "durable_ckpt",
-                "postgres_environment_id": "test",
-            }
-        }
-    )
+    cfg = _multiprocess_config(dsn, app_schema, ckpt_schema)
     service = DurableJobService(config=cfg)
     job = service.create_and_advance(
         origin_platform="cli",
@@ -256,6 +304,9 @@ def test_live_multiprocess_create_and_advance_converges(live_dsn):
 
     saver, conn = open_postgres_checkpointer(dsn=dsn, schema=ckpt_schema)
     conn.close()
+    _persist_configured_target_identities(
+        dsn, _multiprocess_config(dsn, app_schema, ckpt_schema)
+    )
 
     key = f"idem-adv-{uuid.uuid4().hex[:8]}"
     queue: Queue = Queue()

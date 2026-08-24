@@ -537,12 +537,16 @@ def production_attach_kwargs(
     raw_config: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Lifecycle helper: bind transports and mandatory datastore authority."""
+    """Bind mandatory datastore authority and, only for dispatch, transports."""
     try:
         from agent.durable_jobs.config import load_durable_jobs_config
 
-        config = load_durable_jobs_config(raw_config or {})
+        raw = _load_raw_config(raw_config)
+        config = load_durable_jobs_config(raw)
     except (TypeError, ValueError, DurableJobsConfigError):
+        return {}
+
+    if not config.enabled:
         return {}
 
     authority_check = _owner_attr(owner, "durable_job_writer_authority_check")
@@ -575,7 +579,14 @@ def production_attach_kwargs(
             return {}
     if not callable(getattr(authority_check, "effect_lease", None)):
         return {}
-    bound = bind_production_transports(raw_config, owner=owner, **kwargs)
+
+    # PostgreSQL storage/authority-only operation must not inspect, construct,
+    # or resolve provider capabilities. External dispatch keeps the strict
+    # production transport and identity binding below.
+    if not config.dispatch_enabled and config.resolved_backend == "postgresql":
+        return {"writer_authority_check": authority_check}
+
+    bound = bind_production_transports(raw, owner=owner, **kwargs)
     if not bound:
         return {}
     bound["writer_authority_check"] = authority_check

@@ -10884,14 +10884,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return exact, fallback
 
     def _maybe_attach_durable_job_lane(self) -> None:
-        """Construct Durable Job Lane only when runtime capability is bound.
+        """Attach storage authority, and bind dispatch only when enabled.
 
         Default-off and fail-closed. Reads ``durable_jobs`` from active config.
-        Binds only approved concrete transports when a truthful request port
-        is already installed on this runner. Never constructs an HTTP/SDK
-        client or reads a credential because flags are on. Missing or
-        mismatched transport secret refs refuse attach. Package 1 dispatch
-        remains hard-disabled even when the lane is constructed.
+        PostgreSQL storage-only mode never inspects provider seams or
+        credentials. When dispatch is enabled, only approved concrete
+        transports backed by a truthful request port are accepted; missing or
+        mismatched bindings refuse attach.
         """
         try:
             from agent.durable_jobs.production_binding import production_attach_kwargs

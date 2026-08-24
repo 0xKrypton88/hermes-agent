@@ -111,8 +111,10 @@ class DurableJobLaneHandle:
         self.lane._store = None
 
     def __repr__(self) -> str:
+        mode = "dispatch" if self.config.dispatch_allowed else "storage_only"
         return redact_secret_text(
             "DurableJobLaneHandle("
+            f"mode={mode!r}, "
             f"dispatch_allowed={self.config.dispatch_allowed!r}, "
             f"enabled={self.config.enabled!r}, "
             f"cursor_adapter={type(self.cursor_adapter).__name__}, "
@@ -361,6 +363,14 @@ def durable_job_lane_status() -> dict[str, Any]:
     status = {
         "attached": handle is not None,
         "enabled": bool(handle.config.enabled) if handle is not None else False,
+        "mode": (
+            "dispatch" if handle is not None and handle.config.dispatch_allowed
+            else "storage_only" if handle is not None
+            else None
+        ),
+        "dispatch_enabled": (
+            bool(handle.config.dispatch_enabled) if handle is not None else False
+        ),
         "dispatch_allowed": (
             bool(handle.config.dispatch_allowed) if handle is not None else False
         ),
@@ -419,7 +429,10 @@ def attach_durable_job_lane(
     if report is None or not report.constructible or cfg is None:
         _retire_owner_lane(owner)
         return None
-    if not report.runtime_ready:
+    postgres_storage_only = (
+        cfg.resolved_backend == "postgresql" and not cfg.dispatch_enabled
+    )
+    if not report.runtime_ready and not postgres_storage_only:
         logger.debug(
             "durable job lane refusing attach; runtime capability unbound (%s)",
             report.reasons,

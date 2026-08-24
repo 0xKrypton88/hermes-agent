@@ -706,7 +706,11 @@ def _secret_ref_present(ref: Optional[str]) -> bool:
 def _storage_reasons(cfg: DurableJobsConfig) -> list[str]:
     reasons: list[str] = []
     if cfg.resolved_backend == BACKEND_POSTGRESQL:
-        reasons.append("lane_ledgers_require_sqlite")
+        # PostgreSQL is a truthful storage/authority-only runtime. The current
+        # provider/decision ledger path is still SQLite-only, so external
+        # dispatch must remain closed on this backend.
+        if cfg.dispatch_enabled:
+            reasons.append("lane_ledgers_require_sqlite")
         return reasons
     if not cfg.sqlite_lane_storage_ready():
         reasons.append("sqlite_storage_incomplete")
@@ -899,7 +903,8 @@ def preflight_durable_jobs(
     reasons: list[str] = []
     if not cfg.enabled:
         reasons.append("disabled")
-    reasons.extend(_storage_reasons(cfg))
+    storage_reasons = _storage_reasons(cfg)
+    reasons.extend(storage_reasons)
     if not cfg.adapter_modes_explicit():
         reasons.append("adapter_modes_not_explicit")
     if not cfg.bindings_complete():
@@ -924,11 +929,9 @@ def preflight_durable_jobs(
 
     constructible = (
         cfg.enabled
-        and cfg.sqlite_lane_storage_ready()
+        and not storage_reasons
         and cfg.adapter_modes_explicit()
         and cfg.bindings_complete()
-        and "refuses_hermes_state_db" not in reasons
-        and "sqlite_paths_must_be_distinct" not in reasons
     )
     if constructible and not secret_refs_present:
         reasons.append("secret_refs_missing")

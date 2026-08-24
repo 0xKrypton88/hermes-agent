@@ -600,10 +600,10 @@ def _prepare_startup(tmp_path: Path, monkeypatch, **overrides):
 def test_startup_without_production_ports_does_not_attach_valid_candidate_config(
     tmp_path, monkeypatch
 ):
-    """Config + secrets alone cannot mint runtime_ready — no transports."""
+    """Dispatch-enabled config cannot mint runtime_ready without transports."""
     from gateway.durable_job_lane import get_active_durable_job_lane
 
-    _prepare_startup(tmp_path, monkeypatch)
+    _prepare_startup(tmp_path, monkeypatch, dispatch_enabled=True)
     runner = _make_runner(tmp_path)
     runner._maybe_attach_durable_job_lane()
     assert getattr(runner, "_durable_job_lane", None) is None
@@ -2479,3 +2479,123 @@ def test_postgres_production_binding_builds_fresh_authority_provider_without_own
     )
     assert len(connections) == 1
     assert connections[0].closed is True
+
+
+def test_real_gateway_attaches_postgres_storage_only_without_provider_seams(
+    tmp_path, monkeypatch
+):
+    """Real lifecycle binds fresh datastore authority without dispatch providers."""
+    from agent.durable_jobs.adapters import NullCursorProvider, NullSlackPort
+    from gateway import durable_job_lane
+    from gateway.durable_job_lane import durable_job_lane_status
+
+    raw = _complete(
+        tmp_path,
+        backend="postgresql",
+        sqlite_path=None,
+        checkpoint_sqlite_path=None,
+        postgres_dsn="postgresql://durable:***@127.0.0.1:5432/hermes_durable",
+        postgres_schema="durable_app",
+        checkpoint_postgres_dsn="postgresql://durable:***@127.0.0.1:5432/hermes_durable",
+        checkpoint_postgres_schema="durable_checkpoint",
+        postgres_storage_id="hermes_durable_app",
+        checkpoint_postgres_storage_id="hermes_durable_checkpoint",
+        postgres_environment_id="glantz_default",
+        writer_id="hermes_orchestrator",
+        writer_authority_epoch=1,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_active_config(tmp_path, raw)
+    _install_secret_value_traps(monkeypatch)
+
+    class _Cursor:
+        def fetchall(self):
+            return [
+                (
+                    "hermes_durable_app",
+                    "glantz_default",
+                    1,
+                    "hermes_orchestrator",
+                    "new",
+                )
+            ]
+
+    class _Connection:
+        def __init__(self):
+            self.closed = False
+
+        def execute(self, sql, params=()):
+            if str(sql).startswith("SET search_path"):
+                assert '"durable_app"' in str(sql)
+                return _Cursor()
+            assert "FROM durable_writer_authority" in str(sql)
+            assert params == ("hermes_durable_app", "glantz_default")
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connections = []
+
+    def _connect(dsn):
+        assert dsn == raw["durable_jobs"]["postgres_dsn"]
+        connection = _Connection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=_connect))
+
+    class _StorageOnlyLane:
+        def __init__(self, *, config, writer_authority_check):
+            self.config = config
+            self.writer_authority_check = writer_authority_check
+            self._store = object()
+
+        def close(self):
+            self._store = None
+
+    monkeypatch.setattr(durable_job_lane, "DurableLaneService", _StorageOnlyLane)
+
+    runner = _make_runner(tmp_path)
+    provider_attrs = {
+        "_durable_job_runtime_identity",
+        "_durable_job_cursor_request",
+        "_durable_job_slack_request",
+        "_durable_job_cursor_transport",
+        "_durable_job_slack_transport",
+        "_durable_job_cursor_client",
+        "_durable_job_slack_client",
+        "_durable_job_credential_resolver",
+    }
+    assert provider_attrs.isdisjoint(runner.__dict__)
+
+    from agent.durable_jobs.production_binding import production_attach_kwargs
+
+    bound = production_attach_kwargs(owner=runner)
+    assert set(bound) == {"writer_authority_check"}
+    runner._maybe_attach_durable_job_lane()
+
+    handle = runner._durable_job_lane
+    assert handle is not None
+    assert type(handle.cursor_adapter) is NullCursorProvider
+    assert type(handle.slack_adapter) is NullSlackPort
+    assert handle.config.dispatch_enabled is False
+    assert handle.config.dispatch_allowed is False
+    assert handle.preflight.runtime_ready is False
+    assert provider_attrs.isdisjoint(runner.__dict__)
+    assert len(connections) == 1
+    assert connections[0].closed is True
+    handle.lane.writer_authority_check()
+    assert len(connections) == 2
+    assert all(connection.closed for connection in connections)
+    assert durable_job_lane_status() == {
+        "attached": True,
+        "enabled": True,
+        "mode": "storage_only",
+        "dispatch_enabled": False,
+        "dispatch_allowed": False,
+        "cursor_adapter": "NullCursorProvider",
+        "slack_adapter": "NullSlackPort",
+        "backend": "postgresql",
+    }
+    assert "mode='storage_only'" in repr(handle)
