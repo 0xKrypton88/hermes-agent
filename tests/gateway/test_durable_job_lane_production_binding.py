@@ -2654,3 +2654,17 @@ def test_real_gateway_attaches_postgres_storage_only_without_provider_seams(
         "backend": "postgresql",
     }
     assert "mode='storage_only'" in repr(handle)
+
+    from agent.durable_jobs.postgres_identity import TargetIdentityError
+
+    def _reject_identity(_config):
+        raise TargetIdentityError("persisted target identity changed")
+
+    monkeypatch.setattr(
+        postgres_identity, "verify_configured_target_identities", _reject_identity
+    )
+    runner._maybe_attach_durable_job_lane()
+
+    assert getattr(runner, "_durable_job_lane", None) is None
+    assert durable_job_lane_status()["attached"] is False
+    assert handle.lane._store is None

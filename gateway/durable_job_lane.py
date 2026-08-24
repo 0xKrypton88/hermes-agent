@@ -440,6 +440,11 @@ def attach_durable_job_lane(
         _retire_owner_lane(owner)
         return None
 
+    if writer_authority_check is None:
+        logger.debug("durable job lane refusing attach; writer authority unbound")
+        _retire_owner_lane(owner)
+        return None
+
     key = _owner_key(owner)
     oplock = _owner_oplock(key)
     with oplock:
@@ -448,9 +453,6 @@ def attach_durable_job_lane(
                 raise DurableJobLaneAlreadyAttached(
                     "durable job lane is already attached for this owner"
                 )
-        if writer_authority_check is None:
-            logger.debug("durable job lane refusing attach; writer authority unbound")
-            return None
         # Fail before adapters or schema-owning stores are constructed.
         writer_authority_check()
         try:
