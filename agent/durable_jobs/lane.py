@@ -205,9 +205,9 @@ class DurableLaneService:
 
     @contextmanager
     def _mutation_lease(self) -> Iterator[None]:
-        # The datastore authority lease is acquired after admission/identity reads but
-        # before any mutation. Its atomic authority check serializes handover with
-        # every durable write performed under this process-local mutation lease.
+        # The datastore authority lease must be the outermost write boundary.
+        # Callers hold it through store construction/schema DDL, final identity
+        # validation, durable writes, ACKs, and external effects.
         with self._effect_authority_lease("lane-mutation"):
             self._acquire_mutation_lease()
             body_failed = False
@@ -330,6 +330,7 @@ class DurableLaneService:
         if check is None:
             yield
             return
+        self._assert_fresh_writer_authority()
         lease = getattr(check, "effect_lease", None)
         if not callable(lease):
             raise WriterAuthorityError(
@@ -342,37 +343,45 @@ class DurableLaneService:
 
     def _checkout_for_mutation(self) -> DurableJobStore:
         self._require_enabled()
-        # A successful attach is not durable authority for a later write.
+        # Admission is only a fast preflight. Authority can change immediately
+        # afterward, so the authoritative lease is entered before store DDL.
         self._assert_fresh_writer_authority()
         self._after_admission()
-        store = self._require_sqlite_path()
-        self._after_store_checkout()
-        if self._closed:
-            raise LaneClosedError("durable lane is closed")
-        return store
+        with self._mutation_lease():
+            store = self._require_sqlite_path()
+            self._after_store_checkout()
+            if self._closed:
+                raise LaneClosedError("durable lane is closed")
+            return store
 
+    @contextmanager
     def _acquire_authorized_mutation(
         self,
         job_id: str,
         *,
         workspace_id: Optional[str] = None,
         allow_missing_workspace: bool = False,
-    ) -> DurableJobStore:
-        store = self._checkout_for_mutation()
-        if self._identity_rejected(
-            store,
-            job_id,
-            workspace_id=workspace_id,
-            allow_missing_workspace=allow_missing_workspace,
-        ):
-            raise LaneIdentityRejected(
-                "durable lane rejected unbound repository/workspace identity"
-            )
-        self._after_identity_validation()
-        if self._closed:
-            raise LaneClosedError("durable lane is closed")
-        self._before_mutation_lease()
-        return store
+    ) -> Iterator[DurableJobStore]:
+        self._require_enabled()
+        self._assert_fresh_writer_authority()
+        self._after_admission()
+        with self._mutation_lease():
+            store = self._require_sqlite_path()
+            self._after_store_checkout()
+            if self._identity_rejected(
+                store,
+                job_id,
+                workspace_id=workspace_id,
+                allow_missing_workspace=allow_missing_workspace,
+            ):
+                raise LaneIdentityRejected(
+                    "durable lane rejected unbound repository/workspace identity"
+                )
+            self._after_identity_validation()
+            if self._closed:
+                raise LaneClosedError("durable lane is closed")
+            self._before_mutation_lease()
+            yield store
 
     def resume_session_handoff(
         self,
@@ -634,19 +643,18 @@ class DurableLaneService:
             raise PilotDisabledError(
                 "session handoff effects require enabled=True and shadow=False"
             )
-        store = self._acquire_authorized_mutation(job_id)
-        job = store.get_job(job_id)
-        if job is None:
-            raise KeyError(job_id)
-        if str(handoff.repository).strip() != str(job.repository_identity).strip():
-            raise HandoffIdentityMismatch(
-                "handoff repository does not match the durable job"
-            )
-        if not job.frozen_baseline_sha or handoff.exact_sha != job.frozen_baseline_sha:
-            raise HandoffIdentityMismatch(
-                "handoff requires a matching non-empty durable job baseline SHA"
-            )
-        with self._mutation_lease():
+        with self._acquire_authorized_mutation(job_id) as store:
+            job = store.get_job(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if str(handoff.repository).strip() != str(job.repository_identity).strip():
+                raise HandoffIdentityMismatch(
+                    "handoff repository does not match the durable job"
+                )
+            if not job.frozen_baseline_sha or handoff.exact_sha != job.frozen_baseline_sha:
+                raise HandoffIdentityMismatch(
+                    "handoff requires a matching non-empty durable job baseline SHA"
+                )
             return _SessionHandoffCoordinator(
                 ledger=SessionHandoffLedger(store.sqlite_path),
                 linear=linear,
@@ -686,8 +694,7 @@ class DurableLaneService:
             raise PilotDisabledError(
                 "session handoff reconciliation requires enabled=True and shadow=False"
             )
-        with self._mutation_lease():
-            store = self._acquire_authorized_mutation(job_id)
+        with self._acquire_authorized_mutation(job_id) as store:
             job = store.get_job(job_id)
             if job is None:
                 raise KeyError(job_id)
@@ -728,12 +735,11 @@ class DurableLaneService:
         candidate_id: str,
         candidate_version: str,
     ) -> SlackJobBinding:
-        store = self._acquire_authorized_mutation(
+        with self._acquire_authorized_mutation(
             job_id,
             workspace_id=workspace_id,
             allow_missing_workspace=True,
-        )
-        with self._mutation_lease():
+        ) as store:
             return SlackBindingLedger(sqlite_path=store.sqlite_path).bind(
                 job_id=job_id,
                 workspace_id=workspace_id,
@@ -750,8 +756,7 @@ class DurableLaneService:
         slack_port: SlackMessagePort,
         owner_token: Optional[str] = None,
     ) -> SlackJobBinding:
-        store = self._acquire_authorized_mutation(job_id)
-        with self._mutation_lease():
+        with self._acquire_authorized_mutation(job_id) as store:
             ledger = SlackBindingLedger(sqlite_path=store.sqlite_path)
             return deliver_slack_root(
                 ledger, slack_port, job_id=job_id, owner_token=owner_token
@@ -770,8 +775,7 @@ class DurableLaneService:
         provider: CursorProviderPort,
         owner_token: Optional[str] = None,
     ) -> ProviderEffectClaim:
-        store = self._acquire_authorized_mutation(job_id)
-        with self._mutation_lease():
+        with self._acquire_authorized_mutation(job_id) as store:
             # SlackBindingLedger/ProviderEffectLedger construct DurableJobStore
             # and run schema DDL. That is a durable write and must not race close.
             binding = SlackBindingLedger(sqlite_path=store.sqlite_path).get_binding(
@@ -818,8 +822,7 @@ class DurableLaneService:
         allowed_actors: Sequence[str],
         expires_at: Optional[str] = None,
     ) -> JobAuthzPolicy:
-        store = self._acquire_authorized_mutation(job_id)
-        with self._mutation_lease():
+        with self._acquire_authorized_mutation(job_id) as store:
             return DecisionLedger(sqlite_path=store.sqlite_path).set_policy(
                 job_id=job_id,
                 policy_version=policy_version,
@@ -838,8 +841,7 @@ class DurableLaneService:
         policy_version: str,
         decision_idempotency_key: str,
     ) -> DecisionResult:
-        store = self._acquire_authorized_mutation(job_id)
-        with self._mutation_lease():
+        with self._acquire_authorized_mutation(job_id) as store:
             return DecisionLedger(sqlite_path=store.sqlite_path).record_decision(
                 job_id=job_id,
                 decision_type=decision_type,
@@ -888,27 +890,24 @@ class DurableLaneService:
             return InboundActionResult(ok=False, ack_status="rejected")
         if getattr(self, "_closed", False):
             return InboundActionResult(ok=False, ack_status="pending", retryable=True)
+        self._assert_fresh_writer_authority()
         self._after_admission()
         try:
-            store = self._require_sqlite_path()
-        except LaneClosedError:
-            return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-        self._after_store_checkout()
-        if self._closed:
-            return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-        try:
-            if self._identity_rejected(store, job_id, workspace_id=workspace_id):
-                return InboundActionResult(ok=False, ack_status="rejected")
-        except LaneClosedError:
-            return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-        except sqlite3.OperationalError:
-            return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-        self._after_identity_validation()
-        if self._closed:
-            return InboundActionResult(ok=False, ack_status="pending", retryable=True)
-        self._before_mutation_lease()
-        try:
             with self._mutation_lease():
+                store = self._require_sqlite_path()
+                self._after_store_checkout()
+                if self._closed:
+                    return InboundActionResult(
+                        ok=False, ack_status="pending", retryable=True
+                    )
+                if self._identity_rejected(store, job_id, workspace_id=workspace_id):
+                    return InboundActionResult(ok=False, ack_status="rejected")
+                self._after_identity_validation()
+                if self._closed:
+                    return InboundActionResult(
+                        ok=False, ack_status="pending", retryable=True
+                    )
+                self._before_mutation_lease()
                 result = consume_durable_inbound_action(
                     store.sqlite_path,
                     ack_port,
@@ -924,9 +923,6 @@ class DurableLaneService:
                     candidate_version=candidate_version,
                 )
                 with self._lifecycle:
-                    # Holder close/shutdown already dropped the store.
-                    # A concurrent closer still waiting has _closed True but
-                    # keeps the store until this lease releases (winner ACK).
                     shutdown_completed = self._closed and self._store is None
                 if shutdown_completed:
                     return InboundActionResult(

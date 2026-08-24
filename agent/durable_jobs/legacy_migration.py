@@ -83,13 +83,57 @@ def _redact_free_text(value: str) -> str:
         lambda match: match.group(1) + _redacted_marker(match.group(2)), value
     )
 
+
+_SECRET_JSON_KEYS = frozenset(
+    {
+        "authorization",
+        "accesstoken",
+        "refreshtoken",
+        "privatekey",
+        "clientsecret",
+        "apikey",
+        "password",
+        "secret",
+        "token",
+        "credential",
+        "dsn",
+    }
+)
+
+
+def _is_secret_json_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _SECRET_JSON_KEYS or any(
+        normalized.endswith(suffix)
+        for suffix in (
+            "accesstoken",
+            "refreshtoken",
+            "privatekey",
+            "clientsecret",
+            "apikey",
+            "password",
+        )
+    )
+
+
+def _redact_structured_secret(value: Any) -> str:
+    return _redacted_marker(_json(_normalize(value)))
+
+
 def _sanitize_export_value(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_free_text(value)
     if isinstance(value, list):
         return [_sanitize_export_value(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): _sanitize_export_value(item) for key, item in value.items()}
+        return {
+            str(key): (
+                _redact_structured_secret(item)
+                if _is_secret_json_key(key)
+                else _sanitize_export_value(item)
+            )
+            for key, item in value.items()
+        }
     return value
 
 @dataclass(frozen=True)
@@ -131,6 +175,7 @@ class AdoptionPlan:
     table_counts: Mapping[str, int]
     entries: tuple[AdoptionEntry, ...]
     blockers: tuple[ReconciliationBlocker, ...]
+    source_snapshot: FrozenSQLiteSnapshot
 
     def manifest_json(self) -> str:
         payload = {
@@ -334,6 +379,24 @@ def plan_legacy_adoption(snapshot: FrozenSQLiteSnapshot) -> AdoptionPlan:
         table_counts=table_counts,
         entries=tuple(entries),
         blockers=tuple(blockers),
+        source_snapshot=snapshot,
+    )
+
+
+def _plan_matches_source_snapshot(plan: AdoptionPlan) -> bool:
+    """Re-inventory source evidence instead of trusting plan-owned hashes."""
+
+    try:
+        expected = plan_legacy_adoption(plan.source_snapshot)
+    except (OSError, sqlite3.Error, LegacyMigrationError):
+        return False
+    return (
+        plan.snapshot_sha256 == expected.snapshot_sha256
+        and plan.population_sha256 == expected.population_sha256
+        and plan.table_sha256 == expected.table_sha256
+        and plan.table_counts == expected.table_counts
+        and plan.entries == expected.entries
+        and plan.blockers == expected.blockers
     )
 
 
@@ -371,6 +434,10 @@ def apply_legacy_adoption(
 ) -> ApplyResult:
     """Append immutable rows; exact duplicates are no-ops, divergence is fatal."""
 
+    if not _plan_matches_source_snapshot(plan):
+        raise LegacyMigrationError(
+            "divergent adoption plan does not match independently recomputed source snapshot"
+        )
     unresolved = {
         item.migration_key
         for item in plan.blockers
@@ -428,6 +495,8 @@ def verify_legacy_adoption(
     *,
     dispositions: Mapping[str, str],
 ) -> VerificationResult:
+    if not _plan_matches_source_snapshot(plan):
+        return VerificationResult(False, len(plan.entries), 0)
     path = Path(ledger_path)
     if not path.is_file():
         return VerificationResult(False, len(plan.entries), 0)

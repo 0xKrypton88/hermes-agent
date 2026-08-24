@@ -10,6 +10,7 @@ No live Slack/Cursor/network. PostgreSQL is not imported.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -479,3 +480,36 @@ def test_sqlite_row_count_helper_sees_seeded_identity_state(tmp_path):
     assert row is not None
     assert row[0] == FOREIGN_WORKSPACE
     assert row[1] == CONFIG_REPO
+
+
+def test_authority_flip_after_admission_prevents_store_creation(tmp_path):
+    """The authority lease must precede SQLite DDL, identity checks, and effects."""
+    from agent.durable_jobs.config import load_durable_jobs_config
+    from agent.durable_jobs.lane import DurableLaneService
+    from agent.durable_jobs.writer_authority import WriterAuthorityError
+
+    state = {"allowed": True}
+
+    class _RevocableAuthority:
+        def __call__(self):
+            if not state["allowed"]:
+                raise WriterAuthorityError("revoked")
+            return object()
+
+        @contextmanager
+        def effect_lease(self, _effect_key):
+            self()
+            yield
+            self()
+
+    cfg = load_durable_jobs_config(_complete(tmp_path))
+    lane = DurableLaneService(
+        config=cfg,
+        writer_authority_check=_RevocableAuthority(),
+    )
+    lane._after_admission = lambda: state.__setitem__("allowed", False)
+
+    with pytest.raises(WriterAuthorityError, match="revoked"):
+        lane._checkout_for_mutation()
+
+    assert not Path(cfg.sqlite_path).exists()

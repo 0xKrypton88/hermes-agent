@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -690,3 +691,116 @@ def test_shadow_redacts_credential_shaped_values_in_allowlisted_content(tmp_path
     canonical = plan.entries[0].canonical_row_json
     assert secret not in canonical
     assert hashlib.sha256(secret.encode()).hexdigest() in canonical
+
+
+def test_nested_secret_keys_are_redacted_before_all_exports_and_hashes(tmp_path):
+    migration = _legacy_api()
+    assert migration is not None
+    raw_secret = "Bearer reviewer-secret-123456789"
+    path = tmp_path / "legacy-nested-secrets.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY, origin_json TEXT);"
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, content TEXT);"
+    )
+    conn.execute("INSERT INTO sessions VALUES (?, ?)", ("s1", "{}"))
+    payload = {
+        "safe": "keep-me",
+        "nested": {
+            "Authorization": raw_secret,
+            "children": [
+                {"access_token": "child-token-secret-123456789"},
+                {"private_key": "not-a-real-key-but-still-secret"},
+            ],
+        },
+    }
+    conn.execute(
+        "INSERT INTO messages VALUES (?, ?, ?)",
+        (1, "s1", json.dumps(payload)),
+    )
+    conn.commit()
+    conn.close()
+    snapshot = migration.FrozenSQLiteSnapshot(
+        path=path, file_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+    )
+
+    plan = migration.plan_legacy_adoption(snapshot)
+    all_exports = plan.manifest_json() + plan.reconciliation_json()
+    assert raw_secret not in all_exports
+    assert "child-token-secret-123456789" not in all_exports
+    assert "not-a-real-key-but-still-secret" not in all_exports
+    message = next(entry for entry in plan.entries if entry.source_table == "messages")
+    canonical = json.loads(message.canonical_row_json)
+    assert canonical["content"]["safe"] == "keep-me"
+    assert canonical["content"]["nested"]["Authorization"].startswith(
+        "<redacted:sha256="
+    )
+    assert canonical["content"]["nested"]["children"][0]["access_token"].startswith(
+        "<redacted:sha256="
+    )
+    assert message.row_sha256 == hashlib.sha256(
+        message.canonical_row_json.encode("utf-8")
+    ).hexdigest()
+
+
+def test_verify_recomputes_snapshot_and_rejects_self_consistent_forged_plan(tmp_path):
+    migration = _legacy_api()
+    assert migration is not None
+    path, digest = _snapshot(tmp_path)
+    plan = migration.plan_legacy_adoption(
+        migration.FrozenSQLiteSnapshot(path=path, file_sha256=digest)
+    )
+    entry = plan.entries[0]
+    forged_canonical = json.dumps(
+        {"forged": True}, sort_keys=True, separators=(",", ":")
+    )
+    forged_entry = entry.__class__(
+        migration_key=entry.migration_key,
+        source_table=entry.source_table,
+        source_pk_json=entry.source_pk_json,
+        row_sha256=hashlib.sha256(forged_canonical.encode("utf-8")).hexdigest(),
+        canonical_row_json=forged_canonical,
+        target_kind=entry.target_kind,
+    )
+    forged_plan = replace(plan, entries=(forged_entry, *plan.entries[1:]))
+    ledger = tmp_path / "forged-ledger.sqlite3"
+    dispositions = {
+        item.migration_key: "operator_quarantine" for item in forged_plan.blockers
+    }
+    with pytest.raises(
+        migration.LegacyMigrationError,
+        match="does not match independently recomputed source snapshot",
+    ):
+        migration.apply_legacy_adoption(
+            forged_plan, ledger, dispositions=dispositions
+        )
+    assert not ledger.exists()
+
+    # Reproduce the reviewer's stronger case: both the plan and ledger agree on
+    # the forged payload. Verification must still reject source-independent data.
+    conn = sqlite3.connect(ledger)
+    try:
+        migration._ensure_ledger(conn)
+        for item in forged_plan.entries:
+            disposition = dispositions.get(item.migration_key)
+            conn.execute(
+                "INSERT INTO eng118_adoption_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.migration_key,
+                    item.source_table,
+                    item.source_pk_json,
+                    item.row_sha256,
+                    item.canonical_row_json,
+                    item.target_kind,
+                    disposition,
+                    forged_plan.snapshot_sha256,
+                    forged_plan.population_sha256,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert not migration.verify_legacy_adoption(
+        forged_plan, ledger, dispositions=dispositions
+    ).verified
