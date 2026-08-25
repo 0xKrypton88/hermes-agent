@@ -1,0 +1,11 @@
+{
+  "live_effects": false,
+  "proofs": {
+    "checkpoint_reopen_reclaims_expired_lease_and_completes": true,
+    "defined_deduped_manifest_and_readback": true,
+    "rollback_restores_application_checkpoint_and_authority": true
+  },
+  "schema": "hermes.eng118-offline-acceptance",
+  "unverified_gap": "No current offline API materializes adopted rows into production application tables; acceptance proves the immutable adoption-ledger population only.",
+  "version": 1
+}
