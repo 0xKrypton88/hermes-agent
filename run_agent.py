@@ -602,6 +602,18 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
+    def attach_offline_session_handoff_runtime(self, runtime, *, enabled=False) -> None:
+        """Attach the explicit default-off ENG-122 shadow/test runtime.
+
+        This client boundary performs no config lookup and constructs no store
+        or transport.  Callers must inject a fully gated offline runtime.
+        """
+        from agent.orchestration.session_handoff_runtime import (
+            attach_session_handoff_runtime,
+        )
+
+        attach_session_handoff_runtime(self, runtime, enabled=enabled)
+
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 

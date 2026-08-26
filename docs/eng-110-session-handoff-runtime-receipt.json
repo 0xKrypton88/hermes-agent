@@ -1,0 +1,27 @@
+{
+  "schema": "hermes.eng110-session-handoff-runtime-offline-receipt",
+  "version": 1,
+  "base_sha": "ac9ad178eefcf2a7f2df02043077d2329b796938",
+  "live_effects": false,
+  "activation_approved": false,
+  "gate": {
+    "enabled": true,
+    "mode": "offline_shadow_test",
+    "source": "injected_test_runtime_only"
+  },
+  "boundaries": [
+    "AIAgent.attach_offline_session_handoff_runtime",
+    "agent.conversation_loop.run_conversation",
+    "DurableLaneService.resume_session_handoff",
+    "SessionHandoffLedger",
+    "injected_disposable_sqlite_projections"
+  ],
+  "proof_selectors": [
+    "tests/orchestration/test_session_handoff_runtime_e2e.py",
+    "tests/agent/durable_jobs/test_session_handoff.py",
+    "tests/agent/durable_jobs/test_session_handoff_continuation.py",
+    "tests/agent/durable_jobs/test_offline_acceptance_slice.py"
+  ],
+  "forbidden_effects_observed": [],
+  "remaining_gate": "No production adapter, scheduler, config, service, Gateway, provider, network, Linear, Slack, or live child-session activation is authorized."
+}

@@ -1437,6 +1437,16 @@ def run_conversation(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # Explicit ENG-122 offline shadow/test ingress.  The shipped path has no
+    # runtime attribute, so it neither imports the pilot nor opens a durable
+    # store.  Attachment is request-local and never comes from config/env.
+    if getattr(agent, "_session_handoff_runtime", None) is not None:
+        from agent.orchestration.session_handoff_runtime import (
+            run_attached_session_handoff_ingress,
+        )
+
+        run_attached_session_handoff_ingress(agent, user_message)
+
     # ── Adaptive Orchestrator V1 (universal top-level turn boundary) ──
     # Decision hook runs immediately before build_turn_context. Top-level
     # sessions only; workers/children hit the recursion guard and fall through.
