@@ -362,3 +362,32 @@ Offline evidence is recorded in
 `agent/orchestration/eng122_production_preparation_receipt.json`; both
 `activation` and `live_effects` are literally false, and the residual list is
 part of its validated schema.
+
+## ENG-128 request-bound Linear MCP projection owner (default OFF)
+
+`agent/orchestration/linear_mcp_projection.py` supplies the concrete lifecycle
+owner for the existing `LinearHandoffProjection` seam. It never discovers the
+global MCP registry or configuration. A product ingress must inject one narrow
+MCP caller plus matching production and live-effect authorities for the same
+request/session, opt in with the exact `enabled=True, mode="live"` pair, and
+explicitly start the owner. The shipped default and every incomplete or
+mismatched binding fail before an MCP call.
+
+`AIAgent.attach_linear_mcp_projection()` is the concrete product ingress. It
+accepts one complete request binding, verifies that binding against the active
+agent session, and routes only `mcp__linear__list_comments` and
+`mcp__linear__save_comment` through that agent's `_invoke_tool` path. It does
+not consult the global MCP registry or configuration itself, and ordinary
+agent construction still creates no owner and performs no MCP work.
+
+The owner scopes every
+`list_comments(issueId, limit=250, orderBy=createdAt[, cursor])` and
+`save_comment(issueId, body)` invocation to the injected request identity. It
+decodes the JSON payload from the MCP result envelope's single text block and
+follows `hasNextPage`/`cursor` through a bounded, fail-closed page walk. It never
+reads or edits the issue description. Projection comments use a marked,
+versioned idempotency envelope; a fresh comment listing supplies authoritative
+readback, an exact retry is read-only, and reusing a key for different bytes
+fails closed. Ordinary issue comments remain untouched. Shutdown permanently
+retires that owner. Tests replace `_invoke_tool` with an in-memory fake only;
+this suite performs no live calls.

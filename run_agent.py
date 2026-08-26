@@ -638,6 +638,76 @@ class AIAgent:
         self._production_handoff_composition = composition
         return composition
 
+    def attach_linear_mcp_projection(self, binding):
+        """Attach one request-owned Linear projection through this agent's tools.
+
+        This is an explicit product ingress, not an MCP discovery path.  The
+        injected request identities must name the active agent session and the
+        owner remains default-off unless the binding selects live mode.
+        """
+        from agent.orchestration.linear_mcp_projection import (
+            LinearMCPProjectionBinding,
+            LinearMCPProjectionOwner,
+        )
+        from agent.orchestration.production_handoff_composition import (
+            LiveAdapterUnavailable,
+        )
+
+        if getattr(self, "_linear_mcp_projection_owner", None) is not None:
+            raise LiveAdapterUnavailable("Linear MCP projection is already attached")
+        if not isinstance(binding, LinearMCPProjectionBinding):
+            raise LiveAdapterUnavailable("Linear MCP projection binding is required")
+
+        authority = binding.authority
+        active_session_id = str(getattr(self, "session_id", "") or "")
+        if (
+            not active_session_id
+            or getattr(authority, "session_id", None) != active_session_id
+        ):
+            raise LiveAdapterUnavailable(
+                "Linear MCP request is not bound to the active session"
+            )
+
+        agent = self
+
+        class _RequestCaller:
+            _TOOLS = frozenset({"list_comments", "save_comment"})
+
+            def call_tool(
+                caller_self,
+                *,
+                request_id,
+                session_id,
+                server_name,
+                tool_name,
+                arguments,
+            ):
+                if (
+                    request_id != authority.request_id
+                    or session_id != authority.session_id
+                    or session_id != str(getattr(agent, "session_id", "") or "")
+                    or server_name != "linear"
+                    or tool_name not in caller_self._TOOLS
+                ):
+                    raise LiveAdapterUnavailable(
+                        "Linear MCP call escaped its request binding"
+                    )
+                return agent._invoke_tool(
+                    f"mcp__linear__{tool_name}",
+                    dict(arguments),
+                    request_id,
+                )
+
+        owner = LinearMCPProjectionOwner(
+            binding.config,
+            authority=authority,
+            live_authority=binding.live_authority,
+            caller=_RequestCaller(),
+        )
+        owner.start()
+        self._linear_mcp_projection_owner = owner
+        return owner
+
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 
