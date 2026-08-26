@@ -119,7 +119,11 @@ def _connect_target(path: Path, root: Path) -> sqlite3.Connection:
     root = Path(root).resolve()
     if not _resolved_within(target, root):
         raise OfflineAcceptanceError("application target is outside disposable root")
-    connection = sqlite3.connect(target)
+    if not target.is_file():
+        raise OfflineAcceptanceError(
+            "application target is not an initialized disposable file"
+        )
+    connection = sqlite3.connect(f"{target.as_uri()}?mode=rw", uri=True)
     connection.row_factory = sqlite3.Row
     try:
         marker = connection.execute(
@@ -162,10 +166,12 @@ def materialize_disposable_adoption(
 ) -> MaterializationResult:
     """Materialize supported ledger rows atomically into disposable tables."""
     _verified_ledger(plan, ledger_path, dispositions, expected_source_snapshot)
-    supported = tuple(entry for entry in plan.entries if entry.source_table in _TARGET_TABLES)
-    batch = _sha(json.dumps(
-        [entry.migration_key for entry in supported], separators=(",", ":")
-    ))
+    supported = tuple(
+        entry for entry in plan.entries if entry.source_table in _TARGET_TABLES
+    )
+    batch = _sha(
+        json.dumps([entry.migration_key for entry in supported], separators=(",", ":"))
+    )
     connection = _connect_target(application_path, disposable_root)
     inserted = duplicates = 0
     try:
@@ -174,10 +180,14 @@ def materialize_disposable_adoption(
             table = _TARGET_TABLES[entry.source_table]
             existing = connection.execute(
                 f"SELECT source_pk_json,row_sha256,canonical_row_json,batch_sha256 FROM {table} "
-                "WHERE migration_key=?", (entry.migration_key,),
+                "WHERE migration_key=?",
+                (entry.migration_key,),
             ).fetchone()
             expected = (
-                entry.source_pk_json, entry.row_sha256, entry.canonical_row_json, batch
+                entry.source_pk_json,
+                entry.row_sha256,
+                entry.canonical_row_json,
+                batch,
             )
             if existing is None:
                 connection.execute(
@@ -190,10 +200,13 @@ def materialize_disposable_adoption(
                 duplicates += 1
                 was_inserted = 0
             else:
-                raise OfflineAcceptanceError("materialized identity diverges from ledger")
+                raise OfflineAcceptanceError(
+                    "materialized identity diverges from ledger"
+                )
             prior = connection.execute(
                 "SELECT target_table FROM eng118_materialization_journal "
-                "WHERE batch_sha256=? AND migration_key=?", (batch, entry.migration_key),
+                "WHERE batch_sha256=? AND migration_key=?",
+                (batch, entry.migration_key),
             ).fetchone()
             if prior is not None and prior[0] != table:
                 raise OfflineAcceptanceError("materialization journal diverges")
@@ -214,10 +227,12 @@ def materialize_disposable_adoption(
 def readback_disposable_adoption(
     plan: AdoptionPlan, application_path: Path, *, disposable_root: Path
 ) -> MaterializationReadback:
-    supported = tuple(entry for entry in plan.entries if entry.source_table in _TARGET_TABLES)
-    batch = _sha(json.dumps(
-        [entry.migration_key for entry in supported], separators=(",", ":")
-    ))
+    supported = tuple(
+        entry for entry in plan.entries if entry.source_table in _TARGET_TABLES
+    )
+    batch = _sha(
+        json.dumps([entry.migration_key for entry in supported], separators=(",", ":"))
+    )
     connection = _connect_target(application_path, disposable_root)
     actual = 0
     verified = True
@@ -226,15 +241,23 @@ def readback_disposable_adoption(
             table = _TARGET_TABLES[entry.source_table]
             row = connection.execute(
                 f"SELECT source_pk_json,row_sha256,canonical_row_json,batch_sha256 FROM {table} "
-                "WHERE migration_key=?", (entry.migration_key,),
+                "WHERE migration_key=?",
+                (entry.migration_key,),
             ).fetchone()
-            expected = (entry.source_pk_json, entry.row_sha256, entry.canonical_row_json, batch)
+            expected = (
+                entry.source_pk_json,
+                entry.row_sha256,
+                entry.canonical_row_json,
+                batch,
+            )
             if row is not None:
                 actual += 1
             verified = verified and row is not None and tuple(row) == expected
     finally:
         connection.close()
-    return MaterializationReadback(verified and actual == len(supported), batch, len(supported), actual)
+    return MaterializationReadback(
+        verified and actual == len(supported), batch, len(supported), actual
+    )
 
 
 def rollback_disposable_adoption(
@@ -247,7 +270,8 @@ def rollback_disposable_adoption(
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
             "SELECT migration_key,target_table,inserted FROM eng118_materialization_journal "
-            "WHERE batch_sha256=? ORDER BY migration_key", (batch_sha256,),
+            "WHERE batch_sha256=? ORDER BY migration_key",
+            (batch_sha256,),
         ).fetchall()
         if not rows:
             raise OfflineAcceptanceError("unknown materialization batch")

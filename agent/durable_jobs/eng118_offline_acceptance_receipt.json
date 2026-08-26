@@ -2,11 +2,15 @@
   "live_effects": false,
   "proofs": {
     "authoritative_adapter_receipt_bytes_bound": true,
+    "adapter_crash_window_restart_skips_factory_after_durable_commit": true,
+    "adapter_concurrent_callers_return_one_durable_winner": true,
+    "adapter_requires_attested_disposable_root": true,
     "checkpoint_reopen_reclaims_expired_lease_and_completes": true,
     "defined_deduped_manifest_and_readback": true,
     "disposable_application_materialization_dedupes_and_reads_back": true,
     "external_ports_fail_if_called": true,
-    "harness_is_default_off": true,
+    "harness_literal_boolean_enablement_is_default_off_and_no_touch": true,
+    "missing_application_target_is_not_created_on_refusal": true,
     "materialization_rollback_removes_only_batch_insertions": true,
     "rollback_restores_application_checkpoint_and_authority": true
   },
@@ -14,9 +18,9 @@
   "remaining_runtime_client_gates": [
     "No production or live datastore materialization is authorized or wired.",
     "No runtime scheduler, gateway, provider, network, or Slack adapter is wired.",
-    "Client delivery receipt-byte authority and idempotency contracts require separate live acceptance.",
+    "Live client delivery receipt-byte authority and idempotency contracts require separate acceptance.",
     "ENG-122 continuation enablement remains an explicit offline-harness-only flag."
   ],
   "unverified_gap": "Production/runtime and client integrations remain deliberately unwired; this receipt covers disposable offline application tables and a fail-if-called scheduler/adapter harness only.",
-  "version": 2
+  "version": 3
 }

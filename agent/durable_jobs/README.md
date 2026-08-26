@@ -304,12 +304,18 @@ rollback. It cannot open an unmarked existing database or a path outside the
 attested root. It is not imported or called by a runtime path.
 
 `offline_continuation_harness.py` drives the existing continuation store only
-when constructed with `enabled=True`; the default raises before claiming work
-or touching an adapter. Its disposable adapter owns deterministic idempotency
-keys and authoritative receipt bytes. The scheduler hashes bytes read directly
-from that adapter, never a caller-supplied digest. `FailIfCalledPorts` is the
-acceptance sentinel for gateway, provider, network, Slack, or other external
-effects.
+when constructed with the literal boolean `enabled=True`; false or ambiguous
+values fail before claiming work or touching an adapter path. Receipt storage is
+created lazily on the first enabled delivery, only below a separately created,
+root-bound disposable attestation. Existing unmarked SQLite files are refused.
+The adapter checks its stable idempotency key inside a SQLite write transaction
+before invoking the factory, then inserts, rereads, commits, and returns the
+durable authoritative bytes. This proves same-process concurrent callers and a
+restart after the durable adapter commit do not repeat the offline factory; it
+does not claim exactly-once behavior for a crash inside the factory or for a
+future live/network adapter. The scheduler hashes bytes read directly from that
+adapter, never a caller-supplied digest. `FailIfCalledPorts` is the acceptance
+sentinel for gateway, provider, network, Slack, or other external effects.
 
 ENG-110 mapping evidence for this slice:
 
@@ -317,7 +323,7 @@ ENG-110 mapping evidence for this slice:
 | --- | --- |
 | Durable checkpoint | `ContinuationStore` persists stage and next action |
 | Restart/reclaim | Expired lease is reclaimed with a fenced generation |
-| Effect dedupe | Stable adapter idempotency key and immutable digest |
+| Effect dedupe | Stable key; transactional durable lookup before the offline factory |
 | Receipt authority | Scheduler hashes adapter-returned/readback bytes |
 | Manual resume | Digest mismatch remains blocked until verified resume |
 | External isolation | Every external sentinel port raises if called |
@@ -325,4 +331,5 @@ ENG-110 mapping evidence for this slice:
 
 The receipt is `eng118_offline_acceptance_receipt.json`. Production/live
 materialization, runtime scheduler wiring, gateway/provider/network/Slack
-effects, and client receipt-authority acceptance remain separate gates.
+effects, cross-process initialization, and live-client receipt authority remain
+separate gates.
