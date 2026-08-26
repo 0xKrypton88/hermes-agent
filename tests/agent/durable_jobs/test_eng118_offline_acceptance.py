@@ -178,12 +178,11 @@ def test_disposable_offline_acceptance_and_rollback(tmp_path):
         WriterAuthorityBinding("disposable", "offline", 1, "legacy-writer", "legacy"),
     )
 
-    assert receipt["proofs"] == {
-        "checkpoint_reopen_reclaims_expired_lease_and_completes": True,
-        "defined_deduped_manifest_and_readback": True,
-        "rollback_restores_application_checkpoint_and_authority": True,
-    }
+    assert receipt["proofs"]["checkpoint_reopen_reclaims_expired_lease_and_completes"]
+    assert receipt["proofs"]["defined_deduped_manifest_and_readback"]
+    assert receipt["proofs"]["rollback_restores_application_checkpoint_and_authority"]
     assert receipt["unverified_gap"] == (
-        "No current offline API materializes adopted rows into production application "
-        "tables; acceptance proves the immutable adoption-ledger population only."
+        "Production/runtime and client integrations remain deliberately unwired; this "
+        "receipt covers disposable offline application tables and a fail-if-called "
+        "scheduler/adapter harness only."
     )

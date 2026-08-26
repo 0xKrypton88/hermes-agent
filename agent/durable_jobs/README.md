@@ -290,3 +290,39 @@ path only):
 ```bash
 scripts/run_tests.sh tests/agent/durable_jobs/
 ```
+
+## ENG-118 / ENG-122 disposable offline acceptance
+
+`offline_acceptance.py` is the only API in this package that materializes the
+ENG-118 immutable adoption ledger. It requires a newly initialized SQLite file
+beneath a caller-declared disposable root, verifies the root-bound
+`live_effects = 0` marker and the immutable ledger before every write, and maps
+only legacy `sessions` and `messages` into dedicated disposable application tables. A
+repeat application is an exact no-op, divergent identity fails closed, readback
+compares canonical bytes and hashes, and the batch journal supports scoped
+rollback. It cannot open an unmarked existing database or a path outside the
+attested root. It is not imported or called by a runtime path.
+
+`offline_continuation_harness.py` drives the existing continuation store only
+when constructed with `enabled=True`; the default raises before claiming work
+or touching an adapter. Its disposable adapter owns deterministic idempotency
+keys and authoritative receipt bytes. The scheduler hashes bytes read directly
+from that adapter, never a caller-supplied digest. `FailIfCalledPorts` is the
+acceptance sentinel for gateway, provider, network, Slack, or other external
+effects.
+
+ENG-110 mapping evidence for this slice:
+
+| Criterion | Offline evidence |
+| --- | --- |
+| Durable checkpoint | `ContinuationStore` persists stage and next action |
+| Restart/reclaim | Expired lease is reclaimed with a fenced generation |
+| Effect dedupe | Stable adapter idempotency key and immutable digest |
+| Receipt authority | Scheduler hashes adapter-returned/readback bytes |
+| Manual resume | Digest mismatch remains blocked until verified resume |
+| External isolation | Every external sentinel port raises if called |
+| Default off | Missing explicit enablement fails before claim/adapter access |
+
+The receipt is `eng118_offline_acceptance_receipt.json`. Production/live
+materialization, runtime scheduler wiring, gateway/provider/network/Slack
+effects, and client receipt-authority acceptance remain separate gates.
