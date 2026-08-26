@@ -1437,16 +1437,6 @@ def run_conversation(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
-    # Explicit ENG-122 offline shadow/test ingress.  The shipped path has no
-    # runtime attribute, so it neither imports the pilot nor opens a durable
-    # store.  Attachment is request-local and never comes from config/env.
-    if getattr(agent, "_session_handoff_runtime", None) is not None:
-        from agent.orchestration.session_handoff_runtime import (
-            run_attached_session_handoff_ingress,
-        )
-
-        run_attached_session_handoff_ingress(agent, user_message)
-
     # ── Adaptive Orchestrator V1 (universal top-level turn boundary) ──
     # Decision hook runs immediately before build_turn_context. Top-level
     # sessions only; workers/children hit the recursion guard and fall through.
@@ -1512,6 +1502,28 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # Explicit offline handoff effects are allowed only after the orchestrator
+    # decision boundary and the parent prologue have established this turn's
+    # durable identity. Terminal decisions consume the one-shot attachment
+    # without touching the ledger or any projection/session port.
+    if vars(agent).get("_session_handoff_runtime") is not None:
+        from agent.orchestration.session_handoff_runtime import (
+            discard_attached_session_handoff_ingress,
+            run_attached_session_handoff_ingress,
+        )
+
+        _handoff_denied = bool(
+            _orch_turn is not None
+            and not _orch_turn.legacy_continue
+            and not getattr(_orch_turn, "pending_worker", False)
+        )
+        if _handoff_denied:
+            discard_attached_session_handoff_ingress(agent, turn_id=turn_id)
+        else:
+            run_attached_session_handoff_ingress(
+                agent, user_message, turn_id=turn_id
+            )
 
     # Active orchestration after prologue: parent turn id / user-message
     # persistence / hooks are already in place. Pending workers launch here;

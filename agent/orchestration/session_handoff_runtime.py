@@ -98,16 +98,61 @@ def attach_session_handoff_runtime(
         raise SessionHandoffRuntimeDisabled("attachment requires enabled=True")
     if not isinstance(runtime, SessionHandoffRuntime):
         raise TypeError("runtime must be SessionHandoffRuntime")
+    active_session_id = str(getattr(agent, "session_id", "") or "")
+    if not active_session_id:
+        raise ValueError("session handoff attachment requires an active session_id")
+    if runtime.request.parent_session_id != active_session_id:
+        raise ValueError(
+            "request.parent_session_id does not match the active agent session_id"
+        )
     agent._session_handoff_runtime = runtime
+    agent._session_handoff_authority = {
+        "parent_session_id": active_session_id,
+        "consumed": False,
+        "turn_id": None,
+    }
 
 
-def run_attached_session_handoff_ingress(agent: Any, user_message: Any) -> Any:
-    """Run the explicitly attached controller and retain its local observation."""
+def discard_attached_session_handoff_ingress(agent: Any, *, turn_id: str) -> None:
+    """Consume a denied turn's one-shot authority without running any effect."""
+    authority = getattr(agent, "_session_handoff_authority", None)
+    if isinstance(authority, dict) and not authority.get("consumed"):
+        authority["consumed"] = True
+        authority["turn_id"] = str(turn_id or "")
+
+
+def run_attached_session_handoff_ingress(
+    agent: Any, user_message: Any, *, turn_id: str
+) -> Any:
+    """Run once for the authorized current turn and retain its observation."""
     runtime = getattr(agent, "_session_handoff_runtime", None)
     if runtime is None:
         return None
     if not isinstance(runtime, SessionHandoffRuntime):
         raise TypeError("attached session handoff runtime has an invalid type")
+    authority = getattr(agent, "_session_handoff_authority", None)
+    if not isinstance(authority, dict):
+        raise RuntimeError("session handoff current-turn authority is missing")
+    if authority.get("consumed"):
+        raise RuntimeError(
+            "session handoff current-turn authority was already consumed"
+        )
+    active_session_id = str(getattr(agent, "session_id", "") or "")
+    if (
+        not active_session_id
+        or runtime.request.parent_session_id != active_session_id
+        or authority.get("parent_session_id") != active_session_id
+    ):
+        raise ValueError(
+            "request.parent_session_id does not match the active agent session_id"
+        )
+    current_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    if not turn_id or current_turn_id != str(turn_id):
+        raise RuntimeError("session handoff authority is not for the current turn")
+    # Consume before entering the lane. A retry is a new explicitly attached
+    # request, never an accidental replay on a later ordinary message.
+    authority["consumed"] = True
+    authority["turn_id"] = current_turn_id
     result = runtime.ingress(agent, user_message)
     agent._last_session_handoff_result = result
     return result

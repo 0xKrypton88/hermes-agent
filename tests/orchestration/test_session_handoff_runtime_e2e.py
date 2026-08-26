@@ -31,6 +31,9 @@ class DisposableDurablePorts:
                 CREATE TABLE IF NOT EXISTS effects(
                   effect_key TEXT PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS adapter_receipts(
+                  effect_key TEXT PRIMARY KEY, receipt BLOB NOT NULL
+                );
                 """
             )
 
@@ -62,7 +65,20 @@ class DisposableDurablePorts:
         return str(row[0])
 
     def post_handoff_receipt(self, *, handoff_id, resume_pointer, idempotency_key):
-        return self._put(idempotency_key, "slack-shadow", f"slack:{handoff_id}")
+        receipt = f"slack:{handoff_id}".encode("utf-8")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO adapter_receipts VALUES(?,?) ON CONFLICT(effect_key) DO NOTHING",
+                (idempotency_key, receipt),
+            )
+        return self._put(idempotency_key, "slack-shadow", receipt.decode("utf-8"))
+
+    def authoritative_receipt_bytes(self, effect_key):
+        with sqlite3.connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT receipt FROM adapter_receipts WHERE effect_key=?", (effect_key,)
+            ).fetchone()
+        return bytes(row[0])
 
     def find_or_create_child(self, *, parent_session_id, handoff_id, idempotency_key):
         child = self._put(idempotency_key, "child-shadow", "offline-child-1")
@@ -218,7 +234,17 @@ def test_eng110_runtime_receipt_is_explicitly_offline():
         )
     )
     assert receipt["schema"] == "hermes.eng110-session-handoff-runtime-offline-receipt"
-    assert receipt["base_sha"] == "ac9ad178eefcf2a7f2df02043077d2329b796938"
+    assert receipt["base_sha"] == "5786fce1a590eb46da083b991ba005adf19df214"
+    assert receipt["authority"] == {
+        "parent_session_bound": True,
+        "current_turn_bound": True,
+        "one_shot": True,
+        "terminal_orchestration_zero_effects": True,
+    }
+    assert bytes.fromhex(receipt["authoritative_offline_adapter_receipt_hex"]) == (
+        b"slack:handoff-runtime-1"
+    )
+    assert receipt["receipt_scope"] == "injected_disposable_adapter_only"
     assert receipt["live_effects"] is False
     assert receipt["activation_approved"] is False
     assert receipt["gate"] == {
@@ -254,14 +280,42 @@ def test_real_client_attachment_runs_ingress_checkpoint_resume_and_first_turn_on
     )
 
     def stop_after_ingress(*args, **kwargs):
-        raise RuntimeError("stop after ingress")
+        first_agent._current_turn_id = "turn-offline-1"
+        return SimpleNamespace(
+            user_message="continue safely",
+            original_user_message="continue safely",
+            messages=[{"role": "user", "content": "continue safely"}],
+            conversation_history=[],
+            active_system_prompt="system",
+            effective_task_id="turn-offline-1",
+            turn_id="turn-offline-1",
+            current_turn_user_idx=0,
+            should_review_memory=False,
+            plugin_user_context=None,
+            ext_prefetch_cache=None,
+        )
+
+    terminal = SimpleNamespace(
+        legacy_continue=False,
+        pending_worker=False,
+        acted=True,
+        response={"status": "BLOCKED", "final_response": "done", "completed": False},
+    )
+    pending = SimpleNamespace(
+        legacy_continue=False,
+        pending_worker=True,
+        acted=False,
+        response=None,
+    )
 
     with patch(
         "agent.orchestration.service.maybe_orchestrate_turn",
-        side_effect=RuntimeError("orchestrator deliberately unavailable"),
+        return_value=pending,
     ), patch(
         "agent.conversation_loop.build_turn_context", side_effect=stop_after_ingress
-    ), pytest.raises(RuntimeError, match="stop after ingress"):
+    ), patch(
+        "agent.orchestration.service.complete_active_orchestration", return_value=terminal
+    ), patch("agent.conversation_loop.finalize_turn", return_value=terminal.response):
         conversation_loop.run_conversation(first_agent, "continue safely")
 
     assert first_agent._last_session_handoff_result.stage == "COMPLETE"
@@ -283,12 +337,22 @@ def test_real_client_attachment_runs_ingress_checkpoint_resume_and_first_turn_on
         _runtime(lane, restarted_ports, request, safe_policy),
         enabled=True,
     )
+
+    def restarted_context(*args, **kwargs):
+        restarted_agent._current_turn_id = "turn-offline-2"
+        value = stop_after_ingress(*args, **kwargs)
+        value.turn_id = "turn-offline-2"
+        value.effective_task_id = "turn-offline-2"
+        return value
+
     with patch(
         "agent.orchestration.service.maybe_orchestrate_turn",
-        side_effect=RuntimeError("orchestrator deliberately unavailable"),
+        return_value=pending,
     ), patch(
-        "agent.conversation_loop.build_turn_context", side_effect=stop_after_ingress
-    ), pytest.raises(RuntimeError, match="stop after ingress"):
+        "agent.conversation_loop.build_turn_context", side_effect=restarted_context
+    ), patch(
+        "agent.orchestration.service.complete_active_orchestration", return_value=terminal
+    ), patch("agent.conversation_loop.finalize_turn", return_value=terminal.response):
         conversation_loop.run_conversation(restarted_agent, "continue safely")
 
     assert restarted_agent._last_session_handoff_result.stage == "COMPLETE"
@@ -356,6 +420,99 @@ def test_runtime_crash_requires_reconciliation_and_manual_resume_without_duplica
     }
 
 
+def test_initialized_agent_offline_e2e_crosses_prologue_model_and_finalization(
+    tmp_path, monkeypatch
+):
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from run_agent import AIAgent
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    agent = AIAgent(
+        base_url="http://127.0.0.1:9/v1",
+        api_key="offline-test-key",
+        provider="openai",
+        model="offline-model",
+        session_id="parent-offline-1",
+        platform="cli",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+        skip_background_review=True,
+    )
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(
+        model="offline-model",
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="offline final",
+                    tool_calls=None,
+                    reasoning=None,
+                    reasoning_content=None,
+                ),
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=7,
+            completion_tokens=2,
+            total_tokens=9,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        ),
+    )
+    agent.client = fake_client
+    agent._disable_streaming = True
+
+    lane, job, ledger_path = _lane(tmp_path)
+    ports = DisposableDurablePorts(tmp_path / "initialized-agent-ports.sqlite3")
+    request = _request(job.job_id)
+    agent.attach_offline_session_handoff_runtime(
+        _runtime(
+            lane,
+            ports,
+            request,
+            lambda *_: SemanticWaypoint(verified=True),
+        ),
+        enabled=True,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("network/socket/live service must not be called")
+
+    with patch(
+        "agent.orchestration.service.load_config",
+        return_value={"orchestration": {"enabled": False, "mode": "off"}},
+    ), patch("socket.create_connection", side_effect=forbidden), patch(
+        "socket.socket.connect", side_effect=forbidden
+    ):
+        result = agent.run_conversation("continue safely offline")
+        with pytest.raises(RuntimeError, match="already consumed"):
+            agent.run_conversation("unrelated stale second turn")
+
+    assert result["final_response"] == "offline final"
+    assert agent._current_turn_id
+    assert agent._last_session_handoff_result.stage == "COMPLETE"
+    assert ports.counts() == {
+        "child-shadow": 1,
+        "first-turn-shadow": 1,
+        "inject-shadow": 1,
+        "slack-shadow": 1,
+    }
+    assert ports.authoritative_receipt_bytes(request.handoff.idempotency_key + ":slack") == (
+        b"slack:handoff-runtime-1"
+    )
+    state = SessionHandoffLedger(ledger_path).get(
+        job.job_id, request.handoff.handoff_id
+    )
+    assert state.stage == "COMPLETE"
+    assert state.checkpoint_stage == "COMPLETE"
+    assert fake_client.chat.completions.create.call_count == 1
+
+
 def test_runtime_unsafe_waypoint_reaches_no_projection_or_child_port(tmp_path):
     from agent.durable_jobs.session_handoff import (
         SemanticWaypoint,
@@ -378,6 +535,98 @@ def test_runtime_unsafe_waypoint_reaches_no_projection_or_child_port(tmp_path):
     assert SessionHandoffLedger(ledger_path).get(
         job.job_id, request.handoff.handoff_id
     ) is None
+
+
+@pytest.mark.parametrize("status", ["REQUIRE_APPROVAL", "ASK_USER", "BLOCKED"])
+def test_terminal_orchestration_has_zero_handoff_effects(tmp_path, status):
+    from agent import conversation_loop
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from agent.orchestration.service import OrchestrationTurnResult
+    from run_agent import AIAgent
+
+    lane, job, ledger_path = _lane(tmp_path)
+    request = _request(job.job_id)
+    agent = _agent()
+    AIAgent.attach_offline_session_handoff_runtime(
+        agent,
+        _runtime(
+            lane,
+            FailIfCalledPorts(),
+            request,
+            lambda *_: SemanticWaypoint(verified=True),
+        ),
+        enabled=True,
+    )
+    terminal = OrchestrationTurnResult(
+        mode="active",
+        acted=True,
+        legacy_continue=False,
+        task_spec=None,
+        decision=None,
+        compiled=None,
+        trace=None,
+        worker_result=None,
+        response={"status": status, "final_response": status, "completed": False},
+        guard_reason_codes=(),
+    )
+    context = SimpleNamespace(
+        user_message="ordinary",
+        original_user_message="ordinary",
+        messages=[{"role": "user", "content": "ordinary"}],
+        conversation_history=[],
+        active_system_prompt="system",
+        effective_task_id="turn-task",
+        turn_id="turn-1",
+        current_turn_user_idx=0,
+        should_review_memory=False,
+        plugin_user_context=None,
+        ext_prefetch_cache=None,
+    )
+
+    with patch("agent.orchestration.service.maybe_orchestrate_turn", return_value=terminal), patch(
+        "agent.conversation_loop.build_turn_context", return_value=context
+    ), patch("agent.conversation_loop.finalize_turn", return_value=terminal.response):
+        result = conversation_loop.run_conversation(agent, "ordinary")
+
+    assert result["status"] == status
+    assert SessionHandoffLedger(ledger_path).get(job.job_id, request.handoff.handoff_id) is None
+    assert not hasattr(agent, "_last_session_handoff_result")
+
+
+def test_parent_mismatch_and_stale_second_turn_fail_before_effects(tmp_path):
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from agent.orchestration.session_handoff_runtime import run_attached_session_handoff_ingress
+    from run_agent import AIAgent
+
+    lane, job, ledger_path = _lane(tmp_path)
+    request = _request(job.job_id)
+    agent = _agent()
+    ports = DisposableDurablePorts(tmp_path / "authority-ports.sqlite3")
+    runtime = _runtime(
+        lane,
+        ports,
+        request,
+        lambda *_: SemanticWaypoint(verified=True),
+    )
+    AIAgent.attach_offline_session_handoff_runtime(agent, runtime, enabled=True)
+
+    agent.session_id = "wrong-parent"
+    agent._current_turn_id = "turn-1"
+    with pytest.raises(ValueError, match="parent_session_id"):
+        run_attached_session_handoff_ingress(agent, "first", turn_id="turn-1")
+    assert SessionHandoffLedger(ledger_path).get(job.job_id, request.handoff.handoff_id) is None
+
+    agent.session_id = request.parent_session_id
+    run_attached_session_handoff_ingress(agent, "first", turn_id="turn-1")
+    agent._current_turn_id = "turn-2"
+    with pytest.raises(RuntimeError, match="current turn|consumed|stale"):
+        run_attached_session_handoff_ingress(agent, "second", turn_id="turn-2")
+    assert ports.counts() == {
+        "child-shadow": 1,
+        "first-turn-shadow": 1,
+        "inject-shadow": 1,
+        "slack-shadow": 1,
+    }
 
 
 @pytest.mark.parametrize("enabled", [False, 1, "true", None])

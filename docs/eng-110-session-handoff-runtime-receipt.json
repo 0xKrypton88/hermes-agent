@@ -1,7 +1,7 @@
 {
   "schema": "hermes.eng110-session-handoff-runtime-offline-receipt",
-  "version": 1,
-  "base_sha": "ac9ad178eefcf2a7f2df02043077d2329b796938",
+  "version": 2,
+  "base_sha": "5786fce1a590eb46da083b991ba005adf19df214",
   "live_effects": false,
   "activation_approved": false,
   "gate": {
@@ -12,10 +12,21 @@
   "boundaries": [
     "AIAgent.attach_offline_session_handoff_runtime",
     "agent.conversation_loop.run_conversation",
+    "agent.turn_context.build_turn_context",
+    "agent.turn_finalizer.finalize_turn",
     "DurableLaneService.resume_session_handoff",
     "SessionHandoffLedger",
-    "injected_disposable_sqlite_projections"
+    "injected_disposable_sqlite_projections",
+    "in_memory_fake_model_client"
   ],
+  "authority": {
+    "parent_session_bound": true,
+    "current_turn_bound": true,
+    "one_shot": true,
+    "terminal_orchestration_zero_effects": true
+  },
+  "authoritative_offline_adapter_receipt_hex": "736c61636b3a68616e646f66662d72756e74696d652d31",
+  "receipt_scope": "injected_disposable_adapter_only",
   "proof_selectors": [
     "tests/orchestration/test_session_handoff_runtime_e2e.py",
     "tests/agent/durable_jobs/test_session_handoff.py",

@@ -18,17 +18,18 @@ legacy/orchestrator control decision.
 
 | ENG-110 criterion | Product boundary and offline proof |
 |---|---|
-| Runtime ingress | `agent.conversation_loop.run_conversation` invokes only an explicitly attached controller before `maybe_orchestrate_turn`; the E2E enters through that real boundary. |
+| Runtime ingress | `agent.conversation_loop.run_conversation` considers only an explicitly attached controller after `maybe_orchestrate_turn` and after `build_turn_context` has established the parent turn ID. The initialized-agent E2E enters through `AIAgent.run_conversation`. |
 | Strict default-off | Runtime construction and client attachment both require literal booleans and the exact offline mode. Disabled/ambiguous values fail before a lane or port call. |
 | Safe semantic waypoint | The request-bound injected policy must return `SemanticWaypoint`; the canonical lane rejects unsafe waypoints and unarmed pressure. |
 | Durable checkpoint/resume | `DurableLaneService.resume_session_handoff` retains the canonical `SessionHandoffLedger` stage/checkpoint transitions in the disposable durable-job database. |
 | Canonical projections | Canonical JSON remains ledger-owned; Linear readback equivalence is checked before advancement. E2E projections are injected SQLite-only ports. |
 | Owner/fence semantics | Existing lane writer authority, effect-owner OS guard, owner token, and generation CAS remain the only advancement route. |
-| Request-bound receipt authority | The ingress object binds job, parent, canonical handoff, pressure inputs, and manual-resume intent; projection receipts are accepted only by the claimed effect stage. The continuation harness separately hashes bytes read back from its authoritative disposable adapter. |
+| Request/turn-bound authority | Attachment verifies `request.parent_session_id` against the actual agent session and creates authority for one successful current turn only. Ingress rechecks both identities and the prologue's current turn ID before the lane or any port. Terminal authorization outcomes consume that authority with zero handoff effects. |
+| Adapter receipt evidence | The initialized-agent E2E reads the exact Slack-shadow receipt bytes back from its injected disposable adapter store (`b"slack:handoff-runtime-1"`). This proves the offline adapter boundary only; it does not claim production transport receipt authority. |
 | Restart/reclaim and dedupe | A fresh agent/controller and reopened projection store replay a completed handoff without a second child, injection, receipt, or first turn. Continuation lease reclaim remains covered by the durable continuation suite. |
 | Manual resume | A crash after durable child creation leaves `FAILED_CLOSED` plus an in-flight claim. Explicit dead-owner reconciliation and a request with literal `manual_resume=True` continue from the checkpoint without duplicating the child/effects. |
-| First-turn path | E2E crosses real agent client attachment, conversation ingress, lane policy, canonical ledger, injected child creation/handoff injection, and `start_first_turn`. |
-| No live effects | All projection/session boundaries are disposable SQLite ports; fail-if-called external ports remain injected and untouched. Tests stop before model/provider execution. |
+| First-turn path | E2E crosses an initialized `AIAgent`, `run_conversation`, the real `build_turn_context` prologue, orchestration decision boundary, canonical ledger, injected child creation/handoff injection, `start_first_turn`, a fake model client, and real turn finalization. |
+| No live effects | All projection/session boundaries are disposable SQLite ports. The initialized SDK client is replaced with an in-memory fake before the turn, socket connects fail if called, orchestration config is injected, and no Gateway/provider/Linear/Slack/service operation is called. Configuration reads are confined to the temporary `HERMES_HOME`. |
 
 Machine-readable evidence is recorded in
 `docs/eng-110-session-handoff-runtime-receipt.json`. This receipt is an offline
