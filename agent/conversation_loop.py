@@ -23,6 +23,7 @@ import random
 import re
 import ssl
 import time
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -96,6 +97,39 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+class _HandoffAuthorizationState(Enum):
+    """Effect authorization established by the orchestration boundary."""
+
+    PENDING = "pending"
+    AUTHORIZED = "authorized"
+    DENIED = "denied"
+
+
+def _handoff_authorization_for_orchestration(plan: Any) -> _HandoffAuthorizationState:
+    """Map an orchestration result to explicit attached-handoff authority."""
+    if plan is None:
+        return _HandoffAuthorizationState.DENIED
+    if bool(getattr(plan, "legacy_continue", False)):
+        return _HandoffAuthorizationState.AUTHORIZED
+    if bool(getattr(plan, "pending_worker", False)):
+        return _HandoffAuthorizationState.PENDING
+    response = getattr(plan, "response", None)
+    if not isinstance(response, dict):
+        return _HandoffAuthorizationState.DENIED
+    status = ""
+    status = str(
+        response.get("status")
+        or (response.get("orchestration") or {}).get("status")
+        or ""
+    ).upper()
+    if (
+        response.get("completed") is False
+        or status in {"REQUIRE_APPROVAL", "ASK_USER", "BLOCKED", "BLOCK"}
+    ):
+        return _HandoffAuthorizationState.DENIED
+    return _HandoffAuthorizationState.AUTHORIZED
 
 
 def _restore_user_after_reference_handoff(
@@ -1444,6 +1478,7 @@ def run_conversation(
     # until after the parent turn prologue so persistence/turn IDs/hooks remain
     # intact; parent cached prompt/tools/model stay immutable.
     _orch_turn = None
+    _handoff_authorization = _HandoffAuthorizationState.PENDING
     try:
         from agent.orchestration.service import maybe_orchestrate_turn
 
@@ -1454,11 +1489,15 @@ def run_conversation(
             task_id=task_id,
             defer_worker=True,
         )
+        _handoff_authorization = _handoff_authorization_for_orchestration(
+            _orch_turn
+        )
         # Never short-circuit before prologue. Terminal REQUIRE_APPROVAL /
         # ASK_USER / BLOCKED decisions and deferred active workers both need
         # parent turn persistence / turn IDs / hooks first. Legacy ``off`` /
         # ``shadow`` keep legacy_continue=True and fall through after prologue.
     except Exception:
+        _handoff_authorization = _HandoffAuthorizationState.DENIED
         logger.debug("adaptive orchestrator boundary failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
@@ -1503,59 +1542,67 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
-    # Explicit offline handoff effects are allowed only after the orchestrator
-    # decision boundary and the parent prologue have established this turn's
-    # durable identity. Terminal decisions consume the one-shot attachment
-    # without touching the ledger or any projection/session port.
-    if vars(agent).get("_session_handoff_runtime") is not None:
-        from agent.orchestration.session_handoff_runtime import (
-            discard_attached_session_handoff_ingress,
-            run_attached_session_handoff_ingress,
-        )
-
-        _handoff_denied = bool(
-            _orch_turn is not None
-            and not _orch_turn.legacy_continue
-            and not getattr(_orch_turn, "pending_worker", False)
-        )
-        if _handoff_denied:
-            discard_attached_session_handoff_ingress(agent, turn_id=turn_id)
-        else:
-            run_attached_session_handoff_ingress(
-                agent, user_message, turn_id=turn_id
-            )
-
-    # Active orchestration after prologue: parent turn id / user-message
-    # persistence / hooks are already in place. Pending workers launch here;
-    # terminal REQUIRE_APPROVAL / ASK_USER / BLOCKED responses finalize without
-    # launching a worker or falling through to the legacy model loop. Any
-    # completion exception fails closed with a safe blocked response.
-    if _orch_turn is not None and not _orch_turn.legacy_continue:
+    # A deferred active decision is not handoff authority. Complete it after
+    # the prologue but before any attached handoff effect, then authorize only
+    # a non-terminal result. Completion failures are converted to the existing
+    # fail-closed result and remain denied.
+    if _handoff_authorization is _HandoffAuthorizationState.PENDING:
         try:
             from agent.orchestration.service import (
                 complete_active_orchestration,
                 _fail_closed_active_error,
             )
 
-            if getattr(_orch_turn, "pending_worker", False):
-                try:
-                    _orch_turn = complete_active_orchestration(
-                        _orch_turn,
-                        agent,
-                        task_id=effective_task_id,
-                        messages=messages,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "active orchestration completion failed closed",
-                        exc_info=True,
-                    )
-                    _orch_turn = _fail_closed_active_error(
-                        plan=_orch_turn,
-                        agent=agent,
-                        exc=exc,
-                        task_id=effective_task_id,
-                    )
+            try:
+                _orch_turn = complete_active_orchestration(
+                    _orch_turn,
+                    agent,
+                    task_id=effective_task_id,
+                    messages=messages,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "active orchestration completion failed closed",
+                    exc_info=True,
+                )
+                _orch_turn = _fail_closed_active_error(
+                    plan=_orch_turn,
+                    agent=agent,
+                    exc=exc,
+                    task_id=effective_task_id,
+                )
+            _handoff_authorization = _handoff_authorization_for_orchestration(
+                _orch_turn
+            )
+        except Exception:
+            _handoff_authorization = _HandoffAuthorizationState.DENIED
+            logger.debug(
+                "active orchestration authorization failed closed",
+                exc_info=True,
+            )
+
+    # Explicit offline handoff effects are allowed only after orchestration and
+    # the parent prologue have established non-terminal authority for this
+    # turn. Denial consumes the one-shot attachment without touching the ledger
+    # or any projection/session port.
+    if vars(agent).get("_session_handoff_runtime") is not None:
+        from agent.orchestration.session_handoff_runtime import (
+            discard_attached_session_handoff_ingress,
+            run_attached_session_handoff_ingress,
+        )
+
+        if _handoff_authorization is not _HandoffAuthorizationState.AUTHORIZED:
+            discard_attached_session_handoff_ingress(agent, turn_id=turn_id)
+        else:
+            run_attached_session_handoff_ingress(
+                agent, user_message, turn_id=turn_id
+            )
+
+    # Finalize active orchestration after its authorization and any authorized
+    # attached handoff have been resolved.
+    if _orch_turn is not None and not _orch_turn.legacy_continue:
+        try:
+            from agent.orchestration.service import _fail_closed_active_error
 
             if (
                 _orch_turn is not None

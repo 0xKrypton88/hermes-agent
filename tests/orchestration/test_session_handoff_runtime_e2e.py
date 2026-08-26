@@ -207,6 +207,22 @@ def _agent():
     return agent
 
 
+def _turn_context():
+    return SimpleNamespace(
+        user_message="ordinary",
+        original_user_message="ordinary",
+        messages=[{"role": "user", "content": "ordinary"}],
+        conversation_history=[],
+        active_system_prompt="system",
+        effective_task_id="turn-task",
+        turn_id="turn-1",
+        current_turn_user_idx=0,
+        should_review_memory=False,
+        plugin_user_context=None,
+        ext_prefetch_cache=None,
+    )
+
+
 def test_default_runtime_ingress_is_no_touch(tmp_path):
     from agent import conversation_loop
 
@@ -295,11 +311,11 @@ def test_real_client_attachment_runs_ingress_checkpoint_resume_and_first_turn_on
             ext_prefetch_cache=None,
         )
 
-    terminal = SimpleNamespace(
+    completed = SimpleNamespace(
         legacy_continue=False,
         pending_worker=False,
         acted=True,
-        response={"status": "BLOCKED", "final_response": "done", "completed": False},
+        response={"status": "ok", "final_response": "done", "completed": True},
     )
     pending = SimpleNamespace(
         legacy_continue=False,
@@ -314,8 +330,8 @@ def test_real_client_attachment_runs_ingress_checkpoint_resume_and_first_turn_on
     ), patch(
         "agent.conversation_loop.build_turn_context", side_effect=stop_after_ingress
     ), patch(
-        "agent.orchestration.service.complete_active_orchestration", return_value=terminal
-    ), patch("agent.conversation_loop.finalize_turn", return_value=terminal.response):
+        "agent.orchestration.service.complete_active_orchestration", return_value=completed
+    ), patch("agent.conversation_loop.finalize_turn", return_value=completed.response):
         conversation_loop.run_conversation(first_agent, "continue safely")
 
     assert first_agent._last_session_handoff_result.stage == "COMPLETE"
@@ -351,8 +367,8 @@ def test_real_client_attachment_runs_ingress_checkpoint_resume_and_first_turn_on
     ), patch(
         "agent.conversation_loop.build_turn_context", side_effect=restarted_context
     ), patch(
-        "agent.orchestration.service.complete_active_orchestration", return_value=terminal
-    ), patch("agent.conversation_loop.finalize_turn", return_value=terminal.response):
+        "agent.orchestration.service.complete_active_orchestration", return_value=completed
+    ), patch("agent.conversation_loop.finalize_turn", return_value=completed.response):
         conversation_loop.run_conversation(restarted_agent, "continue safely")
 
     assert restarted_agent._last_session_handoff_result.stage == "COMPLETE"
@@ -590,6 +606,152 @@ def test_terminal_orchestration_has_zero_handoff_effects(tmp_path, status):
 
     assert result["status"] == status
     assert SessionHandoffLedger(ledger_path).get(job.job_id, request.handoff.handoff_id) is None
+    assert not hasattr(agent, "_last_session_handoff_result")
+
+
+@pytest.mark.parametrize("status", ["REQUIRE_APPROVAL", "ASK_USER", "BLOCKED"])
+def test_pending_worker_completion_terminal_denies_handoff_before_effects(
+    tmp_path, status
+):
+    from agent import conversation_loop
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from run_agent import AIAgent
+
+    lane, job, ledger_path = _lane(tmp_path)
+    request = _request(job.job_id)
+    agent = _agent()
+    AIAgent.attach_offline_session_handoff_runtime(
+        agent,
+        _runtime(
+            lane,
+            FailIfCalledPorts(),
+            request,
+            lambda *_: SemanticWaypoint(verified=True),
+        ),
+        enabled=True,
+    )
+    pending = SimpleNamespace(
+        legacy_continue=False, pending_worker=True, acted=False, response=None
+    )
+    terminal = SimpleNamespace(
+        legacy_continue=False,
+        pending_worker=False,
+        acted=True,
+        response={"status": status, "final_response": status, "completed": False},
+    )
+
+    with patch(
+        "agent.orchestration.service.maybe_orchestrate_turn", return_value=pending
+    ), patch(
+        "agent.conversation_loop.build_turn_context", return_value=_turn_context()
+    ), patch(
+        "agent.orchestration.service.complete_active_orchestration",
+        return_value=terminal,
+    ) as complete, patch(
+        "agent.conversation_loop.finalize_turn", return_value=terminal.response
+    ):
+        result = conversation_loop.run_conversation(agent, "ordinary")
+
+    assert result["status"] == status
+    complete.assert_called_once()
+    assert agent._session_handoff_authority["consumed"] is True
+    assert SessionHandoffLedger(ledger_path).get(
+        job.job_id, request.handoff.handoff_id
+    ) is None
+    assert not hasattr(agent, "_last_session_handoff_result")
+
+
+def test_pending_worker_completion_exception_denies_handoff_before_effects(tmp_path):
+    from agent import conversation_loop
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from run_agent import AIAgent
+
+    lane, job, ledger_path = _lane(tmp_path)
+    request = _request(job.job_id)
+    agent = _agent()
+    AIAgent.attach_offline_session_handoff_runtime(
+        agent,
+        _runtime(
+            lane,
+            FailIfCalledPorts(),
+            request,
+            lambda *_: SemanticWaypoint(verified=True),
+        ),
+        enabled=True,
+    )
+    pending = SimpleNamespace(
+        legacy_continue=False, pending_worker=True, acted=False, response=None
+    )
+    blocked = SimpleNamespace(
+        legacy_continue=False,
+        pending_worker=False,
+        acted=True,
+        response={"status": "BLOCKED", "final_response": "blocked", "completed": False},
+    )
+
+    with patch(
+        "agent.orchestration.service.maybe_orchestrate_turn", return_value=pending
+    ), patch(
+        "agent.conversation_loop.build_turn_context", return_value=_turn_context()
+    ), patch(
+        "agent.orchestration.service.complete_active_orchestration",
+        side_effect=RuntimeError("completion exploded"),
+    ), patch(
+        "agent.orchestration.service._fail_closed_active_error", return_value=blocked
+    ), patch(
+        "agent.conversation_loop.finalize_turn", return_value=blocked.response
+    ):
+        result = conversation_loop.run_conversation(agent, "ordinary")
+
+    assert result["status"] == "BLOCKED"
+    assert agent._session_handoff_authority["consumed"] is True
+    assert SessionHandoffLedger(ledger_path).get(
+        job.job_id, request.handoff.handoff_id
+    ) is None
+    assert not hasattr(agent, "_last_session_handoff_result")
+
+
+def test_orchestration_boundary_exception_denies_attached_handoff(tmp_path):
+    from agent import conversation_loop
+    from agent.durable_jobs.session_handoff import SemanticWaypoint, SessionHandoffLedger
+    from agent.orchestration.session_handoff_runtime import (
+        discard_attached_session_handoff_ingress,
+    )
+    from run_agent import AIAgent
+
+    lane, job, ledger_path = _lane(tmp_path)
+    request = _request(job.job_id)
+    agent = _agent()
+    AIAgent.attach_offline_session_handoff_runtime(
+        agent,
+        _runtime(
+            lane,
+            FailIfCalledPorts(),
+            request,
+            lambda *_: SemanticWaypoint(verified=True),
+        ),
+        enabled=True,
+    )
+
+    def consume_then_stop(bound_agent, *, turn_id):
+        discard_attached_session_handoff_ingress(bound_agent, turn_id=turn_id)
+        raise RuntimeError("stop after denied handoff boundary")
+
+    with patch(
+        "agent.orchestration.service.maybe_orchestrate_turn",
+        side_effect=RuntimeError("orchestration exploded"),
+    ), patch(
+        "agent.conversation_loop.build_turn_context", return_value=_turn_context()
+    ), patch(
+        "agent.orchestration.session_handoff_runtime.discard_attached_session_handoff_ingress",
+        side_effect=consume_then_stop,
+    ), pytest.raises(RuntimeError, match="stop after denied handoff boundary"):
+        conversation_loop.run_conversation(agent, "ordinary")
+
+    assert agent._session_handoff_authority["consumed"] is True
+    assert SessionHandoffLedger(ledger_path).get(
+        job.job_id, request.handoff.handoff_id
+    ) is None
     assert not hasattr(agent, "_last_session_handoff_result")
 
 
