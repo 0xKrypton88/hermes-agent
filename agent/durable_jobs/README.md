@@ -333,3 +333,34 @@ The receipt is `eng118_offline_acceptance_receipt.json`. Production/live
 materialization, runtime scheduler wiring, gateway/provider/network/Slack
 effects, cross-process initialization, and live-client receipt authority remain
 separate gates.
+
+## ENG-122 / ENG-116 production-switch preparation (still OFFLINE)
+
+`agent/orchestration/production_handoff_composition.py` is the dependency-closed
+composition client seam. It is not imported by Gateway or ordinary runtime and
+does not read environment or active configuration. Its strict schema defaults to
+`enabled=False, mode="off"`; ambiguous booleans fail. A caller must inject a
+request/session-bound `ProductionRequestAuthority`, explicitly call `start()`,
+drive `run_once()`, and call `shutdown()`. The composition creates exactly one
+scheduler, starts no thread, and cannot restart after shutdown; a replacement
+lifecycle owner reopens the durable store and reclaims only expired, generation-
+fenced leases.
+
+Offline receipt ports must provide stable-key dedupe, fenced delivery, and bytes
+read back from their own authoritative store. Live ports additionally require a
+separate matching `LiveEffectAuthority`; configuration and production authority
+alone cannot reach them.
+
+**Exact remaining live Go:** implement and review a concrete
+`LiveAuthoritativeReceiptPort` over the chosen existing product service, proving
+provider-supported idempotency, passing the continuation owner generation as a
+write fence, and returning canonical receipt bytes from an authoritative
+read-after-write API. Then a real lifecycle/client owner must inject both scoped
+authorities and the production continuation datastore. Gateway/service startup,
+credentials, datastore provisioning/migration, deployment, and client UI/Go
+ingress are deliberately not wired by this slice.
+
+Offline evidence is recorded in
+`agent/orchestration/eng122_production_preparation_receipt.json`; both
+`activation` and `live_effects` are literally false, and the residual list is
+part of its validated schema.

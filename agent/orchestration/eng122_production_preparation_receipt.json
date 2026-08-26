@@ -1,0 +1,22 @@
+{
+  "activation": false,
+  "live_effects": false,
+  "proofs": {
+    "default_off_zero_touch": true,
+    "durable_restart_reclaim_is_generation_fenced": true,
+    "explicit_offline_lifecycle": true,
+    "live_port_requires_separate_request_bound_authority": true,
+    "manual_resume_requires_immutable_receipt_digest": true,
+    "receipt_bytes_are_adapter_returned_and_read_back": true,
+    "scheduler_has_one_lifecycle_owner_and_no_thread": true,
+    "terminal_approval_has_zero_effects": true
+  },
+  "remaining_live_go": [
+    "Implement and review a concrete LiveAuthoritativeReceiptPort over the selected existing product service.",
+    "Prove provider idempotency, generation fencing, and canonical authoritative receipt readback.",
+    "Provision and approve the production continuation datastore outside this slice.",
+    "Wire an explicit runtime/client lifecycle owner and separate request-bound live activation ingress."
+  ],
+  "schema": "hermes.eng122-production-preparation",
+  "version": 1
+}
