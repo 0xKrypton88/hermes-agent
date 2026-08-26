@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -202,3 +203,204 @@ def test_production_preparation_receipt_is_explicitly_offline():
     assert receipt["activation"] is False and receipt["live_effects"] is False
     assert all(receipt["proofs"].values())
     assert len(receipt["remaining_live_go"]) == 4
+
+
+def test_production_handoff_runtime_receipt_is_provider_read_back_and_idempotent(tmp_path):
+    from agent.orchestration.production_handoff_composition import (
+        ProductionHandoffBinding, build_production_handoff_composition,
+    )
+    from run_agent import AIAgent
+
+    class LinearProjection:
+        def __init__(self):
+            self.by_issue, self.by_key, self.calls = {}, {}, 0
+        def upsert_handoff(self, *, issue, canonical, idempotency_key):
+            prior = self.by_key.get(idempotency_key)
+            if prior is None:
+                self.calls += 1
+                self.by_key[idempotency_key] = canonical
+                self.by_issue[issue] = canonical
+            else:
+                assert prior == canonical
+            return "write-accepted"
+        def read_handoff(self, *, issue):
+            return self.by_issue[issue]
+
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    store = ContinuationStore(tmp_path / "production.sqlite3", now_fn=clock)
+    _enqueue_authorized(store, job_id="ENG-128-sensitive-shaped-id")
+    projection = LinearProjection()
+    binding = ProductionHandoffBinding(
+        ProductionHandoffConfig(True, "live"), _authority(), store, projection,
+        "ENG-128",
+        LiveEffectAuthority("request-1", "session-1", "activation-1", True),
+    )
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "session-1"
+    composition = agent.attach_production_handoff_composition(binding)
+    delivered = composition.run_once(owner_token="runtime-a", lease_seconds=10)
+    assert delivered.next_action == "verify_handoff_delivery"
+    projected = next(iter(projection.by_issue.values()))
+    assert "ENG-128-sensitive-shaped-id" not in projected
+    assert set(projection.by_issue) == {"ENG-128"}
+    assert set(json.loads(projected)) == {
+        "handoff_sha256", "job_sha256", "schema"
+    }
+    clock.advance(11)
+    assert composition.run_once(owner_token="runtime-b", lease_seconds=10).wake_state == "COMPLETE"
+    assert projection.calls == 1
+
+
+def test_production_handoff_runtime_fails_closed_and_default_runtime_is_zero_touch(tmp_path):
+    import subprocess
+    import sys
+    from agent.orchestration.production_handoff_composition import (
+        LinearAuthoritativeReceiptPort, ProductionHandoffBinding,
+        build_production_handoff_composition,
+    )
+    from run_agent import AIAgent
+
+    store = ContinuationStore(tmp_path / "closed.sqlite3")
+    with pytest.raises(ProductionCompositionDisabled, match="enabled live mode"):
+        build_production_handoff_composition(
+            ProductionHandoffBinding(
+                ProductionHandoffConfig(), _authority(), store, object(),
+                "ENG-128",
+                LiveEffectAuthority("request-1", "session-1", "activation", True),
+            )
+        )
+    with pytest.raises(LiveAdapterUnavailable, match="requires upsert"):
+        LinearAuthoritativeReceiptPort(object(), issue="ENG-128")
+    with pytest.raises(LiveAdapterUnavailable, match="safe Linear issue"):
+        LinearAuthoritativeReceiptPort(object(), issue="not-an-issue")
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "other-session"
+    script = (
+        "import sys,run_agent; n='agent.orchestration.production_handoff_composition';"
+        "sys.stdout.write('1' if n in sys.modules else '0')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path, check=False,
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0"
+
+
+def test_production_binding_disabled_has_no_provider_or_claim_effects(tmp_path):
+    from agent.orchestration.production_handoff_composition import (
+        ProductionHandoffBinding,
+        build_production_handoff_composition,
+    )
+
+    class UntouchedProjection:
+        def upsert_handoff(self, **kwargs):
+            raise AssertionError("disabled binding reached provider write")
+
+        def read_handoff(self, **kwargs):
+            raise AssertionError("disabled binding reached provider read")
+
+    store = ContinuationStore(tmp_path / "disabled.sqlite3")
+    _enqueue_authorized(store)
+    binding = ProductionHandoffBinding(
+        ProductionHandoffConfig(),
+        _authority(),
+        store,
+        UntouchedProjection(),
+        "ENG-128",
+        LiveEffectAuthority("request-1", "session-1", "activation", True),
+    )
+    with pytest.raises(ProductionCompositionDisabled, match="enabled live mode"):
+        build_production_handoff_composition(binding)
+    assert store.get("job", "handoff").owner_token is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("config", None, ProductionCompositionDisabled),
+        ("authority", None, ProductionCompositionDisabled),
+        ("store", None, ProductionCompositionDisabled),
+        ("linear_projection", None, LiveAdapterUnavailable),
+        ("linear_issue", "", LiveAdapterUnavailable),
+        ("live_authority", None, LiveAdapterUnavailable),
+    ],
+)
+def test_production_binding_missing_dependency_fails_closed(
+    tmp_path, field, value, error
+):
+    from agent.orchestration.production_handoff_composition import (
+        ProductionHandoffBinding,
+        build_production_handoff_composition,
+    )
+
+    class Projection:
+        def upsert_handoff(self, **kwargs):
+            raise AssertionError("invalid binding reached provider write")
+
+        def read_handoff(self, **kwargs):
+            raise AssertionError("invalid binding reached provider read")
+
+    binding = ProductionHandoffBinding(
+        ProductionHandoffConfig(True, "live"),
+        _authority(),
+        ContinuationStore(tmp_path / "missing.sqlite3"),
+        Projection(),
+        "ENG-128",
+        LiveEffectAuthority("request-1", "session-1", "activation", True),
+    )
+    with pytest.raises(error):
+        build_production_handoff_composition(replace(binding, **{field: value}))
+
+
+def test_live_receipt_retry_reuses_idempotency_key_without_duplicate_effect(tmp_path):
+    from agent.orchestration.production_handoff_composition import (
+        ProductionHandoffBinding,
+        build_production_handoff_composition,
+    )
+
+    class CrashOnceStore(ContinuationStore):
+        crash = True
+
+        def record_verified_effect(self, *args, **kwargs):
+            if self.crash:
+                self.crash = False
+                raise RuntimeError("simulated crash after provider write")
+            return super().record_verified_effect(*args, **kwargs)
+
+    class IdempotentProjection:
+        def __init__(self):
+            self.effects = {}
+            self.attempts = 0
+
+        def upsert_handoff(self, *, issue, canonical, idempotency_key):
+            self.attempts += 1
+            prior = self.effects.setdefault(idempotency_key, (issue, canonical))
+            assert prior == (issue, canonical)
+            return "accepted"
+
+        def read_handoff(self, *, issue):
+            return next(canonical for stored_issue, canonical in self.effects.values()
+                        if stored_issue == issue)
+
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    store = CrashOnceStore(tmp_path / "retry.sqlite3", now_fn=clock)
+    _enqueue_authorized(store)
+    projection = IdempotentProjection()
+    composition = build_production_handoff_composition(
+        ProductionHandoffBinding(
+            ProductionHandoffConfig(True, "live"),
+            _authority(),
+            store,
+            projection,
+            "ENG-128",
+            LiveEffectAuthority("request-1", "session-1", "activation", True),
+        )
+    )
+    composition.start()
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        composition.run_once(owner_token="first", lease_seconds=10)
+    clock.advance(11)
+    composition.run_once(owner_token="retry", lease_seconds=10)
+    assert projection.attempts == 2
+    assert len(projection.effects) == 1

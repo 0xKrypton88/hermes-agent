@@ -614,6 +614,30 @@ class AIAgent:
 
         attach_session_handoff_runtime(self, runtime, enabled=enabled)
 
+    def attach_production_handoff_composition(self, binding):
+        """Attach one explicitly authorized production receipt composition.
+
+        The import is intentionally inside this opt-in boundary: ordinary agent
+        construction performs no handoff import, storage, or provider work.
+        """
+        if getattr(self, "_production_handoff_composition", None) is not None:
+            raise RuntimeError("production handoff composition is already attached")
+        from agent.orchestration.production_handoff_composition import (
+            ProductionCompositionDisabled,
+            build_production_handoff_composition,
+        )
+
+        active_session_id = str(getattr(self, "session_id", "") or "")
+        authority = getattr(binding, "authority", None)
+        if not active_session_id or getattr(authority, "session_id", None) != active_session_id:
+            raise ProductionCompositionDisabled(
+                "production authority is not bound to the active session"
+            )
+        composition = build_production_handoff_composition(binding)
+        composition.start()
+        self._production_handoff_composition = composition
+        return composition
+
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 

@@ -430,12 +430,27 @@ def _child_env_with_worktree_startup(repo: Path) -> dict[str, str]:
     return env
 
 
-def _child_env_without_startup_hooks(repo: Path) -> dict[str, str]:
-    """Hide worktree sitecustomize and PYTHONSTARTUP from a child process."""
+def _child_env_without_startup_hooks(
+    repo: Path, *, sitecustomize_shadow: Path | None = None
+) -> dict[str, str]:
+    """Hide every worktree startup hook from a child process.
+
+    Locked editable installs expose the checkout through their generated
+    import finder even after ``PYTHONPATH`` and the Hermes ``.pth`` are parked.
+    An inert, earlier ``sitecustomize`` module is therefore required to model
+    an interpreter that genuinely did not execute the checkout hook.
+    """
     env = os.environ.copy()
     repo_s = str(repo)
     prior = env.get("PYTHONPATH", "")
     parts = [part for part in prior.split(os.pathsep) if part and part != repo_s]
+    if sitecustomize_shadow is not None:
+        sitecustomize_shadow.mkdir(parents=True, exist_ok=True)
+        (sitecustomize_shadow / "sitecustomize.py").write_text(
+            "# Deliberately inert: this child must have no Hermes startup hook.\n",
+            encoding="utf-8",
+        )
+        parts.insert(0, str(sitecustomize_shadow))
     if parts:
         env["PYTHONPATH"] = os.pathsep.join(parts)
     else:
@@ -2608,7 +2623,9 @@ finally:
             capture_output=True,
             text=True,
             cwd=str(tmp_path),
-            env=_child_env_without_startup_hooks(repo),
+            env=_child_env_without_startup_hooks(
+                repo, sitecustomize_shadow=tmp_path / "startup-shadow"
+            ),
         )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "trusted=0 accepted=0"
@@ -2742,7 +2759,9 @@ finally:
             capture_output=True,
             text=True,
             cwd=str(tmp_path),
-            env=_child_env_without_startup_hooks(repo),
+            env=_child_env_without_startup_hooks(
+                repo, sitecustomize_shadow=tmp_path / "startup-shadow"
+            ),
         )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "executed=1 candidate=1 trusted=0 accepted=0"

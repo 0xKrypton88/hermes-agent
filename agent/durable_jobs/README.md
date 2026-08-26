@@ -334,31 +334,29 @@ materialization, runtime scheduler wiring, gateway/provider/network/Slack
 effects, cross-process initialization, and live-client receipt authority remain
 separate gates.
 
-## ENG-122 / ENG-116 production-switch preparation (still OFFLINE)
+## ENG-122 production handoff receipt composition (default OFF)
 
 `agent/orchestration/production_handoff_composition.py` is the dependency-closed
-composition client seam. It is not imported by Gateway or ordinary runtime and
+composition client seam. `AIAgent.attach_production_handoff_composition()` is the
+normal runtime attachment point, but imports it only when explicitly called and
 does not read environment or active configuration. Its strict schema defaults to
 `enabled=False, mode="off"`; ambiguous booleans fail. A caller must inject a
 request/session-bound `ProductionRequestAuthority`, explicitly call `start()`,
-drive `run_once()`, and call `shutdown()`. The composition creates exactly one
-scheduler, starts no thread, and cannot restart after shutdown; a replacement
-lifecycle owner reopens the durable store and reclaims only expired, generation-
-fenced leases.
+and explicitly drive `run_once()`. An ordinary agent import performs no datastore,
+provider, scheduler, network, or environment effect.
 
-Offline receipt ports must provide stable-key dedupe, fenced delivery, and bytes
-read back from their own authoritative store. Live ports additionally require a
-separate matching `LiveEffectAuthority`; configuration and production authority
-alone cannot reach them.
+`LinearAuthoritativeReceiptPort` uses the existing Linear handoff projection
+contract. It upserts with the stable continuation idempotency key and emits only
+hashed continuation identities. The durable store enforces the generation fence,
+and receipt bytes come from provider readback. Live construction additionally
+requires a separate matching `LiveEffectAuthority`; configuration and production
+authority alone cannot reach the provider.
 
-**Exact remaining live Go:** implement and review a concrete
-`LiveAuthoritativeReceiptPort` over the chosen existing product service, proving
-provider-supported idempotency, passing the continuation owner generation as a
-write fence, and returning canonical receipt bytes from an authoritative
-read-after-write API. Then a real lifecycle/client owner must inject both scoped
-authorities and the production continuation datastore. Gateway/service startup,
-credentials, datastore provisioning/migration, deployment, and client UI/Go
-ingress are deliberately not wired by this slice.
+**Exact remaining activation blocker:** no product caller supplies a production
+continuation datastore, approved Linear projection/issue, or request-bound
+`LiveEffectAuthority`. Dispatch and activation therefore remain disabled.
+Gateway service changes, credentials, datastore provisioning/migration,
+deployment, and client UI/Go ingress are deliberately outside this slice.
 
 Offline evidence is recorded in
 `agent/orchestration/eng122_production_preparation_receipt.json`; both
