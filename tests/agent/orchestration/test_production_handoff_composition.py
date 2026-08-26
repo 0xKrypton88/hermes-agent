@@ -52,6 +52,13 @@ def _authority(*, terminal=False):
     return ProductionRequestAuthority("request-1", "session-1", True, terminal)
 
 
+def _enqueue_authorized(store, *, job_id="job", request_id="request-1", session_id="session-1"):
+    return store.enqueue(
+        job_id=job_id, handoff_id="handoff", checkpoint_stage="DELIVER",
+        next_action="deliver_handoff", request_id=request_id, session_id=session_id,
+    )
+
+
 def test_representative_client_default_off_is_zero_touch_and_schema_is_strict(tmp_path):
     store_path = tmp_path / "absent.sqlite3"
     port = _FailIfCalledPort()
@@ -68,10 +75,7 @@ def test_offline_client_restart_reclaim_manual_resume_and_lifecycle(tmp_path):
     clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     path = tmp_path / "continuations.sqlite3"
     store = ContinuationStore(path, now_fn=clock)
-    store.enqueue(
-        job_id="job", handoff_id="handoff", checkpoint_stage="DELIVER",
-        next_action="deliver_handoff",
-    )
+    _enqueue_authorized(store)
     port = _OfflineReceiptPort()
     first = ProductionHandoffComposition(
         ProductionHandoffConfig(True, "offline"), authority=_authority(),
@@ -100,10 +104,7 @@ def test_offline_client_restart_reclaim_manual_resume_and_lifecycle(tmp_path):
 
     # Exercise the real explicit manual-resume API without inventing an effect.
     blocked_store = ContinuationStore(tmp_path / "blocked.sqlite3", now_fn=clock)
-    blocked_store.enqueue(
-        job_id="blocked", handoff_id="handoff", checkpoint_stage="DELIVER",
-        next_action="deliver_handoff",
-    )
+    _enqueue_authorized(blocked_store, job_id="blocked")
     blocked_port = _OfflineReceiptPort()
     blocked = ProductionHandoffComposition(
         ProductionHandoffConfig(True, "offline"), authority=_authority(),
@@ -128,15 +129,22 @@ def test_offline_client_restart_reclaim_manual_resume_and_lifecycle(tmp_path):
 
 
 def test_terminal_approval_has_zero_effects_and_live_requires_separate_authority(tmp_path):
-    path = tmp_path / "never-created.sqlite3"
+    class ObservableStore:
+        calls = 0
+
+        def claim_due_scoped(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("store reached")
+
+    observable_store = ObservableStore()
     fail = _FailIfCalledPort()
     terminal = ProductionHandoffComposition(
         ProductionHandoffConfig(True, "offline"), authority=_authority(terminal=True),
-        offline_port=fail,
+        store=observable_store, offline_port=fail,
     )
     with pytest.raises(ProductionCompositionDisabled, match="not active"):
         terminal.start()
-    assert not path.exists()
+    assert observable_store.calls == 0
 
     store = ContinuationStore(tmp_path / "live.sqlite3")
     without_live_go = ProductionHandoffComposition(
@@ -156,6 +164,32 @@ def test_terminal_approval_has_zero_effects_and_live_requires_separate_authority
 
 def test_receipt_port_contract_is_runtime_checkable():
     assert isinstance(_OfflineReceiptPort(), AuthoritativeReceiptPort)
+
+
+@pytest.mark.parametrize("mode", ["offline", "live"])
+def test_production_claims_only_exact_authority_scope(mode, tmp_path):
+    store = ContinuationStore(tmp_path / f"{mode}.sqlite3")
+    _enqueue_authorized(store, job_id="foreign", request_id="request-2")
+    store.enqueue(
+        job_id="legacy", handoff_id="handoff", checkpoint_stage="DELIVER",
+        next_action="deliver_handoff",
+    )
+    port = _FailIfCalledPort()
+    kwargs = {"offline_port": port}
+    if mode == "live":
+        kwargs = {
+            "live_port": port,
+            "live_authority": LiveEffectAuthority(
+                "request-1", "session-1", "activation", True
+            ),
+        }
+    composition = ProductionHandoffComposition(
+        ProductionHandoffConfig(True, mode), authority=_authority(), store=store, **kwargs
+    )
+    composition.start()
+    assert composition.run_once(owner_token="owner", lease_seconds=10) is None
+    assert store.get("foreign", "handoff").owner_token is None
+    assert store.get("legacy", "handoff").owner_token is None
 
 
 def test_production_preparation_receipt_is_explicitly_offline():

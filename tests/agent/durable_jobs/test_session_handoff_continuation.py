@@ -68,6 +68,68 @@ def _force_after_transaction(store: ContinuationStore, callback) -> None:
     store._connect = connect
 
 
+def test_existing_sqlite_store_migrates_scope_columns_without_inference(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE session_handoff_continuations ("
+            "job_id TEXT NOT NULL, handoff_id TEXT NOT NULL, "
+            "checkpoint_stage TEXT NOT NULL, next_action TEXT NOT NULL, "
+            "due_at TEXT NOT NULL, owner_token TEXT, "
+            "owner_generation INTEGER NOT NULL DEFAULT 0, lease_expires_at TEXT, "
+            "heartbeat_at TEXT, verification_state TEXT NOT NULL DEFAULT 'PENDING', "
+            "manual_resume_reason TEXT, manual_resume_operator_reason TEXT, "
+            "wake_state TEXT NOT NULL DEFAULT 'DUE', PRIMARY KEY (job_id, handoff_id))"
+        )
+        connection.execute(
+            "INSERT INTO session_handoff_continuations "
+            "(job_id,handoff_id,checkpoint_stage,next_action,due_at) "
+            "VALUES ('request-looking-job','handoff','DELIVER','deliver_handoff',"
+            "'2026-01-01T00:00:00+00:00')"
+        )
+
+    store = ContinuationStore(path)
+
+    migrated = store.get("request-looking-job", "handoff")
+    assert migrated.request_id is None and migrated.session_id is None
+    assert store.claim_due_scoped(
+        request_id="request-looking-job",
+        session_id="session",
+        owner_token="owner",
+        lease_seconds=10,
+    ) is None
+
+
+def test_scoped_claim_atomically_selects_only_exact_request_and_session(tmp_path):
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    store = _store(tmp_path, clock)
+    for job_id, request_id, session_id in (
+        ("foreign-request", "request-2", "session-1"),
+        ("foreign-session", "request-1", "session-2"),
+        ("authorized", "request-1", "session-1"),
+    ):
+        store.enqueue(
+            job_id=job_id,
+            handoff_id="handoff",
+            checkpoint_stage="DELIVER",
+            next_action="deliver_handoff",
+            request_id=request_id,
+            session_id=session_id,
+        )
+
+    claim = store.claim_due_scoped(
+        request_id="request-1",
+        session_id="session-1",
+        owner_token="owner",
+        lease_seconds=10,
+    )
+
+    assert claim is not None and claim.job_id == "authorized"
+    assert store.get("foreign-request", "handoff").owner_token is None
+    assert store.get("foreign-session", "handoff").owner_token is None
+    assert store.claim_due(owner_token="legacy-owner", lease_seconds=10) is None
+
+
 def test_claim_samples_due_and_expiry_time_after_begin_immediate(tmp_path):
     clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     store = _store(tmp_path, clock)

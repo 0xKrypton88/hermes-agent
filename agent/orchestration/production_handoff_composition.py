@@ -105,9 +105,15 @@ class LiveAuthoritativeReceiptPort(AuthoritativeReceiptPort, Protocol):
 class ContinuationScheduler:
     """One explicitly driven scheduler, owned by one started composition."""
 
-    def __init__(self, store: ContinuationStore, port: AuthoritativeReceiptPort) -> None:
+    def __init__(
+        self,
+        store: ContinuationStore,
+        port: AuthoritativeReceiptPort,
+        authority: ProductionRequestAuthority,
+    ) -> None:
         self._store = store
         self._port = port
+        self._authority = authority
 
     @staticmethod
     def idempotency_key(record: ContinuationRecord) -> str:
@@ -116,7 +122,12 @@ class ContinuationScheduler:
         ).hexdigest()
 
     def run_once(self, *, owner_token: str, lease_seconds: float) -> ContinuationRecord | None:
-        claim = self._store.claim_due(owner_token=owner_token, lease_seconds=lease_seconds)
+        claim = self._store.claim_due_scoped(
+            request_id=self._authority.request_id,
+            session_id=self._authority.session_id,
+            owner_token=owner_token,
+            lease_seconds=lease_seconds,
+        )
         if claim is None:
             return None
         key = self.idempotency_key(claim)
@@ -188,7 +199,7 @@ class ProductionHandoffComposition:
             port = self._authorized_live_port()
         if port is None or not isinstance(port, AuthoritativeReceiptPort):
             raise ProductionCompositionDisabled("an authoritative receipt port is required")
-        self._scheduler = ContinuationScheduler(self._store, port)
+        self._scheduler = ContinuationScheduler(self._store, port, self._authority)
 
     def _authorized_live_port(self) -> LiveAuthoritativeReceiptPort:
         live = self._live_authority

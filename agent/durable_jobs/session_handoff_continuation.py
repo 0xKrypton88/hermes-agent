@@ -37,6 +37,8 @@ class DeliveryVerificationFailed(RuntimeError):
 class ContinuationRecord:
     job_id: str
     handoff_id: str
+    request_id: str | None
+    session_id: str | None
     checkpoint_stage: str
     next_action: str
     due_at: str
@@ -54,6 +56,8 @@ _DDL = """
 CREATE TABLE IF NOT EXISTS session_handoff_continuations (
     job_id TEXT NOT NULL,
     handoff_id TEXT NOT NULL,
+    request_id TEXT,
+    session_id TEXT,
     checkpoint_stage TEXT NOT NULL,
     next_action TEXT NOT NULL,
     due_at TEXT NOT NULL,
@@ -102,6 +106,22 @@ class ContinuationStore:
         self._now_fn = now_fn
         with self._connect() as connection:
             connection.executescript(_DDL)
+            self._migrate_scope_columns(connection)
+
+    @staticmethod
+    def _migrate_scope_columns(connection: sqlite3.Connection) -> None:
+        """Add authoritative scope without assigning identity to legacy rows."""
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(session_handoff_continuations)"
+            )
+        }
+        for name in ("request_id", "session_id"):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE session_handoff_continuations ADD COLUMN {name} TEXT"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -133,17 +153,24 @@ class ContinuationStore:
         checkpoint_stage: str,
         next_action: str,
         due_at: str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
     ) -> ContinuationRecord:
         if not all((job_id, handoff_id, checkpoint_stage, next_action)):
             raise ValueError(
                 "continuation identity, checkpoint, and next_action are required"
             )
+        if (request_id is None) != (session_id is None):
+            raise ValueError("continuation request and session scope must be provided together")
+        if request_id is not None and (not request_id or not session_id):
+            raise ValueError("continuation request and session scope must be nonempty")
         due = due_at or self._now_fn()
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO session_handoff_continuations "
-                "(job_id,handoff_id,checkpoint_stage,next_action,due_at) VALUES (?,?,?,?,?)",
-                (job_id, handoff_id, checkpoint_stage, next_action, due),
+                "(job_id,handoff_id,request_id,session_id,checkpoint_stage,next_action,due_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (job_id, handoff_id, request_id, session_id, checkpoint_stage, next_action, due),
             )
             result = self._select_record(connection, job_id, handoff_id)
         return result
@@ -169,7 +196,8 @@ class ContinuationStore:
             expires = add_seconds_iso(now, lease_seconds)
             rows = connection.execute(
                 "SELECT * FROM session_handoff_continuations "
-                "WHERE wake_state='DUE' AND verification_state!='MANUAL_RESUME' AND due_at<=? "
+                "WHERE request_id IS NULL AND session_id IS NULL "
+                "AND wake_state='DUE' AND verification_state!='MANUAL_RESUME' AND due_at<=? "
                 "ORDER BY due_at,job_id,handoff_id",
                 (now,),
             ).fetchall()
@@ -192,6 +220,63 @@ class ContinuationStore:
                     now,
                     candidate["job_id"],
                     candidate["handoff_id"],
+                    candidate["owner_generation"],
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                return None
+            result = self._select_record(
+                connection, candidate["job_id"], candidate["handoff_id"]
+            )
+            connection.commit()
+        return result
+
+    def claim_due_scoped(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        owner_token: str,
+        lease_seconds: float,
+    ) -> ContinuationRecord | None:
+        """Atomically claim only a record durably bound to the exact authority."""
+        if not request_id or not session_id:
+            raise ValueError("nonempty request and session scope are required")
+        if not owner_token or lease_seconds <= 0:
+            raise ValueError("owner token and positive lease are required")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = self._now_fn()
+            expires = add_seconds_iso(now, lease_seconds)
+            rows = connection.execute(
+                "SELECT * FROM session_handoff_continuations "
+                "WHERE request_id=? AND session_id=? AND wake_state='DUE' "
+                "AND verification_state!='MANUAL_RESUME' AND due_at<=? "
+                "ORDER BY due_at,job_id,handoff_id",
+                (request_id, session_id, now),
+            ).fetchall()
+            candidate = next(
+                (row for row in rows if claim_is_expired(row["lease_expires_at"], now)),
+                None,
+            )
+            if candidate is None:
+                connection.commit()
+                return None
+            generation = int(candidate["owner_generation"]) + 1
+            changed = connection.execute(
+                "UPDATE session_handoff_continuations SET owner_token=?,owner_generation=?,"
+                "lease_expires_at=?,heartbeat_at=? WHERE job_id=? AND handoff_id=? "
+                "AND request_id=? AND session_id=? AND owner_generation=?",
+                (
+                    owner_token,
+                    generation,
+                    expires,
+                    now,
+                    candidate["job_id"],
+                    candidate["handoff_id"],
+                    request_id,
+                    session_id,
                     candidate["owner_generation"],
                 ),
             ).rowcount
