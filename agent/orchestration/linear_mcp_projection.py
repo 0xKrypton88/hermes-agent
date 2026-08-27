@@ -265,7 +265,10 @@ class LinearMCPProjectionOwner:
             if cursor is not None:
                 arguments["cursor"] = cursor
             result = self._call("list_comments", arguments)
-            if set(result) != {"comments", "hasNextPage", "cursor"}:
+            if set(result) not in (
+                {"comments", "hasNextPage"},
+                {"comments", "hasNextPage", "cursor"},
+            ):
                 raise ValueError("Linear MCP comments page has an invalid schema")
             for body in self._comment_bodies(result):
                 projection = self._projection_from_comment(body)

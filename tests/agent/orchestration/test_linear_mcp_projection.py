@@ -217,6 +217,28 @@ def test_projection_never_reads_or_edits_issue_description():
     assert all("description" not in call[4] for call in caller.calls)
 
 
+def test_terminal_comments_page_accepts_provider_omitted_cursor():
+    class OmittedTerminalCursorCaller(FakeRequestMCPCaller):
+        def call_tool(self, **kwargs):
+            self.calls.append(kwargs)
+            assert kwargs["tool_name"] == "list_comments"
+            return self.envelope({
+                "comments": [
+                    {
+                        "body": LinearMCPProjectionOwner._document(
+                            "provider terminal page", "9" * 64
+                        )
+                    }
+                ],
+                "hasNextPage": False,
+            })
+
+    owner = _owner(OmittedTerminalCursorCaller())
+    owner.start()
+
+    assert owner.read_handoff(issue="ENG-128") == "provider terminal page"
+
+
 def test_comment_pages_follow_mcp_json_cursor_until_exhausted():
     class PaginatedCaller(FakeRequestMCPCaller):
         def call_tool(self, **kwargs):
