@@ -155,13 +155,21 @@ class LinearAuthoritativeReceiptPort:
             canonical=canonical,
             idempotency_key=idempotency_key,
         )
-        return self._receipt_bytes(self._projection.read_handoff(issue=self._issue))
+        return self._receipt_bytes(
+            self._projection.read_handoff(
+                issue=self._issue, idempotency_key=idempotency_key
+            )
+        )
 
     def readback(
         self, record: ContinuationRecord, *, idempotency_key: str
     ) -> bytes:
-        del record, idempotency_key
-        return self._receipt_bytes(self._projection.read_handoff(issue=self._issue))
+        del record
+        return self._receipt_bytes(
+            self._projection.read_handoff(
+                issue=self._issue, idempotency_key=idempotency_key
+            )
+        )
 
 
 @dataclass(frozen=True)

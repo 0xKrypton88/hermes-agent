@@ -104,7 +104,7 @@ def test_projection_routes_every_call_through_one_request_and_reads_back():
     assert owner.upsert_handoff(
         issue="ENG-128", canonical='{"handoff":"digest"}', idempotency_key=key
     ) == key
-    assert owner.read_handoff(issue="ENG-128") == '{"handoff":"digest"}'
+    assert owner.read_handoff(issue="ENG-128", idempotency_key=key) == '{"handoff":"digest"}'
 
     assert [call[3] for call in caller.calls] == [
         "list_comments", "save_comment", "list_comments", "list_comments"
@@ -121,6 +121,50 @@ def test_projection_routes_every_call_through_one_request_and_reads_back():
         "idempotency_key": key,
         "schema": "hermes.linear-mcp-handoff-projection.v1",
     }
+
+
+def test_readback_selects_the_requested_projection_when_issue_has_multiple_jobs():
+    caller = FakeRequestMCPCaller()
+    caller.comments = [
+        {"body": LinearMCPProjectionOwner._document("golden", "a" * 64)},
+        {"body": LinearMCPProjectionOwner._document("restart", "b" * 64)},
+    ]
+    owner = _owner(caller)
+    owner.start()
+
+    assert owner.read_handoff(
+        issue="ENG-128", idempotency_key="b" * 64
+    ) == "restart"
+
+
+@pytest.mark.parametrize(
+    "comments",
+    [
+        [{"body": LinearMCPProjectionOwner._document("other", "a" * 64)}],
+        [
+            {"body": LinearMCPProjectionOwner._document("first", "b" * 64)},
+            {"body": LinearMCPProjectionOwner._document("second", "b" * 64)},
+        ],
+    ],
+)
+def test_readback_fails_closed_without_exactly_one_requested_projection(comments):
+    caller = FakeRequestMCPCaller()
+    caller.comments = comments
+    owner = _owner(caller)
+    owner.start()
+
+    with pytest.raises(ValueError, match="exactly one matching projection"):
+        owner.read_handoff(issue="ENG-128", idempotency_key="b" * 64)
+
+
+def test_readback_rejects_invalid_key_before_calling_linear():
+    caller = FakeRequestMCPCaller()
+    owner = _owner(caller)
+    owner.start()
+
+    with pytest.raises(ValueError, match="SHA-256 idempotency key"):
+        owner.read_handoff(issue="ENG-128", idempotency_key="not-a-key")
+    assert caller.calls == []
 
 
 def test_projection_decodes_handle_function_call_nested_result_shape():
@@ -146,7 +190,7 @@ def test_projection_decodes_handle_function_call_nested_result_shape():
     owner = _owner(caller)
     owner.start()
 
-    assert owner.read_handoff(issue="ENG-128") == "runtime projection"
+    assert owner.read_handoff(issue="ENG-128", idempotency_key="f" * 64) == "runtime projection"
     assert caller.calls[0]["tool_name"] == "list_comments"
 
 
@@ -174,13 +218,13 @@ def test_owner_cannot_be_used_outside_its_lifecycle():
     caller = FakeRequestMCPCaller()
     owner = _owner(caller)
     with pytest.raises(LiveAdapterUnavailable, match="not started"):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
     owner.start()
     with pytest.raises(LiveAdapterUnavailable, match="already started"):
         owner.start()
     owner.shutdown()
     with pytest.raises(LiveAdapterUnavailable, match="not started"):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
     with pytest.raises(LiveAdapterUnavailable, match="cannot restart"):
         owner.start()
     assert caller.calls == []
@@ -192,8 +236,8 @@ def test_malformed_readback_fails_closed():
     owner = _owner(caller)
     owner.start()
 
-    with pytest.raises(ValueError, match="no handoff projection"):
-        owner.read_handoff(issue="ENG-128")
+    with pytest.raises(ValueError, match="exactly one matching projection"):
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
     assert [call[3] for call in caller.calls] == ["list_comments"]
 
     assert owner.upsert_handoff(
@@ -236,7 +280,7 @@ def test_terminal_comments_page_accepts_provider_omitted_cursor():
     owner = _owner(OmittedTerminalCursorCaller())
     owner.start()
 
-    assert owner.read_handoff(issue="ENG-128") == "provider terminal page"
+    assert owner.read_handoff(issue="ENG-128", idempotency_key="9" * 64) == "provider terminal page"
 
 
 def test_comment_pages_follow_mcp_json_cursor_until_exhausted():
@@ -280,7 +324,7 @@ def test_comment_pages_follow_mcp_json_cursor_until_exhausted():
     owner = _owner(caller)
     owner.start()
 
-    assert owner.read_handoff(issue="ENG-128") == "latest"
+    assert owner.read_handoff(issue="ENG-128", idempotency_key="e" * 64) == "latest"
     assert [call[4].get("cursor") for call in caller.calls] == [None, "page-2"]
 
 
@@ -300,7 +344,7 @@ def test_malformed_comment_pagination_fails_closed(result, error):
     owner = _owner(Caller())
     owner.start()
     with pytest.raises(ValueError, match=error):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
 
 
 def test_repeated_cursor_and_page_bound_fail_closed(monkeypatch):
@@ -313,13 +357,13 @@ def test_repeated_cursor_and_page_bound_fail_closed(monkeypatch):
     owner = _owner(Caller())
     owner.start()
     with pytest.raises(ValueError, match="invalid pagination"):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
 
     monkeypatch.setattr("agent.orchestration.linear_mcp_projection._MAX_COMMENT_PAGES", 1)
     owner = _owner(Caller())
     owner.start()
     with pytest.raises(ValueError, match="exceeded its bound"):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
 
 
 @pytest.mark.parametrize(
@@ -339,4 +383,4 @@ def test_malformed_mcp_result_envelope_fails_closed(envelope, error):
     owner = _owner(Caller())
     owner.start()
     with pytest.raises(ValueError, match=error):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)

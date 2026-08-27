@@ -223,8 +223,8 @@ def test_production_handoff_runtime_receipt_is_provider_read_back_and_idempotent
             else:
                 assert prior == canonical
             return "write-accepted"
-        def read_handoff(self, *, issue):
-            return self.by_issue[issue]
+        def read_handoff(self, *, issue, idempotency_key):
+            return self.by_key[idempotency_key]
 
     clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     store = ContinuationStore(tmp_path / "production.sqlite3", now_fn=clock)
@@ -379,9 +379,10 @@ def test_live_receipt_retry_reuses_idempotency_key_without_duplicate_effect(tmp_
             assert prior == (issue, canonical)
             return "accepted"
 
-        def read_handoff(self, *, issue):
-            return next(canonical for stored_issue, canonical in self.effects.values()
-                        if stored_issue == issue)
+        def read_handoff(self, *, issue, idempotency_key):
+            stored_issue, canonical = self.effects[idempotency_key]
+            assert stored_issue == issue
+            return canonical
 
     clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     store = CrashOnceStore(tmp_path / "retry.sqlite3", now_fn=clock)

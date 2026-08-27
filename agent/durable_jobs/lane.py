@@ -547,7 +547,9 @@ class DurableLaneService:
                                 canonical=canonical,
                                 idempotency_key=f"{key}:linear",
                             )
-                            if self.linear.read_handoff(issue=handoff.issue) != canonical:
+                            if self.linear.read_handoff(
+                                issue=handoff.issue, idempotency_key=f"{key}:linear"
+                            ) != canonical:
                                 raise ProjectionVerificationError(
                                     "Linear readback mismatch"
                                 )

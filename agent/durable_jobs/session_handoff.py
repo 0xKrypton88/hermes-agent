@@ -300,7 +300,9 @@ class LinearHandoffProjection(Protocol):
         self, *, issue: str, canonical: str, idempotency_key: str
     ) -> str: ...
 
-    def read_handoff(self, *, issue: str) -> str: ...
+    def read_handoff(
+        self, *, issue: str, idempotency_key: str
+    ) -> str: ...
 
 
 class SlackHandoffProjection(Protocol):

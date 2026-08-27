@@ -203,11 +203,16 @@ class LinearMCPProjectionOwner:
         return issue
 
     @staticmethod
-    def _document(canonical: Any, idempotency_key: Any) -> str:
+    def _validate_idempotency_key(value: Any) -> str:
+        if type(value) is not str or _KEY_RE.fullmatch(value) is None:
+            raise ValueError("a SHA-256 idempotency key is required")
+        return value
+
+    @classmethod
+    def _document(cls, canonical: Any, idempotency_key: Any) -> str:
         if type(canonical) is not str or not canonical or len(canonical.encode()) > 4096:
             raise ValueError("canonical projection must be nonempty bounded text")
-        if type(idempotency_key) is not str or _KEY_RE.fullmatch(idempotency_key) is None:
-            raise ValueError("a SHA-256 idempotency key is required")
+        idempotency_key = cls._validate_idempotency_key(idempotency_key)
         payload = json.dumps(
             {"canonical": canonical, "idempotency_key": idempotency_key, "schema": _SCHEMA},
             sort_keys=True,
@@ -314,9 +319,16 @@ class LinearMCPProjectionOwner:
             raise ValueError("Linear MCP authoritative readback did not match")
         return idempotency_key
 
-    def read_handoff(self, *, issue: str) -> str:
+    def read_handoff(
+        self, *, issue: str, idempotency_key: str
+    ) -> str:
         issue = self._validate_issue(issue)
+        idempotency_key = self._validate_idempotency_key(idempotency_key)
         projections = self._list_projections(issue)
-        if not projections:
-            raise ValueError("Linear MCP readback has no handoff projection comment")
-        return projections[-1]["canonical"]
+        matches = [
+            projection for projection in projections
+            if projection["idempotency_key"] == idempotency_key
+        ]
+        if len(matches) != 1:
+            raise ValueError("Linear MCP readback requires exactly one matching projection")
+        return matches[0]["canonical"]

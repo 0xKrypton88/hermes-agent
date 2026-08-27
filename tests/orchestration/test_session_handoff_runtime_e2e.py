@@ -57,7 +57,7 @@ class DisposableDurablePorts:
             )
         return receipt
 
-    def read_handoff(self, *, issue):
+    def read_handoff(self, *, issue, idempotency_key):
         with sqlite3.connect(self.path) as connection:
             row = connection.execute(
                 "SELECT canonical FROM projection WHERE issue=?", (issue,)

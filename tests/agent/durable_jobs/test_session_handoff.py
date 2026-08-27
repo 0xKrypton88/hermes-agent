@@ -224,7 +224,7 @@ class _Linear:
         self.value = canonical
         return self.effects[idempotency_key]
 
-    def read_handoff(self, *, issue):
+    def read_handoff(self, *, issue, idempotency_key):
         return self.value
 
 

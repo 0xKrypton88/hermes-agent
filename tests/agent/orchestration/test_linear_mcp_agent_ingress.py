@@ -56,7 +56,7 @@ def test_agent_ingress_routes_projection_through_request_bound_invoke_tool():
     owner.upsert_handoff(
         issue="ENG-128", canonical="provider bytes", idempotency_key="a" * 64
     )
-    assert owner.read_handoff(issue="ENG-128") == "provider bytes"
+    assert owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64) == "provider bytes"
     assert [call[0] for call in agent.calls] == [
         "mcp__linear__list_comments",
         "mcp__linear__save_comment",
@@ -100,5 +100,5 @@ def test_agent_ingress_rejects_session_drift_before_invoke_tool():
     agent.session_id = "rotated-session"
 
     with pytest.raises(LiveAdapterUnavailable, match="escaped its request binding"):
-        owner.read_handoff(issue="ENG-128")
+        owner.read_handoff(issue="ENG-128", idempotency_key="a" * 64)
     assert agent.calls == []
