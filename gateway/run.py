@@ -1087,13 +1087,10 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` selects whether the empty-message recovery may emit a
+    concise restoration acknowledgement.  Both interactive and non-interactive
+    resumes must continue the interrupted task from the first unrecorded step;
+    asking "what next?" abandons the saved task and can create a restart loop.
     """
     reason_phrase = (
         "a gateway restart"
@@ -1113,12 +1110,13 @@ def build_resume_recovery_note(
         )
     elif interactive:
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
+            "Report briefly that the session was restored, then review the "
+            "preserved task list and conversation history and CONTINUE the "
+            "interrupted task without asking what to do next."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded result."
         )
     else:
         resume_guidance = (

@@ -28,6 +28,9 @@ class TestGatewayLifecyclePattern:
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",
         "hermes gateway stop",
+        "python -m hermes_cli.main gateway restart",
+        ".venv/Scripts/python.exe -m hermes_cli.main gateway restart",
+        "env -u _HERMES_GATEWAY python3.11 -m hermes_cli.main gateway stop",
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
@@ -81,6 +84,8 @@ class TestGatewayLifecyclePattern:
         # foot-gun (#30719 lists only those).
         "hermes gateway start",
         "hermes gateway start --all",
+        "python -m hermes_cli.main gateway start",
+        "python -m hermes_cli.main gateway status",
         # Tightened launchctl/systemctl branches: ops on NON-gateway hermes
         # services must not be falsely blocked (the old `.*hermes` matched any
         # hermes token).
@@ -269,6 +274,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl --user restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
+        "env -u _HERMES_GATEWAY .venv/Scripts/python.exe -m hermes_cli.main gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
         "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",

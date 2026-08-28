@@ -55,11 +55,17 @@ class GatewayLifecycleBlocked(ValueError):
 # actual shell-command-shaped strings, not on prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
+    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun —
+    # plus its module-entrypoint equivalent.  The latter matters because an
+    # agent can otherwise bypass the CLI's `_HERMES_GATEWAY` self-targeting
+    # guard with `env -u _HERMES_GATEWAY python -m hermes_cli.main ...`.
+    # The gateway then kills that terminal subprocess during shutdown before
+    # it reaches the relaunch half, leaving the service offline.
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    r"(?:(?:hermes|python(?:w|3(?:\.\d+)*)?(?:\.exe)?\s+-m\s+hermes_cli\.main)"
+    r"\s+gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
